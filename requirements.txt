@@ -1,0 +1,10 @@
+streamlit[auth]
+supabase
+torch
+torchvision
+opencv-python-headless
+pillow
+numpy
+reportlab
+plotly
+matplotlib
