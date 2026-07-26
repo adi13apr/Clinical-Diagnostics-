@@ -67,8 +67,13 @@ url = "YOUR_SUPABASE_URL"
 key = "YOUR_SUPABASE_ANON_KEY"
 ```
 ## 5. Run the Application
+
+```bash
 streamlit run app.py
-📝 License
-[Specify your license here, e.g., MIT License]
+```
+
+## 📝 License
+
+This project is licensed under the MIT License.
 
 
