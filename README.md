@@ -26,33 +26,46 @@ An AI-powered web application built to assist with clinical diagnostics using de
 
 If you want to run this project locally on your machine, follow these steps:
 
-### 1. Clone the repository
-```bash
-git clone [https://github.com/adi13apr/Clinical-Diagnostics-.git](https://github.com/adi13apr/Clinical-Diagnostics-.git)
+# 1. Clone the repository
+
+```
+git clone https://github.com/adi13apr/Clinical-Diagnostics--.git
 cd Clinical-Diagnostics-
-### 2. Create and activate a Virtual Environment
-# Windows
+```
+
+## 2. Create and activate a Virtual Environment
+
+### Windows
+
+```
 python -m venv venv
 venv\Scripts\activate
+```
 
-# macOS/Linux
+### macOS/Linux
+
+```
 python3 -m venv venv
 source venv/bin/activate
-### 3. Install Dependencies
-Install the required packages from the requirements.txt file:
+```
 
+## 3. Install Dependencies
 
+Install the required packages from the `requirements.txt` file:
+
+```
 pip install -r requirements.txt
-### 4. Configure Secrets (Supabase)
-Create a .streamlit folder in the root directory, and inside it, create a file named secrets.toml. Add your Supabase credentials to this file:
+```
 
+## 4. Configure Secrets (Supabase)
+
+Create a `.streamlit` folder in the root directory, and inside it, create a file named `secrets.toml`. Add your Supabase credentials:
+
+```
 [supabase]
 url = "YOUR_SUPABASE_URL"
 key = "YOUR_SUPABASE_ANON_KEY"
-(Note: Ensure .streamlit/secrets.toml is added to your .gitignore file so it is never pushed to public version control!)
-
-### 5. Run the Application
-streamlit run app.py
+```
 
 📝 License
 [Specify your license here, e.g., MIT License]
