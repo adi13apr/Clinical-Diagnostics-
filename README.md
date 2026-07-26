@@ -66,7 +66,8 @@ Create a `.streamlit` folder in the root directory, and inside it, create a file
 url = "YOUR_SUPABASE_URL"
 key = "YOUR_SUPABASE_ANON_KEY"
 ```
-
+## 5. Run the Application
+streamlit run app.py
 📝 License
 [Specify your license here, e.g., MIT License]
 
