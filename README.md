@@ -3,8 +3,6 @@ Markdown
 
 An AI-powered web application built to assist with clinical diagnostics using deep learning. This portal provides a secure, user-friendly interface for processing medical data using a custom-trained PyTorch model, complete with user authentication and database management.
 
-## 🚀 Live Demo
-**[Insert your Streamlit Cloud URL here]**
 
 ## 🛠️ Tech Stack
 
