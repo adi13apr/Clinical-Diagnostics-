@@ -29,7 +29,7 @@ If you want to run this project locally on your machine, follow these steps:
 # 1. Clone the repository
 
 ```
-git clone https://github.com/adi13apr/Clinical-Diagnostics--.git
+git clone https://github.com/adi13apr/Clinical-Diagnostics-.git
 cd Clinical-Diagnostics-
 ```
 
