@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from agent.schema import DISCLAIMER, Report
 from agent.tools import TOOL_DECLARATIONS, ReportTools
 from services.calibration import REFER_MESSAGE, STATUS_REFER
+from services.tracing import estimate_cost, safe_set, trace_event, trace_span
 
 GEMINI_MODEL = "gemini-3.8-flash"  # stable per https://ai.google.dev/gemini-api/docs/models
 MAX_STEPS = 5   # LLM calls per report, including the retry
@@ -75,6 +76,9 @@ class LLMTurn:
     text: Optional[str] = None
     tool_calls: List[ToolCall] = field(default_factory=list)
     raw: Any = None  # provider-native message, replayed as-is (keeps Gemini thought signatures)
+    usage: Optional[dict] = None          # {"input_tokens", "output_tokens", "thinking_tokens"}
+    finish_reason: Optional[str] = None
+    rate_limit_retries: int = 0
 
 
 class LLMClient(ABC):
@@ -157,6 +161,7 @@ class GeminiClient(LLMClient):
             thinking_config=t.ThinkingConfig(thinking_level="low"),
         )
         contents = self._contents(messages)
+        retries = 0
         for attempt in (1, 2):
             try:
                 response = self.client.models.generate_content(model=self.model, contents=contents, config=config)
@@ -168,6 +173,7 @@ class GeminiClient(LLMClient):
                 # One retry, and only when Google's requested wait is short; otherwise fall back now
                 if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
                     self.sleep(delay)
+                    retries += 1
                     continue
                 raise RateLimitError(delay) from e
         if not response.candidates or response.candidates[0].content is None:
@@ -175,7 +181,15 @@ class GeminiClient(LLMClient):
         content = response.candidates[0].content
         calls = [ToolCall(name=c.name, args=dict(c.args or {}), id=c.id) for c in (response.function_calls or [])]
         text = None if calls else "".join(p.text for p in content.parts or [] if p.text and not p.thought)
-        return LLMTurn(text=text, tool_calls=calls, raw=content)
+        meta = response.usage_metadata
+        usage = None if meta is None else {
+            "input_tokens": meta.prompt_token_count,
+            "output_tokens": meta.candidates_token_count,
+            "thinking_tokens": meta.thoughts_token_count,
+        }
+        finish = response.candidates[0].finish_reason
+        return LLMTurn(text=text, tool_calls=calls, raw=content, usage=usage, rate_limit_retries=retries,
+                       finish_reason=getattr(finish, "name", None) or (str(finish) if finish else None))
 
 
 class MockLLMClient(LLMClient):
@@ -198,8 +212,8 @@ class MockLLMClient(LLMClient):
         return LLMTurn(tool_calls=[ToolCall(name=name, args=args, id=f"call-{name}")])
 
     @staticmethod
-    def final(obj):
-        return LLMTurn(text=obj if isinstance(obj, str) else json.dumps(obj))
+    def final(obj, usage=None):
+        return LLMTurn(text=obj if isinstance(obj, str) else json.dumps(obj), usage=usage, finish_reason="STOP")
 
 
 @dataclass
@@ -308,7 +322,7 @@ def fallback_report(tools):
         sentences.append(f"This meets the {truth['referral_threshold']:.0%} confidence threshold, "
                          "but it is a screening result, not a diagnosis.")
     if gradcam.get("peak_region"):
-        spread = "spread across the image" if gradcam["focus"] == "diffuse" else "concentrated"
+        spread = "spread across the image" if gradcam.get("focus") != "focal" else "concentrated"
         sentences.append(f"The model's attention was {spread}, peaking around the {gradcam['peak_region']}.")
 
     if truth["status"] == STATUS_REFER:
@@ -334,8 +348,36 @@ def fallback_report(tools):
     return report
 
 
-def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES):
-    """Run the tool-calling loop and return a ReportResult (LLM report or template fallback)."""
+def llm_call_attributes(turn, model):
+    """Span attributes for one LLM response: tokens, nominal cost, finish reason, retries."""
+    usage = turn.usage or {}
+    output = None
+    if usage.get("output_tokens") is not None:
+        output = usage["output_tokens"] + (usage.get("thinking_tokens") or 0)  # thinking is billed as output
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "thinking_tokens": usage.get("thinking_tokens"),
+        **estimate_cost(model, usage.get("input_tokens"), output),
+        "finish_reason": turn.finish_reason,
+        "tool_calls": len(turn.tool_calls),
+        "rate_limit_retries": turn.rate_limit_retries,
+    }
+
+
+def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES, tracer=None):
+    """Run the tool-calling loop and return a ReportResult (LLM report or template fallback).
+
+    Traced as a 'report' span holding llm_call, tool_call, guard and fallback_used spans.
+    """
+    with trace_span(tracer, "report", llm=getattr(llm, "name", None)) as span:
+        result = _generate_report(tools, llm, max_steps, max_retries, tracer)
+        trace_event(tracer, "fallback_used", used=result.source == "fallback", reason=result.reason)
+        safe_set(span, source=result.source, steps=result.steps, rejected=len(result.rejected))
+    return result
+
+
+def _generate_report(tools, llm, max_steps, max_retries, tracer):
     truth = tools.run_classifier()  # ground truth for the guard, independent of what the LLM calls
     result = ReportResult(report=None, source="fallback")
 
@@ -352,19 +394,29 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES):
     for step in range(1, max_steps + 1):
         result.steps = step
         try:
-            turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS)
+            with trace_span(tracer, "llm_call", model=llm.name, step=step) as span:
+                turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS)
+                safe_set(span, **llm_call_attributes(turn, llm.name))
         except Exception as e:
             detail = f"{type(e).__name__}: {e}" + (f" <- {e.__cause__}" if e.__cause__ else "")
             return fall_back(describe_llm_error(e), detail)
         messages.append({"role": "assistant", "turn": turn})
 
         if turn.tool_calls:
-            results = [(call, tools.call(call.name, call.args)) for call in turn.tool_calls]
+            results = []
+            for call in turn.tool_calls:
+                with trace_span(tracer, "tool_call", tool=call.name, args=call.args, step=step) as span:
+                    output = tools.call(call.name, call.args)
+                    if isinstance(output, dict) and "error" in output:
+                        span.fail(output["error"], "ToolError")
+                results.append((call, output))
             result.tool_calls += [call.name for call in turn.tool_calls]
             messages.append({"role": "tool", "results": results})
             continue
 
         report, problem = parse_report(turn.text, truth)
+        trace_event(tracer, "guard", status="ok" if report is not None else "reject",
+                    error=problem, result="pass" if report is not None else "reject", reason=problem, step=step)
         if report is not None:
             result.report = report.model_copy(update={"disclaimer": DISCLAIMER})
             result.source, result.model = "llm", llm.name
@@ -416,7 +468,7 @@ def image_fingerprint(image):
     return h.hexdigest()
 
 
-def generate_report_for_image(model_service, image, prediction=None, llm=None, cache=REPORT_CACHE):
+def generate_report_for_image(model_service, image, prediction=None, llm=None, cache=REPORT_CACHE, tracer=None):
     """Dashboard entry point. Reuses a cached LLM report for the same image, temperature and model.
 
     Only LLM reports are cached: a fallback (e.g. after a rate limit) costs nothing to rebuild, and
@@ -427,8 +479,10 @@ def generate_report_for_image(model_service, image, prediction=None, llm=None, c
         key = (image_fingerprint(image), float(model_service.temperature), llm.name)
         hit = cache.get(key)
         if hit is not None:
+            with trace_span(tracer, "report", llm=llm.name, source=hit.source, cached=True):
+                trace_event(tracer, "report_cache_hit")
             return dataclasses.replace(hit, cached=True, steps=0)
-    result = generate_report(ReportTools(model_service, image, prediction), llm)
+    result = generate_report(ReportTools(model_service, image, prediction, tracer=tracer), llm, tracer=tracer)
     if key is not None and result.source == "llm":
         cache.put(key, result)
     return result

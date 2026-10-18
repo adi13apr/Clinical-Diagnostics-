@@ -46,10 +46,11 @@ TOOL_DECLARATIONS = [
 
 
 class ReportTools:
-    def __init__(self, model_service, image, prediction=None, condition_info_path=CONDITION_INFO_PATH):
+    def __init__(self, model_service, image, prediction=None, condition_info_path=CONDITION_INFO_PATH, tracer=None):
         self.model_service = model_service
         self.image = image
         self._prediction = prediction  # reuse the dashboard's prediction instead of re-running the model
+        self.tracer = tracer
         self._classifier = None
         self._gradcam = None
         with open(condition_info_path, encoding="utf-8") as f:
@@ -57,7 +58,7 @@ class ReportTools:
 
     def run_classifier(self):
         if self._classifier is None:
-            p = self._prediction or self.model_service.predict(self.image)
+            p = self._prediction or self.model_service.predict(self.image, tracer=self.tracer)
             self._classifier = {
                 "predicted_class": p["diagnosis"],
                 "calibrated_probability": round(p["confidence"], DECIMALS),
@@ -71,7 +72,7 @@ class ReportTools:
     def get_gradcam(self):
         if self._gradcam is None:
             predicted = self.run_classifier()["predicted_class"]
-            cam = self.model_service.compute_gradcam(self.image, predicted)
+            cam = self.model_service.compute_gradcam(self.image, predicted, tracer=self.tracer)
             self._gradcam = {
                 "explained_class": predicted,
                 **summarize_cam_regions(cam),

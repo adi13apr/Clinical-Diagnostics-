@@ -2,6 +2,7 @@ import streamlit as st
 from PIL import Image
 from services.pdf_handler import PDFReportGenerator
 from services.calibration import REFER_THRESHOLD, REFER_MESSAGE, STATUS_REFER
+from services.tracing import finish_trace, make_tracer, trace_span
 from datetime import datetime
 import pandas as pd
 import time
@@ -47,7 +48,34 @@ def show_report(report_result):
         st.markdown(f"- {limitation}")
     st.caption(report.disclaimer)
 
-def show_single_result(user_email, model_service, image):
+def trace_table(spans):
+    """Spans as a table, indented by nesting depth"""
+    depth = {}
+    rows = []
+    for s in spans:
+        depth[s['span_id']] = depth.get(s.get('parent_span_id'), -1) + 1
+        a = s.get('attributes') or {}
+        detail = s.get('error') or ", ".join(
+            f"{k}={a[k]}" for k in ('tool', 'model', 'result', 'used', 'finish_reason', 'predicted_class', 'status')
+            if a.get(k) is not None)
+        tokens = (f"{a.get('input_tokens')} / {(a.get('output_tokens') or 0) + (a.get('thinking_tokens') or 0)}"
+                  if a.get('input_tokens') is not None else "")
+        rows.append({
+            'Step': "\u2003" * depth[s['span_id']] + s['name'],
+            'Status': '✅' if s['status'] == 'ok' else f"❌ {s.get('error_type') or ''}",
+            'Latency (ms)': s.get('latency_ms'),
+            'Tokens in / out': tokens,
+            'Nominal cost ($)': a.get('nominal_cost_usd'),
+            'Detail': detail,
+        })
+    return pd.DataFrame(rows)
+
+def show_trace(spans, trace_id):
+    with st.expander("View trace"):
+        st.caption(f"Trace {trace_id}. Costs are nominal list prices; free-tier requests cost $0.")
+        st.dataframe(trace_table(spans), use_container_width=True, hide_index=True)
+
+def show_single_result(user_email, model_service, image, trace_store=None):
     """Prediction, heatmap, AI report and PDF for the last single-image run (kept in session_state)"""
     result = st.session_state['last_result']
     patient_name = st.session_state['last_patient_name']
@@ -84,12 +112,20 @@ def show_single_result(user_email, model_service, image):
     st.subheader("📝 AI Report")
     if st.button("Generate report"):
         from agent.agent import build_llm_client, generate_report_for_image
+        # Same trace as the prediction, so everything about this image is one trace
+        tracer = make_tracer(trace_store, trace_id=st.session_state.get('last_trace_id'))
         with st.spinner("Writing report..."):
             st.session_state['last_report'] = generate_report_for_image(
-                model_service, image, prediction=result, llm=build_llm_client())
+                model_service, image, prediction=result, llm=build_llm_client(), tracer=tracer)
+        finish_trace(tracer)
+        if tracer is not None:
+            st.session_state['last_trace_spans'] = st.session_state.get('last_trace_spans', []) + [
+                s.to_dict() for s in tracer.spans]
     report_result = st.session_state.get('last_report')
     if report_result is not None:
         show_report(report_result)
+    if st.session_state.get('last_trace_spans'):
+        show_trace(st.session_state['last_trace_spans'], st.session_state.get('last_trace_id'))
 
     # Generate and offer PDF download
     st.divider()
@@ -113,20 +149,23 @@ def show_single_result(user_email, model_service, image):
         mime="application/pdf"
     )
 
-def run_prediction(model_service, prediction_service, image):
+def run_prediction(model_service, prediction_service, image, tracer=None):
     """Run the model, timing it, and log the prediction (logging failures only warn)"""
-    start = time.perf_counter()
-    result = model_service.predict(image)
-    inference_ms = round((time.perf_counter() - start) * 1000)
-    
-    try:
-        prediction_service.log_prediction(result, inference_ms)
-    except Exception as e:
-        st.warning(f"Could not log prediction: {str(e)}")
-    
+    with trace_span(tracer, "prediction"):
+        start = time.perf_counter()
+        result = model_service.predict(image, tracer=tracer)
+        inference_ms = round((time.perf_counter() - start) * 1000)
+
+        try:
+            with trace_span(tracer, "log_prediction"):
+                prediction_service.log_prediction(result, inference_ms,
+                                                  trace_id=tracer.trace_id if tracer else None)
+        except Exception as e:
+            st.warning(f"Could not log prediction: {str(e)}")
+
     return result
 
-def show_dashboard(user_email, auth_service, data_service, model_service, prediction_service):
+def show_dashboard(user_email, auth_service, data_service, model_service, prediction_service, trace_store=None):
     # Sidebar for User Info & Logout
     st.sidebar.title("🩺 Control Panel")
     st.sidebar.info(f"Radiologist: **{user_email}**")
@@ -143,16 +182,17 @@ def show_dashboard(user_email, auth_service, data_service, model_service, predic
         st.rerun()
     
     # Import analytics here to avoid circular imports
-    from ui.analytics import show_analytics, show_prediction_analytics
+    from ui.analytics import show_analytics, show_prediction_analytics, show_trace_analytics
     
     # Route to selected page
     if page == "📋 Diagnosis":
-        show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service)
+        show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service, trace_store)
     else:
         show_analytics(data_service, user_email)
         show_prediction_analytics(prediction_service)
+        show_trace_analytics(trace_store)
 
-def show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service):
+def show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service, trace_store=None):
     st.title("Clinical Diagnostic Dashboard")
 
     if not model_service.calibrated:
@@ -179,9 +219,10 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                 upload_key = (getattr(uploaded_file, 'file_id', uploaded_file.name), patient_name)
                 
                 if st.button("Run AI Diagnosis"):
+                    tracer = make_tracer(trace_store)  # one trace per prediction
                     with st.spinner("Analyzing anatomical features..."):
                         # Call the Model Service
-                        result = run_prediction(model_service, prediction_service, image)
+                        result = run_prediction(model_service, prediction_service, image, tracer)
                         st.session_state['last_result'] = result
                         st.session_state['last_image'] = image
                         st.session_state['last_patient_name'] = patient_name
@@ -189,24 +230,28 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                         st.session_state['last_timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         st.session_state['last_heatmap'] = None
                         st.session_state['last_report'] = None
-                        
+
                         # Save the result to Supabase
                         try:
-                            data_service.save_diagnosis(user_email, result, patient_name)
+                            with trace_span(tracer, "save_history"):
+                                data_service.save_diagnosis(user_email, result, patient_name)
                         except Exception as e:
                             st.error(f"Could not save to diagnostic history: {str(e)}")
-                    
+
                     with st.spinner("Generating interpretation map (this may take 5-10 seconds)..."):
                         try:
                             # Pass the result to avoid redundant prediction
-                            st.session_state['last_heatmap'] = model_service.generate_heatmap(image, result)
+                            st.session_state['last_heatmap'] = model_service.generate_heatmap(image, result, tracer=tracer)
                         except Exception as e:
                             st.warning(f"Could not generate heatmap: {str(e)}")
-                    
+
+                    finish_trace(tracer)
+                    st.session_state['last_trace_id'] = tracer.trace_id if tracer else None
+                    st.session_state['last_trace_spans'] = [s.to_dict() for s in tracer.spans] if tracer else []
                     st.success("Analysis Complete!")
                 
                 if st.session_state.get('last_upload_key') == upload_key:
-                    show_single_result(user_email, model_service, image)
+                    show_single_result(user_email, model_service, image, trace_store)
     
     # TAB 2: Batch Upload
     with tab2:
@@ -255,13 +300,15 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                     status_placeholder.write(f"Processing {idx + 1}/{len(uploaded_files)}: {patient_id}")
                     progress_bar.progress((idx + 1) / len(uploaded_files))
                     
+                    tracer = make_tracer(trace_store)  # one trace per image
                     try:
                         # Open and predict
                         image = Image.open(uploaded_file)
-                        result = run_prediction(model_service, prediction_service, image)
-                        
+                        result = run_prediction(model_service, prediction_service, image, tracer)
+
                         # Save to database
-                        data_service.save_diagnosis(user_email, result, patient_id)
+                        with trace_span(tracer, "save_history"):
+                            data_service.save_diagnosis(user_email, result, patient_id)
                         
                         results.append({
                             'Patient ID': patient_id,
@@ -278,7 +325,8 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                             'Triage': 'N/A',
                             'Status': f'❌ {str(e)[:30]}'
                         })
-                
+                    finish_trace(tracer)
+
                 status_placeholder.empty()
                 progress_bar.empty()
                 

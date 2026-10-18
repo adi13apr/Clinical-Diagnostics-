@@ -32,7 +32,8 @@ api_key = "..."   # or env GEMINI_API_KEY
 
 Database setup: run the files in `sql/` in order, in the Supabase SQL Editor, **before** deploying code that depends on them:
 - `002` adds `status` / `temperature` to `predictions`. Without it every prediction-log insert fails, which the app reports as a warning only.
-- `003` adds `status` to `diagnosis_history`. Without it every history insert fails: the single tab shows an error and batch rows show "Error". The `diagnosis_history` table has no migration in the repo; it already exists in the Supabase project.
+- `003` adds `status` to `diagnosis_history`. Without it every history insert fails: the single tab shows an error and batch rows show "Error".
+- `004` creates `traces` and adds `predictions.trace_id`. Without it every prediction-log insert fails (warning only), and spans go to local `traces/` only. The `diagnosis_history` table has no migration in the repo; it already exists in the Supabase project.
 
 ## Layout
 
@@ -41,6 +42,7 @@ app.py                      Entry point: builds services, routes login vs dashbo
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
   model_handler.py          CLAHETransform, StudentEfficientNet, ModelService (load + calibrated predict + heatmap)
   calibration.py            Temperature loading, apply_temperature, triage, ECE. No Streamlit import.
+  tracing.py                Tracer/Span, fail-safe helpers, JSONL + Supabase sinks, nominal cost, summarize_spans
   heatmap_handler.py        GradCAM on the last conv block + HeatmapGenerator (3-panel figure) + summarize_cam_regions
   prediction_handler.py     PredictionService: insert into `predictions`, read `prediction_daily_summary`
   data_handler.py           DataService: Supabase table `diagnosis_history` insert/select
@@ -61,6 +63,9 @@ sql/
   001_predictions.sql       `predictions` table, RLS policies, `prediction_daily_summary` view
   002_prediction_status.sql `status` + `temperature` columns, `refer_count` in the view
   003_diagnosis_history_status.sql  `status` column on diagnosis_history
+  004_traces.sql            `traces` table (one row per span, RLS) + predictions.trace_id
+config/
+  pricing.json              NOMINAL per-model prices for cost estimates; billing_tier "free" → billed $0
 scripts/
   calibrate.py              Fits the temperature on the notebook's val split, reports on its test split
   failure_case.py           Renders docs/failure_case_gradcam.png (Grad-CAM of a misclassified test image)
@@ -76,6 +81,7 @@ outputs/                    Committed calibration results
 tests/                      pytest; conftest.py stubs the network so tests need no checkpoint or Supabase
   fixtures/                 Verbatim LLM outputs used as regression tests
 data/                       Gitignored. Kaggle datasets + data/cache/calibration_logits.npz
+traces/                     Gitignored. Span JSONL, one file per UTC day (ephemeral on Streamlit Cloud)
 best_student_model_aligned_final.pth   state_dict for StudentEfficientNet (~16 MB, committed)
 ```
 
@@ -149,13 +155,30 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
 - **Model ID:** `GEMINI_MODEL = "gemini-3.8-flash"` (stable). Override with `st.secrets["gemini"]["model"]` or `GEMINI_MODEL`.
 - **Tests** use `MockLLMClient` (scripted `LLMTurn`s / callables). The Gemini wiring is tested offline with a fake `client.models`. Never call the network in tests.
 
+## Tracing (`services/tracing.py`)
+
+- **One trace per prediction.** The dashboard creates `make_tracer(trace_store)` on "Run AI Diagnosis" (and per batch image), stores `last_trace_id`, and reuses that id for "Generate report". A prediction and its report therefore share one `trace_id`, which is also written to `predictions.trace_id`.
+- **Spans:** `prediction` → `preprocess` / `classify` / `calibrate` (inside `ModelService.predict`), `log_prediction`, `save_history`, `gradcam` (`generate_heatmap` and `compute_gradcam`), and `report` → `llm_call` / `tool_call` (→ `gradcam`) / `guard` / `fallback_used`. A cache hit records `report` → `report_cache_hit`.
+  - `llm_call` attributes: model, step, `input_tokens`, `output_tokens`, `thinking_tokens`, `nominal_cost_usd`, `billed_cost_usd`, `finish_reason`, `tool_calls`, `rate_limit_retries`. On failure: status error plus `error_type`.
+  - `guard`: zero-duration event, `result` pass/reject plus `reason`. A reject has status error and `error_type` "Rejected".
+  - `fallback_used`: `used` bool plus `reason`, one per generated report.
+- **Fail-safe rule:** app code only calls `trace_span`, `trace_event`, `safe_set` and `finish_trace`. These swallow and log tracer errors, while the step's own exceptions still propagate. Pass `tracer=None` to disable tracing. Never call `tracer.span()` directly from app code.
+- **Sinks:** `finish()` writes new spans to every sink. A failing sink is logged and appended to `tracer.sink_errors`, never raised.
+  - `JsonlTraceSink` writes `traces/YYYY-MM-DD.jsonl` and always runs.
+  - `SupabaseTraceStore` writes the `traces` table and needs the logged-in auth client.
+- **Cost:** `estimate_cost(model, input, output+thinking)` uses `config/pricing.json`. Prices are dated (`until`), because the intro price ends 2026-12-31. With `billing_tier: "free"`, billed cost is 0. Unpriced models (e.g. the mock) get `None`.
+- **UI and analytics:**
+  - "View trace" under the AI report shows `trace_table(spans)`.
+  - Analytics `show_trace_analytics` reads Supabase, falling back to local JSONL, and uses `summarize_spans` for average latency per step (events excluded), tokens and nominal cost per LLM report, guard reject rate and fallback rate (cache hits excluded).
+- **Measured (live, CPU, one report):** preprocess 130 ms, classify 47 ms, Grad-CAM figure 1.15 s (raw map 0.1 s), LLM calls 10.8 s + 3.5 s, about 2.2k input and 350 output tokens, about $0.003 nominal.
+
 ## Supabase
 
 There are two kinds of client, both using the anon key from `st.secrets`:
 
 | Client | Lifetime | Session | Used by | Tables |
 | --- | --- | --- | --- | --- |
-| `AuthService.client` | one per browser session (`st.session_state.auth_provider`) | logged-in user's JWT after `login_email` | `AuthService`, `PredictionService` | `predictions`, `prediction_daily_summary` |
+| `AuthService.client` | one per browser session (`st.session_state.auth_provider`) | logged-in user's JWT after `login_email` | `AuthService`, `PredictionService`, `SupabaseTraceStore` | `predictions`, `prediction_daily_summary`, `traces` |
 | `DataService.client` | rebuilt every rerun | none (anon role) | `DataService` | `diagnosis_history` |
 
 - Login state for routing lives in `st.session_state.user` (the Supabase `User` object). The dashboard only uses `.email`.
@@ -171,7 +194,7 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 
 - **When a row is written:** inside `run_prediction`, immediately after `model_service.predict` succeeds and before `save_diagnosis`. That gives one row per image, single or batch.
 - **Columns:**
-  - App sends `predicted_label`, `confidence` (calibrated, 0–1), `inference_ms` (int, `perf_counter` around `predict`), `status` (`confident`/`refer`), and `temperature`.
+  - App sends `predicted_label`, `confidence` (calibrated, 0–1), `inference_ms` (int, `perf_counter` around `predict`), `status` (`confident`/`refer`), `temperature`, and `trace_id` (migration 004).
   - Server fills `id`, `user_id` (`default auth.uid()`), and `created_at`.
   - `status`/`temperature` are NULL on rows logged before migration 002; NULL `temperature` means `confidence` is raw.
 - **RLS:** `authenticated` can insert and select only their own rows (`user_id = auth.uid()`).

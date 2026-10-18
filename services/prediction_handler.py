@@ -3,7 +3,7 @@ class PredictionService:
         # Must be the logged-in auth client so RLS sees the user's session
         self.client = client
 
-    def log_prediction(self, result, inference_ms):
+    def log_prediction(self, result, inference_ms, trace_id=None):
         data = {
             "predicted_label": result['diagnosis'],
             "confidence": result['confidence'],
@@ -11,6 +11,9 @@ class PredictionService:
             "status": result['status'],
             "temperature": result['temperature']
         }
+        # Links this row to its spans in the `traces` table (needs sql/004_traces.sql)
+        if trace_id is not None:
+            data["trace_id"] = trace_id
         return self.client.table("predictions").insert(data).execute()
 
     def get_daily_summary(self):

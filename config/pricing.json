@@ -1,0 +1,15 @@
+{
+  "_note": "NOMINAL list prices, used only to estimate what a request WOULD cost on the paid tier. On the Gemini free tier every request costs $0 (billed_cost_usd). Prices change; check https://ai.google.dev/gemini-api/docs/pricing before relying on these numbers.",
+  "currency": "USD",
+  "billing_tier": "free",
+  "models": {
+    "gemini-3.8-flash": {
+      "source": "https://ai.google.dev/gemini-api/docs/pricing (Standard tier, retrieved 2026-10-18)",
+      "schedule": [
+        {"until": "2026-12-31", "input_per_million": 0.75, "output_per_million": 3.75},
+        {"until": null, "input_per_million": 1.50, "output_per_million": 7.50}
+      ],
+      "output_includes_thinking": true
+    }
+  }
+}

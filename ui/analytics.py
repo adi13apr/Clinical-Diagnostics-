@@ -197,3 +197,68 @@ def show_prediction_analytics(prediction_service):
         'refer_count': 'Referred'
     })
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+def load_trace_rows(trace_store):
+    """Spans from Supabase; falls back to this server's local JSONL if the table isn't available.
+
+    Returns (rows, source_label).
+    """
+    from services.tracing import JsonlTraceSink
+    if trace_store is not None:
+        try:
+            return trace_store.read(), "Supabase `traces` table"
+        except Exception as e:
+            st.warning(f"Could not read traces from Supabase ({type(e).__name__}); showing local traces.")
+    return JsonlTraceSink().read(), "local traces/ JSONL (this server only)"
+
+
+def show_trace_analytics(trace_store):
+    """Pipeline health from step-level traces: latency per step, tokens, guard and fallback rates"""
+    from services.tracing import summarize_spans
+
+    st.divider()
+    st.header("🔍 Pipeline traces")
+
+    try:
+        rows, source = load_trace_rows(trace_store)
+    except Exception as e:
+        st.warning(f"Could not load traces: {str(e)}")
+        return
+    if not rows:
+        st.info("No traces yet. Run a diagnosis or generate a report to start collecting traces.")
+        return
+
+    m = summarize_spans(rows)
+    st.caption(f"{m['traces']} traces from the {source}, most recent {len(rows)} spans.")
+
+    def pct(x):
+        return "—" if x is None else f"{x:.0%}"
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        tokens = ("—" if m['avg_input_tokens_per_report'] is None else
+                  f"{m['avg_input_tokens_per_report'] + m['avg_output_tokens_per_report']:,.0f}")
+        st.metric("Tokens per LLM report", tokens,
+                  help="Input + output (including thinking), averaged over reports that called the LLM")
+    with col2:
+        cost = m['avg_nominal_cost_per_report_usd']
+        st.metric("Nominal cost per report", "—" if cost is None else f"${cost:.4f}",
+                  help="List-price estimate from config/pricing.json. Free-tier requests cost $0.")
+    with col3:
+        st.metric("Guard reject rate", pct(m['guard_reject_rate']),
+                  help=f"Rejected LLM drafts out of {m['guard_checks']} guard checks")
+    with col4:
+        st.metric("Fallback rate", pct(m['fallback_rate']),
+                  help=f"Reports that used the template, out of {m['reports']} generated (cache hits excluded)")
+
+    st.subheader("Average latency per step")
+    steps_df = pd.DataFrame([
+        {'Step': name, 'Spans': s['count'], 'Avg latency (ms)': s['avg_latency_ms'], 'Error rate': pct(s['error_rate'])}
+        for name, s in sorted(m['steps'].items(), key=lambda kv: -kv[1]['avg_latency_ms'])
+    ])
+    fig = px.bar(steps_df, x='Avg latency (ms)', y='Step', orientation='h', title="Mean latency by step",
+                 color_discrete_sequence=['#1f77b4'])
+    fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(steps_df, use_container_width=True, hide_index=True)
