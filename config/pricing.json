@@ -1,8 +1,18 @@
 {
-  "_note": "NOMINAL list prices, used only to estimate what a request WOULD cost on the paid tier. On the Gemini free tier every request costs $0 (billed_cost_usd). Prices change; check https://ai.google.dev/gemini-api/docs/pricing before relying on these numbers.",
+  "_note": "NOMINAL list prices, used only to estimate what a request WOULD cost on a paid plan. On the Groq and Gemini free tiers every request costs $0 (billed_cost_usd). Prices change; check the provider pricing pages (https://console.groq.com/docs/model/..., https://ai.google.dev/gemini-api/docs/pricing) before relying on these numbers.",
   "currency": "USD",
   "billing_tier": "free",
   "models": {
+    "openai/gpt-oss-120b": {
+      "source": "https://console.groq.com/docs/model/openai/gpt-oss-120b (on-demand, retrieved 2026-10-18; cached input $0.075 not modelled)",
+      "schedule": [{"until": null, "input_per_million": 0.15, "output_per_million": 0.60}],
+      "output_includes_thinking": true
+    },
+    "qwen/qwen3.8-27b": {
+      "source": "https://console.groq.com/docs/model/qwen/qwen3.8-27b (Preview model, retrieved 2026-10-18)",
+      "schedule": [{"until": null, "input_per_million": 0.80, "output_per_million": 4.00}],
+      "output_includes_thinking": true
+    },
     "gemini-3.8-flash": {
       "source": "https://ai.google.dev/gemini-api/docs/pricing (Standard tier, retrieved 2026-10-18)",
       "schedule": [

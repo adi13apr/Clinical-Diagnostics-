@@ -4,7 +4,7 @@ Guidance for working in this repository.
 
 ## What this is
 
-A Streamlit app ("Clinical Diagnostic Portal") where a logged-in radiologist uploads a chest X-ray and gets a 3-class prediction (**Normal / Pneumonia / Tuberculosis**) from a distilled EfficientNet-B0. Probabilities are temperature-calibrated, and each prediction is triaged as `confident` or `refer` (clinician review). The app also shows a Grad-CAM overlay and produces a PDF report. An optional Gemini tool-calling agent writes a plain-language report; it explains the classifier's output and can never change it. Supabase handles auth and stores two things: the per-patient diagnosis history and a per-user prediction log that feeds the analytics page. The app is deployed on Streamlit Community Cloud.
+A Streamlit app ("Clinical Diagnostic Portal") where a logged-in radiologist uploads a chest X-ray and gets a 3-class prediction (**Normal / Pneumonia / Tuberculosis**) from a distilled EfficientNet-B0. Probabilities are temperature-calibrated, and each prediction is triaged as `confident` or `refer` (clinician review). The app also shows a Grad-CAM overlay and produces a PDF report. An optional LLM tool-calling agent (Groq `openai/gpt-oss-120b` by default, Gemini as an option) writes a plain-language report; it explains the classifier's output and can never change it. Supabase handles auth and stores two things: the per-patient diagnosis history and a per-user prediction log that feeds the analytics page. The app is deployed on Streamlit Community Cloud.
 
 ## Commands
 
@@ -17,7 +17,7 @@ streamlit run app.py
 pytest                             # no Supabase, dataset or GPU needed
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
-python -m evals.run --live --resume  # continue the live eval (real model + Gemini; needs data/ and a key)
+python -m evals.run --live --resume  # continue the live eval (real model + LLM; needs data/ and a key)
 ```
 
 CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`.
@@ -29,9 +29,13 @@ The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 url = "..."
 key = "..."   # anon key
 
-[gemini]          # optional; without it "Generate report" uses the template report
+[groq]            # default provider (config/llm.json); without a key "Generate report" uses the template
+api_key = "..."   # or env GROQ_API_KEY
+# report_model = "openai/gpt-oss-120b"   # optional overrides of config/llm.json
+# judge_model = "qwen/qwen3.8-27b"
+
+[gemini]          # only if LLM_PROVIDER=gemini (or "provider" in config/llm.json)
 api_key = "..."   # or env GEMINI_API_KEY
-# model = "gemini-3.8-flash"   # optional override (or env GEMINI_MODEL)
 ```
 
 Database setup: run the files in `sql/` in order, in the Supabase SQL Editor, **before** deploying code that depends on them:
@@ -55,7 +59,9 @@ services/                   Non-UI logic. Each module exposes one class (calibra
 agent/                      LLM report agent (see "Report agent")
   schema.py                 Pydantic Report + fixed DISCLAIMER
   tools.py                  ReportTools: run_classifier, get_gradcam, get_condition_info; TOOL_DECLARATIONS
-  agent.py                  LLMClient / GeminiClient / MockLLMClient, tool loop, grounding guard, fallback report
+  agent.py                  LLMClient / OpenAICompatibleClient / GeminiClient / MockLLMClient, tool loop, guard, fallback
+  llm_config.py             Provider selection + keys from config/llm.json, st.secrets, env
+  rate_limit.py             Token-aware per-model ModelBudget (rpm, tpm, daily caps), budget_for()
   condition_info.json       Static condition text (DRAFT: needs clinical sign-off)
 ui/                         Streamlit pages; functions named show_*(...)
   login_pages.py            show_login_ui(auth_service)
@@ -70,6 +76,7 @@ sql/
   004_traces.sql            `traces` table (one row per span, RLS) + predictions.trace_id
 config/
   pricing.json              NOMINAL per-model prices for cost estimates; billing_tier "free" → billed $0
+  llm.json                  Provider (groq | gemini; env LLM_PROVIDER), report/judge models, per-model limits, request options
 scripts/
   calibrate.py              Fits the temperature on the notebook's val split, reports on its test split
   failure_case.py           Renders docs/failure_case_gradcam.png (Grad-CAM of a misclassified test image)
@@ -146,12 +153,23 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
 - **Cache:** `REPORT_CACHE` is a process-wide, thread-safe LRU of 256 entries, keyed by (SHA-256 of the decoded pixels + mode + size, temperature, model name).
   - Only `source == "llm"` results are cached. Fallbacks are free to rebuild, and caching one would block a later Gemini attempt.
   - Hits return `cached=True` with `steps=0`.
-- **Request budget:** the prompt asks for all three tools in the first turn, and `get_condition_info` defaults to the predicted class. A report is then 2 Gemini requests, 3 with a retry. Measured live: 2 requests, 6.5 s, versus 5 requests and 16.6 s calling one tool per turn. The free tier allows 5 requests/minute per model.
-- **429 handling** (`GeminiClient.generate`): read Google's retry delay (the `RetryInfo` detail, else "retry in Ns" in the message). If it's under `RATE_LIMIT_MAX_RETRY_DELAY` (10 s), sleep and retry **once**; otherwise raise `RateLimitError` right away, which falls back with "Gemini rate limit reached (retry in N s)."
+- **Providers** (`config/llm.json`, `build_llm_client(role)`): `groq` (default) uses `OpenAICompatibleClient` (Chat Completions + tools, `openai` SDK with `max_retries=0`). `gemini` uses `GeminiClient`. `LLM_PROVIDER` overrides the config. Keys come from `st.secrets[section]["api_key"]` or the env var named in the config.
+  - Models (confirmed in Groq's docs, 2026-10-18): reports `openai/gpt-oss-120b` (Production; tool use, **no parallel tool calls**), judge `qwen/qwen3.8-27b` (**Preview**, "evaluation only"; strict `json_schema`).
+  - Request options live in `config/llm.json`: gpt-oss `reasoning_effort: low`, `include_reasoning: false`, `max_completion_tokens: 2000`. Qwen judge `reasoning_effort: none` (instruct mode), `reasoning_format: hidden`, `max_completion_tokens: 600`; with reasoning, a judgement used about 1.2k output tokens, over Qwen's 1000 output-tokens/min limit. Keys starting with `_` are comments, stripped by `request_options()`. Non-standard keys go through `extra_body` (`split_request_options`), because the openai SDK rejects unknown kwargs.
+  - Usage maps to `output_tokens` (excluding reasoning) plus `thinking_tokens` (`completion_tokens_details.reasoning_tokens`), as with Gemini.
+- **Request budget:** the prompt asks for each tool once (in parallel where supported); `get_condition_info` defaults to the predicted class. On Groq gpt-oss that's 3 tool turns plus the answer (4 calls, about 3.2k tokens); on Gemini, 2 calls.
+  - Once every tool has been called, the next turn is sent with tool calls forbidden (`tools_allowed=False` → Groq `tool_choice: "none"`, Gemini function-calling mode NONE), so it can only be the answer.
+- **Limits** (`agent/rate_limit.py`): each client holds the shared `budget_for(model)`.
+  - Before a call it reserves an estimate (prompt chars / 3.5 + `max_completion_tokens`) and waits until requests/min and tokens/min in the last 60 s fit. After the call, the real `total_tokens` replaces the estimate.
+  - Daily request/token caps raise `DailyCapReached`, which becomes `RateLimitError.daily`.
+  - Groq free tier on this account: 1000 requests/day and 8000 tokens/min per model (from the `x-ratelimit-limit-*` headers); 30/min and 200k tokens/day from the docs. Daily counters are per process (UTC day).
+  - **Output tokens/min (`otpm`):** `qwen/qwen3.8-27b` also has an undocumented 1000 OTPM limit, found from a 429 "Request too large ... (OTPM): Limit 1000". Groq checks `max_completion_tokens` against it before running, so a request whose `max_completion_tokens` exceeds it can never succeed. `ModelBudget` reserves `max_completion_tokens` against `otpm`, then records the real `completion_tokens`.
+- **429 handling:** Gemini reads `RetryInfo`; Groq reads `retry-after` (else "try again in 1m2.5s" in the message). If the wait is under `RATE_LIMIT_MAX_RETRY_DELAY` (10 s), sleep and retry **once**; otherwise raise `RateLimitError` immediately, with the daily quota recognised from the message ("tokens per day (TPD)").
+- **Error kinds** (`classify_llm_error`, stored in `ReportResult.error_kind`): `rate_limit`, `infrastructure` (network, auth, server, unknown), or `model`. A model failure is Groq's 400 `tool_use_failed`, a malformed tool call that gpt-oss produces intermittently. A model failure gets **one retry** (sharing `MAX_RETRIES` with guard rejections, and recorded in `rejected` with `text: None`) before falling back.
 - **Tools** (`ReportTools`): the image and the dashboard's prediction are bound server-side. The LLM sees only tool outputs: no pixels, no patient name or email.
   - `run_classifier` rounds probabilities to 4 dp, so the report can copy them exactly.
   - `get_gradcam` covers the predicted class.
-  - `get_condition_info` reads `condition_info.json` only; there are no web lookups. `condition` is optional and defaults to the predicted class.
+  - `get_condition_info` reads `condition_info.json` only; there are no web lookups. `condition` is optional and defaults to the predicted class. It also returns `model_limitations` (from `_model_limitations`), which holds the dataset/source-confound caveat. That caveat used to be required by the system prompt without being in any tool output, and the pilot judge flagged it as ungrounded. Report limitations must come from this tool; the template report uses them verbatim.
   - Tool exceptions are returned to the LLM as `{"error": ...}`.
 - **Loop:** at most `MAX_STEPS = 5` LLM calls. The final text must be JSON → `Report.model_validate` → `check_grounding`. On failure the LLM gets the problem and `MAX_RETRIES = 1` more try. After that, or on any LLM exception, it falls back to `fallback_report`.
 - **Grounding guard** (`check_grounding`):
@@ -164,8 +182,7 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `FunctionDeclaration(parameters_json_schema=...)`, AFC disabled, `thinking_level="low"`, and **no temperature** (deprecated for Gemini 3.8).
   - Model turns are replayed as received, which keeps thought signatures. Each `FunctionResponse` carries the call's `id` and `name`.
   - The final answer is plain JSON text, not `response_json_schema`: combining structured output with tools wasn't confirmed in the docs.
-- **Model ID:** `GEMINI_MODEL = "gemini-3.8-flash"` (stable). Override with `st.secrets["gemini"]["model"]` or `GEMINI_MODEL`.
-- **Tests** use `MockLLMClient` (scripted `LLMTurn`s / callables). The Gemini wiring is tested offline with a fake `client.models`. Never call the network in tests.
+- **Tests** use `MockLLMClient` (scripted `LLMTurn`s / callables). The Gemini and Groq wiring is tested offline with fake clients (`tests/test_providers.py` fakes `chat.completions.create` and builds real `openai` errors with `httpx` responses). Never call the network in tests.
 
 ## Tracing (`services/tracing.py`)
 
@@ -192,13 +209,14 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `dataset_hash` is computed over canonical JSON, independent of CRLF/LF, and is stored in every run record. Replay refuses records from a different hash.
   - Rebuilding needs `--force` and changes the hash, which means a new live run and a new baseline.
 - **Deterministic checks** (`checks.py`): schema valid, class/probability/status match the classifier, refer → "clinician review", no confirmed-diagnosis claim (`asserts_confirmed_diagnosis`), limitations present (1–5), length limits (summary 2–3 sentences and ≤ 600 chars, recommendation ≤ 500, each limitation ≤ 300), and `guard_replay_consistent` (today's guard still rejects the recorded rejected drafts and accepts the final LLM report). Pass rates exclude not-applicable cases (`None`).
-- **Judge** (`judge.py`): Gemini structured output (`response_schema=JudgeResult`), with `rubric.md` sent verbatim. It sees tool outputs and the report only, never the true label. The judge model defaults to the agent's model (self-preference bias is possible; `--judge-model` changes it).
+- **Judge** (`judge.py`, `build_judge()`): Groq `qwen/qwen3.8-27b`, a different model family from the report model to avoid self-preference. It uses strict `json_schema` (`JUDGE_JSON_SCHEMA`: closed objects, scores as an integer enum 1–5, and Pydantic validates the result). `GeminiJudge` (`response_schema`) is used when the provider is gemini. `rubric.md` is sent verbatim. The judge sees tool outputs and the report only, never the true label. `--judge-model` overrides the model.
 - **Live runs** (`run.py --live`):
-  - One `RateLimiter` (default 4 RPM) is shared by the agent and the judge through `rate_limited_client`. It holds a reference to the genai `Client`, which closes its HTTP connection when garbage-collected. Never wrap an inline `genai.Client(...)` without keeping a reference.
+  - Agent and judge come from `build_llm_client("report")` / `build_judge()` with per-model budgets from `config/llm.json`; a model used by both shares one budget. A google-genai `Client` closes its HTTP connection when garbage-collected, so always keep a reference to it.
   - Records are appended; the last record per case wins. `--resume` skips judged cases and re-judges unjudged ones.
-  - Any LLM *exception* during the agent step raises `StopRun` instead of recording a template report as a result.
+  - A `rate_limit` or `infrastructure` failure in the agent step raises `StopRun` (retry later) instead of recording a template report as a result. A `model` failure (e.g. repeated `tool_use_failed`) is recorded as a real fallback outcome (`fallback_error_kind`).
+  - Context for a run (setup changes, why) goes in `evals/runs/<run>.notes.md`; `build_summary` appends it as "Run notes".
   - Rate-limit stops print the resume command.
-- **Free-tier quota:** `gemini-3.8-flash` allows **20 requests/day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`; resets at midnight Pacific) and 5/min. A full run is about 108 requests (36 × 2 agent + 1 judge), so it takes about 6 days on the free tier, or minutes on a paid key. `RateLimitError.daily` and `describe_llm_error` report daily exhaustion explicitly.
+- **Quotas:** a full run is 36 × (about 4 gpt-oss calls + 1 Qwen call), roughly 115k + 105k tokens, which fits Groq's free daily limits (200k tokens/day per model) at about 1–2 cases/min under 8k tokens/min. Gemini's free tier (20 requests/day for `gemini-3.8-flash`) could not run it in under about 6 days, which is why the provider moved to Groq.
 - **Replay and baseline:** `--replay` re-scores the baseline's run (or `--run`), prints the summary, and exits 1 if any deterministic pass rate is below `baseline.json`. `--update-baseline` rewrites it, marked PROVISIONAL while the run is partial. CI runs `--replay`.
 - **Human validation:** `--export-human-labels` writes 15 blind rows (5 error-only, 5 refer, 5 correct; LLM-written preferred) with empty score columns. It needs ≥ 15 reports and refuses to overwrite a sheet that has scores. `--agreement` gives exact, within-1 and mean (judge − human) per criterion. **Only a human fills in the scores.**
 
@@ -261,8 +279,7 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 ## Known issues (not yet fixed)
 
 - `agent/condition_info.json` is a draft that hasn't had clinical review. It must be signed off before clinical use.
-- The live eval run is partial (2/36 reports; the free-tier daily quota ran out), so `evals/baseline.json` is provisional.
-- The judge docks faithfulness for the "two public datasets" limitation because that fact isn't in any tool output, yet the agent's system prompt requires it. Consider exposing it through a tool (e.g. in `run_classifier`), so it's grounded.
+- The judge (`qwen/qwen3.8-27b`) is a Groq **Preview** model; Groq may change or remove it. Re-confirm the ID before relying on old scores.
 - The grounding guard checks the structured fields and banned phrases, not the meaning of the free text. A summary could still describe the wrong condition in words while keeping `predicted_class` correct.
 - The PDF still labels the prediction "Primary Diagnosis" and the title emoji renders as a box (Helvetica has no emoji).
 - The batch tab still marks a row "Error" if the history save fails, even though the prediction and log succeeded.

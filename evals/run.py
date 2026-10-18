@@ -1,6 +1,6 @@
 """Eval runner.
 
-    python -m evals.run --live [--resume [RUN]] [--rpm 4] [--limit N]   # real model + Gemini, resumable
+    python -m evals.run --live [--resume [RUN]] [--limit N]             # real model + LLM agent/judge, resumable
     python -m evals.run --replay [--run RUN] [--update-baseline]        # re-score saved outputs, no network (CI)
     python -m evals.run --export-human-labels [--run RUN]               # blank sheet for human scoring
     python -m evals.run --agreement [--run RUN]                         # judge vs human agreement
@@ -26,7 +26,6 @@ REPO = Path(__file__).resolve().parent.parent
 RUNS_DIR = REPO / "evals" / "runs"
 RESULTS_DIR = REPO / "evals" / "results"
 BASELINE_PATH = REPO / "evals" / "baseline.json"
-DEFAULT_RPM = 4  # free tier allows 5 requests/minute per model; keep a margin
 
 
 class StopRun(Exception):
@@ -86,10 +85,10 @@ def run_case(case, service, llm, roots):
         prediction = service.predict(image, tracer=tracer)
     tools = ReportTools(service, image, prediction, tracer=tracer)
     result = generate_report(tools, llm, tracer=tracer)
-    if result.source == "fallback" and result.error_detail is not None:
-        # The LLM call itself failed (quota, network, auth): that says nothing about report
-        # quality, so stop and retry later instead of recording a template report as a result
-        raise StopRun(f"{result.reason} {result.error_detail[:300]}")
+    if result.source == "fallback" and result.error_kind in ("rate_limit", "infrastructure"):
+        # Quota, network, auth or server failure: says nothing about report quality, so stop and
+        # retry later. A 'model' failure (e.g. an invalid tool call) IS a result and is recorded.
+        raise StopRun(f"{result.reason} {(result.error_detail or '')[:300]}")
 
     truth = tools.run_classifier()
     llm_calls = [s for s in tracer.spans if s.name == "llm_call"]
@@ -103,6 +102,7 @@ def run_case(case, service, llm, roots):
         "report": result.report.model_dump(),
         "report_source": result.source,
         "fallback_reason": result.reason,
+        "fallback_error_kind": result.error_kind,
         "steps": result.steps,
         "rejected": result.rejected,
         "agent_usage": {
@@ -117,22 +117,25 @@ def run_case(case, service, llm, roots):
 
 def live(args):
     import logging
-
-    from google import genai
     logging.getLogger("streamlit").setLevel(logging.ERROR)  # ModelService's st.cache_resource outside the app
 
     sys.path.insert(0, str(REPO / "scripts"))
-    from agent.agent import GeminiClient, RateLimitError, describe_llm_error, load_gemini_settings
+    from agent.agent import RateLimitError, build_llm_client, describe_llm_error
+    from agent.llm_config import provider_settings
     from calibrate import find_root
-    from evals.judge import GeminiJudge
-    from evals.rate_limit import RateLimiter, rate_limited_client
+    from evals.judge import build_judge
     from services.model_handler import ModelService
 
     cases = load_cases()
     data_hash = dataset_hash(cases)
-    api_key, model = load_gemini_settings()
-    if not api_key:
-        raise SystemExit("No Gemini key: set st.secrets['gemini']['api_key'] or GEMINI_API_KEY.")
+    provider, settings = provider_settings()
+    # Agent and judge get per-model token-aware budgets from config/llm.json (shared if the model is the same)
+    llm = build_llm_client("report")
+    judge = build_judge(args.judge_model)
+    if llm is None or judge is None:
+        raise SystemExit(f"No API key for provider {provider!r}: set st.secrets['{settings['secret_section']}']"
+                         f"['api_key'] or {settings['env_key']}.")
+    model = llm.name
 
     if args.resume:
         run_path = Path(args.resume) if args.resume != "latest" else latest_run()
@@ -145,13 +148,8 @@ def live(args):
         run_path = RUNS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
         records = {}
     run_id = run_path.stem
-    print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, model {model}, "
-          f"judge {args.judge_model or model}, {args.rpm} requests/min")
-
-    limiter = RateLimiter(args.rpm)
-    client = rate_limited_client(genai.Client(api_key=api_key), limiter)  # one limiter for agent + judge
-    llm = GeminiClient(api_key, model, client=client)
-    judge = GeminiJudge(api_key, args.judge_model or model, client=client)
+    print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, provider {provider}, "
+          f"reports {model}, judge {judge.model}")
     service = ModelService(str(REPO / "best_student_model_aligned_final.pth"))
     roots = {"pneumonia": find_root(REPO / "data" / "pneumonia", "chest_xray", "train"),
              "tb": find_root(REPO / "data" / "tb", "TB_Chest_Radiography_Database", "Tuberculosis")}
@@ -164,7 +162,7 @@ def live(args):
                 continue
             if record is None:
                 record = {"record_version": RECORD_VERSION, "case_id": case.case_id, "run_id": run_id,
-                          "dataset_hash": data_hash, "agent_model": model,
+                          "dataset_hash": data_hash, "provider": provider, "agent_model": model,
                           "recorded_at": datetime.now(timezone.utc).isoformat(),
                           **run_case(case, service, llm, roots), "judge": None, "judge_error": None}
                 append_record(run_path, record)
@@ -182,10 +180,10 @@ def live(args):
             j = record["judge"]
             print(f"[{i}/{len(todo)}] {case.case_id}: {record['report_source']}, "
                   f"judge {'-'.join(str(j['scores'][c]['score']) for c in CRITERIA) if j else record['judge_error']}"
-                  f" ({limiter.calls} requests so far)", flush=True)
+                  f" ({record.get('agent_usage', {}).get('llm_calls', '?')} agent calls)", flush=True)
     except StopRun as e:
         remaining = sum(1 for c in todo if not (records.get(c.case_id) or {}).get("judge"))
-        print(f"\nStopped: {e}\n{remaining} cases left (~{remaining * 3} Gemini requests: 2 agent + 1 judge each). "
+        print(f"\nStopped: {e}\n{remaining} cases left. "
               f"Resume with: python -m evals.run --live --resume {relative(run_path)}")
         return 2
 
@@ -312,6 +310,10 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
                          f"{fmt(s['mean_judge_minus_human'])} |")
         if a["problems"]:
             lines += ["", "Problems: " + "; ".join(a["problems"])]
+    # Human-written context for this run (e.g. why the setup changed), kept next to the run file
+    notes = Path(run_path).with_suffix(".notes.md")
+    if notes.exists():
+        lines += ["", "## Run notes", "", notes.read_text(encoding="utf-8").strip()]
     return {"markdown": "\n".join(lines) + "\n", "rates": rates, "drops": drops}
 
 
@@ -379,7 +381,6 @@ def main(argv=None):
     mode.add_argument("--agreement", action="store_true")
     ap.add_argument("--resume", nargs="?", const="latest", help="continue a live run (default: latest)")
     ap.add_argument("--run", help="run file to replay / export / compare (default: baseline run or latest)")
-    ap.add_argument("--rpm", type=float, default=DEFAULT_RPM, help="max Gemini requests per minute")
     ap.add_argument("--limit", type=int, help="only the first N cases")
     ap.add_argument("--judge-model", help="judge model (default: the agent's model)")
     ap.add_argument("--update-baseline", action="store_true", help="with --replay: write evals/baseline.json")

@@ -10,7 +10,6 @@ Only tool outputs are sent to the LLM: no image pixels and no patient details.
 import dataclasses
 import hashlib
 import json
-import os
 import re
 import threading
 import time
@@ -21,6 +20,8 @@ from typing import Any, List, Optional
 
 from pydantic import ValidationError
 
+from agent.llm_config import load_llm_config, provider_settings, request_options
+from agent.rate_limit import DailyCapReached, budget_for, estimate_tokens
 from agent.schema import DISCLAIMER, Report
 from agent.tools import TOOL_DECLARATIONS, ReportTools
 from services.calibration import REFER_MESSAGE, STATUS_REFER
@@ -42,9 +43,9 @@ NEGATION_WINDOW_WORDS = 4
 SYSTEM_PROMPT = f"""You write short, plain-language reports about an AI chest X-ray classifier's result.
 
 Rules:
-1. In your FIRST turn, call all three tools at once (parallel function calls), with no arguments:
-   run_classifier, get_gradcam and get_condition_info (it defaults to the predicted class).
-   Then write the report. Don't call tools one at a time.
+1. Call each of the three tools once, with no arguments: run_classifier, get_gradcam and
+   get_condition_info (it defaults to the predicted class). If you can make parallel function calls,
+   call all three in your first turn. Then write the report.
 2. run_classifier's output is authoritative. Copy predicted_class, calibrated_probability and status
    into the report EXACTLY as returned. Never change, round or reinterpret them.
 3. Use get_gradcam to describe which approximate region influenced the model. Hedge: it is a coarse
@@ -54,8 +55,8 @@ Rules:
 5. If status is "refer", the recommendation must begin with "{REFER_MESSAGE.capitalize()}." and say
    that clinician review is needed.
 6. summary: 2-3 plain-language sentences for a non-specialist. recommendation: next step for the
-   reader. limitations: short bullet strings, including that the model was evaluated on data from
-   two public datasets where each disease came from a different source.
+   reader. limitations: short bullet strings taken from get_condition_info (what_this_result_means
+   and model_limitations); don't invent others.
 
 When you have the facts, reply with ONLY a JSON object (no markdown) matching this JSON Schema:
 {json.dumps(Report.model_json_schema())}"""
@@ -90,21 +91,30 @@ class LLMClient(ABC):
     name = "llm"
 
     @abstractmethod
-    def generate(self, system, messages, tools):
-        """Return the next LLMTurn."""
+    def generate(self, system, messages, tools, tools_allowed=True):
+        """Return the next LLMTurn. tools_allowed=False forbids tool calls (final-answer turn)."""
 
 
 class RateLimitError(Exception):
-    """The LLM provider returned 429 and we didn't (or couldn't) wait it out."""
+    """The LLM provider returned 429 (or a client-side cap was hit) and we didn't wait it out."""
 
-    def __init__(self, retry_delay=None, quota_id=None, quota_limit=None):
+    def __init__(self, retry_delay=None, quota_id=None, quota_limit=None, provider="Gemini",
+                 resets="midnight Pacific time"):
         super().__init__(f"rate limited (quota {quota_id or 'unknown'}, limit {quota_limit}, "
                          f"retry delay {retry_delay})")
         self.retry_delay, self.quota_id, self.quota_limit = retry_delay, quota_id, quota_limit
+        self.provider, self.resets = provider, resets
 
     @property
     def daily(self):
-        return "PerDay" in (self.quota_id or "")
+        q = self.quota_id or ""
+        return "PerDay" in q or "per day" in q.lower()
+
+    @classmethod
+    def from_daily_cap(cls, cap, provider):
+        """Client-side daily cap from config/llm.json (agent/rate_limit.py)."""
+        return cls(None, f"client daily {cap.what} cap for {cap.model} (per day)", f"{cap.cap} {cap.what}s"
+                   if cap.what == "token" else cap.cap, provider=provider, resets="midnight UTC (client cap)")
 
 
 def quota_info(error):
@@ -133,17 +143,41 @@ def describe_llm_error(error):
     """Short, user-facing reason for an LLM failure (the full error stays in ReportResult.error_detail)."""
     if isinstance(error, RateLimitError):
         if error.daily:
-            limit = f" of {error.quota_limit} requests" if error.quota_limit else ""
-            return f"Gemini daily quota{limit} reached (resets at midnight Pacific time)."
+            limit = error.quota_limit
+            unit = "tokens" if "token" in (error.quota_id or "").lower() else "requests"
+            limit = "" if not limit else f" of {limit}" if not str(limit).isdigit() else f" of {limit} {unit}"
+            return f"{error.provider} daily quota{limit} reached (resets at {error.resets})."
         wait = f" (retry in {error.retry_delay:.0f} s)" if error.retry_delay else ""
-        return f"Gemini rate limit reached{wait}."
-    if hasattr(error, "code") and hasattr(error, "status"):  # google.genai.errors.APIError
-        return f"Gemini error {error.code} {error.status}."
+        return f"{error.provider} rate limit reached{wait}."
+    if hasattr(error, "code") and hasattr(error, "status") and not hasattr(error, "status_code"):
+        return f"Gemini error {error.code} {error.status}."  # google.genai.errors.APIError
+    if hasattr(error, "status_code"):  # openai.APIStatusError (Groq and other OpenAI-compatible APIs)
+        if _is_tool_use_failed(error):
+            return "The model produced an invalid tool call."
+        return f"LLM API error {error.status_code}."
     return f"LLM call failed ({type(error).__name__})."
 
 
+def _is_tool_use_failed(error):
+    body = getattr(error, "body", None)
+    code = (body.get("error", body) if isinstance(body, dict) else {}).get("code") if isinstance(body, dict) else None
+    return getattr(error, "status_code", None) == 400 and (code == "tool_use_failed" or "tool_use_failed" in str(error))
+
+
+def classify_llm_error(error):
+    """'rate_limit', 'infrastructure' (network, auth, server, unknown) or 'model' (the model misbehaved).
+
+    Eval runs stop on rate_limit/infrastructure (retry later) but record 'model' failures as results.
+    """
+    if isinstance(error, RateLimitError):
+        return "rate_limit"
+    if _is_tool_use_failed(error) or isinstance(error, json.JSONDecodeError):
+        return "model"
+    return "infrastructure"
+
+
 class GeminiClient(LLMClient):
-    def __init__(self, api_key, model=GEMINI_MODEL, client=None, sleep=time.sleep):
+    def __init__(self, api_key, model=GEMINI_MODEL, client=None, sleep=time.sleep, budget=None):
         from google import genai
         from google.genai import errors, types
         self.types = types
@@ -152,6 +186,7 @@ class GeminiClient(LLMClient):
         self.name = model
         self.client = client or genai.Client(api_key=api_key)
         self.sleep = sleep
+        self.budget = budget  # agent.rate_limit.ModelBudget shared per model, or None
 
     def _contents(self, messages):
         t = self.types
@@ -169,21 +204,27 @@ class GeminiClient(LLMClient):
                     for call, result in m["results"]]))
         return contents
 
-    def generate(self, system, messages, tools):
+    def generate(self, system, messages, tools, tools_allowed=True):
         t = self.types
         config = t.GenerateContentConfig(
             system_instruction=system,
             tools=[t.Tool(function_declarations=[
                 t.FunctionDeclaration(name=d["name"], description=d["description"],
                                       parameters_json_schema=d["parameters"]) for d in tools])],
+            tool_config=None if tools_allowed else t.ToolConfig(
+                function_calling_config=t.FunctionCallingConfig(mode="NONE")),
             automatic_function_calling=t.AutomaticFunctionCallingConfig(disable=True),
             thinking_config=t.ThinkingConfig(thinking_level="low"),
         )
         contents = self._contents(messages)
         retries = 0
         for attempt in (1, 2):
+            reservation = self._reserve(system, messages, tools)
             try:
                 response = self.client.models.generate_content(model=self.model, contents=contents, config=config)
+                meta = response.usage_metadata
+                if self.budget is not None and meta is not None:
+                    self.budget.record(reservation, meta.total_token_count)
                 break
             except self.errors.ClientError as e:
                 if e.code != 429:
@@ -210,6 +251,136 @@ class GeminiClient(LLMClient):
         return LLMTurn(text=text, tool_calls=calls, raw=content, usage=usage, rate_limit_retries=retries,
                        finish_reason=getattr(finish, "name", None) or (str(finish) if finish else None))
 
+    def _reserve(self, system, messages, tools):
+        if self.budget is None:
+            return None
+        try:
+            return self.budget.acquire(estimate_tokens(system, [m.get("text") for m in messages], tools) + 1000)
+        except DailyCapReached as cap:
+            raise RateLimitError.from_daily_cap(cap, "Gemini") from cap
+
+
+class OpenAICompatibleClient(LLMClient):
+    """Chat Completions API with tool calling (Groq, or any OpenAI-compatible endpoint)."""
+
+    def __init__(self, api_key, model, base_url, client=None, sleep=time.sleep, budget=None, options=None,
+                 provider="Groq"):
+        if client is None:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)  # retries are handled here
+        self.client, self.model, self.name = client, model, model
+        self.sleep, self.budget, self.provider = sleep, budget, provider
+        self.options = dict(options or {})
+
+    def _messages(self, system, messages):
+        out = [{"role": "system", "content": system}]
+        for m in messages:
+            if m["role"] == "user":
+                out.append({"role": "user", "content": m["text"]})
+            elif m["role"] == "assistant":
+                out.append(m["turn"].raw)
+            else:
+                out += [{"role": "tool", "tool_call_id": call.id, "name": call.name,
+                         "content": json.dumps(result, default=str)} for call, result in m["results"]]
+        return out
+
+    def generate(self, system, messages, tools, tools_allowed=True):
+        import openai
+        payload = self._messages(system, messages)
+        tool_specs = [{"type": "function", "function": {"name": d["name"], "description": d["description"],
+                                                        "parameters": d["parameters"]}} for d in tools]
+        options = dict(self.options, **({} if tools_allowed else {"tool_choice": "none"}))
+        retries = 0
+        for attempt in (1, 2):
+            reservation = self._reserve(payload, tool_specs)
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model, messages=payload, tools=tool_specs, **split_request_options(options))
+                break
+            except openai.RateLimitError as e:
+                delay = openai_retry_after(e)
+                if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
+                    self.sleep(delay)
+                    retries += 1
+                    continue
+                raise RateLimitError(delay, *openai_quota_info(e), provider=self.provider,
+                                     resets="the provider's daily window") from e
+        usage = response.usage
+        if self.budget is not None and usage is not None:
+            self.budget.record(reservation, usage.total_tokens, usage.completion_tokens)
+        choice = response.choices[0]
+        message = choice.message
+        calls = []
+        for tc in message.tool_calls or []:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}  # malformed arguments: our tools take none, so let the call through
+            calls.append(ToolCall(name=tc.function.name, args=args if isinstance(args, dict) else {}, id=tc.id))
+        raw = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            raw["tool_calls"] = [{"id": tc.id, "type": "function",
+                                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                                 for tc in message.tool_calls]
+        return LLMTurn(text=None if calls else (message.content or ""), tool_calls=calls, raw=raw,
+                       usage=openai_usage(usage), finish_reason=choice.finish_reason, rate_limit_retries=retries)
+
+    def _reserve(self, payload, tool_specs):
+        if self.budget is None:
+            return None
+        try:
+            max_out = int(self.options.get("max_completion_tokens", 1000))
+            return self.budget.acquire(estimate_tokens(payload, tool_specs) + max_out, max_out)
+        except DailyCapReached as cap:
+            raise RateLimitError.from_daily_cap(cap, self.provider) from cap
+
+
+# Parameters the openai SDK accepts as keyword arguments; provider-specific ones (Groq's
+# include_reasoning, reasoning_format, ...) must go through extra_body.
+OPENAI_STANDARD_PARAMS = {"max_completion_tokens", "max_tokens", "reasoning_effort", "temperature", "top_p",
+                          "seed", "stop", "parallel_tool_calls", "tool_choice"}
+
+
+def split_request_options(options):
+    """Request options as create() kwargs, with non-standard keys moved into extra_body."""
+    kwargs = {k: v for k, v in options.items() if k in OPENAI_STANDARD_PARAMS}
+    extra = {k: v for k, v in options.items() if k not in OPENAI_STANDARD_PARAMS}
+    if extra:
+        kwargs["extra_body"] = extra
+    return kwargs
+
+
+def openai_usage(usage):
+    """{input, output (excluding reasoning), thinking} so output + thinking = billed completion tokens."""
+    if usage is None:
+        return None
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning = getattr(details, "reasoning_tokens", None) if details is not None else None
+    completion = usage.completion_tokens
+    return {"input_tokens": usage.prompt_tokens,
+            "output_tokens": completion - reasoning if reasoning is not None else completion,
+            "thinking_tokens": reasoning}
+
+
+def openai_retry_after(error):
+    """Seconds from the 429's retry-after header, else 'try again in 1m2.5s' in the message, or None."""
+    response = getattr(error, "response", None)
+    value = response.headers.get("retry-after") if response is not None else None
+    if value:
+        try:
+            return float(value)
+        except ValueError:
+            pass
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", str(error))
+    return (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else None
+
+
+def openai_quota_info(error):
+    """(quota description, limit) from Groq's 429 message, e.g. ('tokens per day (TPD)', '200000')
+    or ('output tokens per minute (OTPM)', '1000')."""
+    m = re.search(r"on ([a-z ]*?(?:tokens|requests)) per (minute|day) \((\w+)\): Limit (\d+)", str(error))
+    return (f"{m.group(1)} per {m.group(2)} ({m.group(3)})", m.group(4)) if m else (None, None)
+
 
 class MockLLMClient(LLMClient):
     """Scripted client for tests. Each script item is an LLMTurn or a callable(messages) -> LLMTurn."""
@@ -218,9 +389,11 @@ class MockLLMClient(LLMClient):
     def __init__(self, script):
         self.script = list(script)
         self.calls = []
+        self.tools_allowed = []
 
-    def generate(self, system, messages, tools):
+    def generate(self, system, messages, tools, tools_allowed=True):
         self.calls.append(list(messages))
+        self.tools_allowed.append(tools_allowed)
         if not self.script:
             raise RuntimeError("MockLLMClient script exhausted")
         item = self.script.pop(0)
@@ -246,6 +419,7 @@ class ReportResult:
     tool_calls: List[str] = field(default_factory=list)
     rejected: List[dict] = field(default_factory=list)  # exact LLM outputs the guard rejected, for audit/tests
     error_detail: Optional[str] = None  # full LLM error text (not shown to users)
+    error_kind: Optional[str] = None    # classify_llm_error(): rate_limit / infrastructure / model
     cached: bool = False                 # served from REPORT_CACHE, no LLM requests spent
 
     def source_line(self):
@@ -256,23 +430,21 @@ class ReportResult:
         return "Standard template report generated from the classifier's output."
 
 
-def load_gemini_settings():
-    """(api_key, model) from st.secrets["gemini"] or env GEMINI_API_KEY / GEMINI_MODEL."""
-    secrets = {}
-    try:
-        import streamlit as st
-        secrets = dict(st.secrets.get("gemini", {}))
-    except Exception:
-        pass  # no secrets file outside Streamlit
-    api_key = secrets.get("api_key") or os.environ.get("GEMINI_API_KEY")
-    model = secrets.get("model") or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
-    return api_key, model
+def build_llm_client(role="report", model=None, config=None):
+    """Client for the configured provider (config/llm.json, env LLM_PROVIDER), or None without a key.
 
-
-def build_llm_client():
-    """GeminiClient if a key is configured, else None (callers then get the template report)."""
-    api_key, model = load_gemini_settings()
-    return GeminiClient(api_key, model) if api_key else None
+    role picks report_model or judge_model; model overrides it. Each model gets its shared budget.
+    """
+    config = config or load_llm_config()
+    name, settings = provider_settings(config)
+    if not settings["api_key"]:
+        return None
+    model = model or settings[f"{role}_model"]
+    budget = budget_for(model, config["limits"].get(model, {}))
+    if settings["kind"] == "gemini":
+        return GeminiClient(settings["api_key"], model, budget=budget)
+    return OpenAICompatibleClient(settings["api_key"], model, settings["base_url"], budget=budget,
+                                  options=request_options(model, config), provider=name.capitalize())
 
 
 def asserts_confirmed_diagnosis(text):
@@ -355,12 +527,7 @@ def fallback_report(tools):
         status=truth["status"],
         summary=" ".join(sentences),
         recommendation=recommendation,
-        limitations=[
-            info["what_this_result_means"],
-            "The model was evaluated on two public datasets in which each disease came from a different "
-            "source, so performance on images from other hospitals or scanners may be lower.",
-            "Grad-CAM regions are approximate and show what influenced the model, not confirmed findings.",
-        ],
+        limitations=[info["what_this_result_means"], *info["model_limitations"]],  # all from the tool output
         disclaimer=DISCLAIMER,
     )
     assert not check_grounding(report, truth), check_grounding(report, truth)
@@ -400,25 +567,38 @@ def _generate_report(tools, llm, max_steps, max_retries, tracer):
     truth = tools.run_classifier()  # ground truth for the guard, independent of what the LLM calls
     result = ReportResult(report=None, source="fallback")
 
-    def fall_back(reason, detail=None):
+    def fall_back(reason, detail=None, kind=None):
         result.report, result.source, result.reason = fallback_report(tools), "fallback", reason
-        result.error_detail = detail
+        result.error_detail, result.error_kind = detail, kind
         return result
 
     if llm is None:
-        return fall_back("No LLM configured (set st.secrets['gemini']['api_key'] or GEMINI_API_KEY).")
+        return fall_back("No LLM configured (set an API key for the provider in config/llm.json, "
+                         "e.g. st.secrets['groq']['api_key'] or GROQ_API_KEY).")
 
     messages = [{"role": "user", "text": USER_PROMPT}]
     retries_left = max_retries
+    all_tools = {d["name"] for d in TOOL_DECLARATIONS}
     for step in range(1, max_steps + 1):
         result.steps = step
+        # Once every tool has been called the model has all the facts: forbid further tool calls so the
+        # turn can only be the final answer (avoids malformed tool calls such as Groq's tool_use_failed)
+        tools_allowed = not all_tools <= set(result.tool_calls)
         try:
-            with trace_span(tracer, "llm_call", model=llm.name, step=step) as span:
-                turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS)
+            with trace_span(tracer, "llm_call", model=llm.name, step=step, tools_allowed=tools_allowed) as span:
+                turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS, tools_allowed=tools_allowed)
                 safe_set(span, **llm_call_attributes(turn, llm.name))
         except Exception as e:
             detail = f"{type(e).__name__}: {e}" + (f" <- {e.__cause__}" if e.__cause__ else "")
-            return fall_back(describe_llm_error(e), detail)
+            kind = classify_llm_error(e)
+            if kind == "model" and retries_left > 0:
+                # The model misbehaved at the API level (e.g. invalid tool call): retry once, like a guard rejection
+                retries_left -= 1
+                result.problems.append(describe_llm_error(e))
+                result.rejected.append({"step": step, "text": None, "problem": describe_llm_error(e),
+                                        "error_detail": detail[:500]})
+                continue
+            return fall_back(describe_llm_error(e), detail, kind)
         messages.append({"role": "assistant", "turn": turn})
 
         if turn.tool_calls:

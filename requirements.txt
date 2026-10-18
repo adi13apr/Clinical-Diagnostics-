@@ -11,3 +11,4 @@ matplotlib
 pandas
 google-genai
 pydantic
+openai

@@ -327,7 +327,8 @@ def test_parallel_tool_calls_need_two_llm_calls(make_tools):
 
 
 def test_prompt_asks_for_parallel_tool_calls():
-    assert "call all three tools at once" in SYSTEM_PROMPT
+    # Parallel when the model supports it (Gemini); gpt-oss-120b on Groq calls them one per turn
+    assert "call all three in your first turn" in SYSTEM_PROMPT
     declaration = next(d for d in TOOL_DECLARATIONS if d["name"] == "get_condition_info")
     assert "required" not in declaration["parameters"]
 

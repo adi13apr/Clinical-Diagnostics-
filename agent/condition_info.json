@@ -7,6 +7,10 @@
       "https://www.who.int/news-room/fact-sheets/detail/pneumonia"
     ]
   },
+  "_model_limitations": [
+    "The model was trained and evaluated on two public datasets in which each disease came from a different source (pneumonia images from a pediatric JPEG dataset, tuberculosis images from an adult PNG dataset), so performance on images from other hospitals or scanners may be lower.",
+    "Grad-CAM regions are approximate and show what influenced the model, not confirmed findings."
+  ],
   "Normal": {
     "overview": "The classifier did not find patterns it associates with pneumonia or tuberculosis in this chest X-ray.",
     "typical_xray_findings": "Clear lung fields without areas of consolidation, cavities or nodules that the model was trained to recognise.",

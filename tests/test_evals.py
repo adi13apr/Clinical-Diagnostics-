@@ -12,7 +12,6 @@ from evals.checks import CHECKS, pass_rates, run_checks
 from evals.dataset import CASES_PATH, dataset_hash, load_cases
 from evals.human_labels import LabelsAlreadyFilled, agreement, export_human_labels, read_labels
 from evals.judge import GeminiJudge, MockJudge
-from evals.rate_limit import RateLimiter
 from evals.schema import CASE_SCHEMA_VERSION, CRITERIA, JudgeResult, SchemaVersionError
 
 CASES = load_cases()
@@ -164,21 +163,6 @@ def test_committed_baseline_replays_cleanly():
     if not eval_run.BASELINE_PATH.exists():
         pytest.skip("no committed baseline yet")
     assert eval_run.main(["--replay"]) == 0
-
-
-# Rate limiter
-
-def test_rate_limiter_spaces_calls():
-    now, sleeps = [0.0], []
-
-    def sleep(s):
-        sleeps.append(round(s, 3))
-        now[0] += s
-
-    limiter = RateLimiter(4, clock=lambda: now[0], sleep=sleep)
-    for _ in range(3):
-        limiter.wait()
-    assert sleeps == [15.0, 15.0] and limiter.calls == 3
 
 
 # Judge

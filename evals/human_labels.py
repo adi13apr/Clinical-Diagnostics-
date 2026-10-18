@@ -14,8 +14,8 @@ HUMAN_LABELS_PATH = Path(__file__).resolve().parent / "human_labels.csv"
 N_LABELS = 15
 SEED = 7
 CONTEXT_COLUMNS = ["case_id", "classifier_result", "classifier_probabilities", "gradcam_summary",
-                   "condition_info_for", "report_source", "report_summary", "report_recommendation",
-                   "report_limitations"]
+                   "condition_info_for", "condition_info_text", "report_source", "report_summary",
+                   "report_recommendation", "report_limitations"]
 SCORE_COLUMNS = CRITERIA + ["notes"]
 
 
@@ -54,6 +54,13 @@ def select_for_labelling(records, cases_by_id, n=N_LABELS, seed=SEED):
     return sorted(chosen, key=lambda r: r["case_id"])
 
 
+def _condition_text(info):
+    parts = [f"{k}: {info[k]}" for k in ("overview", "typical_xray_findings", "what_this_result_means",
+                                         "typical_next_steps") if info.get(k)]
+    parts += [f"model limitation: {l}" for l in info.get("model_limitations", [])]
+    return " | ".join(parts)
+
+
 def _row(record):
     c, g, rep = record["classifier"], record["tool_outputs"].get("gradcam") or {}, record["report"]
     gradcam = ("unavailable" if not g.get("peak_region") else
@@ -64,6 +71,8 @@ def _row(record):
         "classifier_probabilities": ", ".join(f"{k} {v}" for k, v in c["probabilities"].items()),
         "gradcam_summary": gradcam,
         "condition_info_for": (record["tool_outputs"].get("condition_info") or {}).get("condition", ""),
+        # The same vetted text the judge sees, so faithfulness can be checked against it
+        "condition_info_text": _condition_text(record["tool_outputs"].get("condition_info") or {}),
         "report_source": record["report_source"],
         "report_summary": rep["summary"],
         "report_recommendation": rep["recommendation"],

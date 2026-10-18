@@ -34,7 +34,8 @@ TOOL_DECLARATIONS = [
         "name": "get_condition_info",
         "description": (
             "Vetted background text about a condition (overview, typical X-ray findings, what an AI "
-            "result means, typical next steps). Use only this text for medical background. "
+            "result means, typical next steps) plus the model's known limitations (model_limitations). "
+            "Use only this text for medical background and limitations. "
             "Omit 'condition' to get the classifier's predicted class."
         ),
         "parameters": {
@@ -88,6 +89,8 @@ class ReportTools:
         if condition not in CLASS_NAMES:
             raise ValueError(f"Unknown condition {condition!r}; expected one of {CLASS_NAMES}")
         return {"condition": condition, **self.condition_info[condition],
+                # Model-level caveats live here (not in the system prompt) so report text about them is grounded
+                "model_limitations": list(self.condition_info["_model_limitations"]),
                 "review_status": self.condition_info["_meta"]["review_status"]}
 
     def call(self, name, args):
