@@ -97,9 +97,25 @@ class LLMClient(ABC):
 class RateLimitError(Exception):
     """The LLM provider returned 429 and we didn't (or couldn't) wait it out."""
 
-    def __init__(self, retry_delay=None):
-        super().__init__(f"rate limited (retry delay {retry_delay})")
-        self.retry_delay = retry_delay
+    def __init__(self, retry_delay=None, quota_id=None, quota_limit=None):
+        super().__init__(f"rate limited (quota {quota_id or 'unknown'}, limit {quota_limit}, "
+                         f"retry delay {retry_delay})")
+        self.retry_delay, self.quota_id, self.quota_limit = retry_delay, quota_id, quota_limit
+
+    @property
+    def daily(self):
+        return "PerDay" in (self.quota_id or "")
+
+
+def quota_info(error):
+    """(quota_id, limit) from a 429's QuotaFailure detail, e.g. ('GenerateRequestsPerDay...-FreeTier', '20')."""
+    body = getattr(error, "details", None)
+    details = body.get("error", {}).get("details", []) if isinstance(body, dict) else []
+    for d in details:
+        if str(d.get("@type", "")).endswith("QuotaFailure"):
+            for v in d.get("violations", []):
+                return v.get("quotaId"), v.get("quotaValue")
+    return None, None
 
 
 def retry_delay_seconds(error):
@@ -116,6 +132,9 @@ def retry_delay_seconds(error):
 def describe_llm_error(error):
     """Short, user-facing reason for an LLM failure (the full error stays in ReportResult.error_detail)."""
     if isinstance(error, RateLimitError):
+        if error.daily:
+            limit = f" of {error.quota_limit} requests" if error.quota_limit else ""
+            return f"Gemini daily quota{limit} reached (resets at midnight Pacific time)."
         wait = f" (retry in {error.retry_delay:.0f} s)" if error.retry_delay else ""
         return f"Gemini rate limit reached{wait}."
     if hasattr(error, "code") and hasattr(error, "status"):  # google.genai.errors.APIError
@@ -175,7 +194,7 @@ class GeminiClient(LLMClient):
                     self.sleep(delay)
                     retries += 1
                     continue
-                raise RateLimitError(delay) from e
+                raise RateLimitError(delay, *quota_info(e)) from e
         if not response.candidates or response.candidates[0].content is None:
             raise RuntimeError(f"Gemini returned no content: {response.prompt_feedback}")
         content = response.candidates[0].content

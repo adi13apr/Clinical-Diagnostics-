@@ -436,6 +436,16 @@ def test_retry_delay_is_read_from_message_when_details_missing():
     assert retry_delay_seconds(ValueError("boom")) is None
 
 
+def test_daily_quota_is_reported_as_daily(make_tools):
+    daily = genai_errors.ClientError(429, {"error": {
+        "code": 429, "message": "Quota exceeded. Please retry in 30039s.", "status": "RESOURCE_EXHAUSTED",
+        "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [
+            {"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier", "quotaValue": "20"}]},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "30039s"}]}})
+    result = generate_report(make_tools(CONFIDENT), gemini_client(RaisingModels([daily])))
+    assert result.reason == "Gemini daily quota of 20 requests reached (resets at midnight Pacific time)."
+
+
 def test_other_gemini_errors_get_a_short_reason(make_tools):
     bad_request = genai_errors.ClientError(400, {"error": {"code": 400, "message": "bad", "status": "INVALID_ARGUMENT"}})
     result = generate_report(make_tools(CONFIDENT), gemini_client(RaisingModels([bad_request])))

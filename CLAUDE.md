@@ -16,7 +16,11 @@ pip install -r requirements-dev.txt  # + pytest
 streamlit run app.py
 pytest                             # no Supabase, dataset or GPU needed
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
+python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
+python -m evals.run --live --resume  # continue the live eval (real model + Gemini; needs data/ and a key)
 ```
+
+CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`.
 
 The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 
@@ -78,6 +82,14 @@ notebooks/
 outputs/                    Committed calibration results
   calibration.json          Temperature (read by the app at startup), test metrics, coverage table
   reliability.png           Reliability diagram before/after scaling
+evals/                      Report-agent eval suite (see "Evals")
+  cases.jsonl               36 versioned test-split cases (schema_version 1)
+  rubric.md                 Judge + human rubric (faithfulness, uncertainty_language, actionability, plain_language)
+  runs/*.jsonl              Raw live-run records (committed; replayed by CI)
+  results/<date>.md         Run summaries
+  baseline.json             Deterministic pass rates CI must not drop below
+  human_labels.csv          Blind sheet for a HUMAN to score (never fill it in programmatically)
+.github/workflows/ci.yml    pytest + eval replay
 tests/                      pytest; conftest.py stubs the network so tests need no checkpoint or Supabase
   fixtures/                 Verbatim LLM outputs used as regression tests
 data/                       Gitignored. Kaggle datasets + data/cache/calibration_logits.npz
@@ -172,6 +184,24 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - Analytics `show_trace_analytics` reads Supabase, falling back to local JSONL, and uses `summarize_spans` for average latency per step (events excluded), tokens and nominal cost per LLM report, guard reject rate and fallback rate (cache hits excluded).
 - **Measured (live, CPU, one report):** preprocess 130 ms, classify 47 ms, Grad-CAM figure 1.15 s (raw map 0.1 s), LLM calls 10.8 s + 3.5 s, about 2.2k input and 350 output tokens, about $0.003 nominal.
 
+## Evals (`evals/`)
+
+- **Dataset:** `python -m evals.dataset` builds `cases.jsonl` from the cached test-split logits. It includes every model error (24), every refer case (17; 11 overlap with errors), and 6 confident correct cases (2 per class; Normal takes one from each source), for 36 in total.
+  - Each case snapshots the classifier output; live runs record `snapshot_match` to catch drift.
+  - `load_cases` raises `SchemaVersionError` on a `schema_version` mismatch. `EvalCase` forbids unknown fields.
+  - `dataset_hash` is computed over canonical JSON, independent of CRLF/LF, and is stored in every run record. Replay refuses records from a different hash.
+  - Rebuilding needs `--force` and changes the hash, which means a new live run and a new baseline.
+- **Deterministic checks** (`checks.py`): schema valid, class/probability/status match the classifier, refer → "clinician review", no confirmed-diagnosis claim (`asserts_confirmed_diagnosis`), limitations present (1–5), length limits (summary 2–3 sentences and ≤ 600 chars, recommendation ≤ 500, each limitation ≤ 300), and `guard_replay_consistent` (today's guard still rejects the recorded rejected drafts and accepts the final LLM report). Pass rates exclude not-applicable cases (`None`).
+- **Judge** (`judge.py`): Gemini structured output (`response_schema=JudgeResult`), with `rubric.md` sent verbatim. It sees tool outputs and the report only, never the true label. The judge model defaults to the agent's model (self-preference bias is possible; `--judge-model` changes it).
+- **Live runs** (`run.py --live`):
+  - One `RateLimiter` (default 4 RPM) is shared by the agent and the judge through `rate_limited_client`. It holds a reference to the genai `Client`, which closes its HTTP connection when garbage-collected. Never wrap an inline `genai.Client(...)` without keeping a reference.
+  - Records are appended; the last record per case wins. `--resume` skips judged cases and re-judges unjudged ones.
+  - Any LLM *exception* during the agent step raises `StopRun` instead of recording a template report as a result.
+  - Rate-limit stops print the resume command.
+- **Free-tier quota:** `gemini-3.8-flash` allows **20 requests/day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`; resets at midnight Pacific) and 5/min. A full run is about 108 requests (36 × 2 agent + 1 judge), so it takes about 6 days on the free tier, or minutes on a paid key. `RateLimitError.daily` and `describe_llm_error` report daily exhaustion explicitly.
+- **Replay and baseline:** `--replay` re-scores the baseline's run (or `--run`), prints the summary, and exits 1 if any deterministic pass rate is below `baseline.json`. `--update-baseline` rewrites it, marked PROVISIONAL while the run is partial. CI runs `--replay`.
+- **Human validation:** `--export-human-labels` writes 15 blind rows (5 error-only, 5 refer, 5 correct; LLM-written preferred) with empty score columns. It needs ≥ 15 reports and refuses to overwrite a sheet that has scores. `--agreement` gives exact, within-1 and mean (judge − human) per criterion. **Only a human fills in the scores.**
+
 ## Supabase
 
 There are two kinds of client, both using the anon key from `st.secrets`:
@@ -231,6 +261,8 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 ## Known issues (not yet fixed)
 
 - `agent/condition_info.json` is a draft that hasn't had clinical review. It must be signed off before clinical use.
+- The live eval run is partial (2/36 reports; the free-tier daily quota ran out), so `evals/baseline.json` is provisional.
+- The judge docks faithfulness for the "two public datasets" limitation because that fact isn't in any tool output, yet the agent's system prompt requires it. Consider exposing it through a tool (e.g. in `run_classifier`), so it's grounded.
 - The grounding guard checks the structured fields and banned phrases, not the meaning of the free text. A summary could still describe the wrong condition in words while keeping `predicted_class` correct.
 - The PDF still labels the prediction "Primary Diagnosis" and the title emoji renders as a box (Helvetica has no emoji).
 - The batch tab still marks a row "Error" if the history save fails, even though the prediction and log succeeded.
