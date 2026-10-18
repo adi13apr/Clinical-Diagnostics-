@@ -3,11 +3,16 @@ import streamlit as st
 from services.auth_handler import AuthService
 from services.data_handler import DataService
 from services.model_handler import ModelService
+from services.prediction_handler import PredictionService
 from ui.login_pages import show_login_ui
 from ui.dashboard import show_dashboard  # <--- This is the important part
 
 # 1. Initialize the background workers
-auth_provider = AuthService()
+# Keep one auth client per browser session so its login survives reruns (RLS needs it)
+if "auth_provider" not in st.session_state:
+    st.session_state.auth_provider = AuthService()
+auth_provider = st.session_state.auth_provider
+prediction_provider = PredictionService(auth_provider.client)
 data_provider = DataService()
 model_provider = ModelService("best_student_model_aligned_final.pth")
 
@@ -25,5 +30,6 @@ else:
         st.session_state.user.email, 
         auth_provider, 
         data_provider, 
-        model_provider
+        model_provider,
+        prediction_provider
     )

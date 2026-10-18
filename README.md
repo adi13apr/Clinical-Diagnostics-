@@ -3,6 +3,8 @@ Markdown
 
 An AI-powered web application built to assist with clinical diagnostics using deep learning. This portal provides a secure, user-friendly interface for processing medical data using a custom-trained PyTorch model, complete with user authentication and database management.
 
+## 🚀 Live Demo
+**[https://clinical-diagnosis.streamlit.app/](https://clinical-diagnosis.streamlit.app/)**
 
 ## 🛠️ Tech Stack
 
@@ -19,6 +21,14 @@ An AI-powered web application built to assist with clinical diagnostics using de
 * **AI Diagnostics:** Integrates a lightweight, fine-tuned PyTorch model (`best_student_model_aligned_final.pth`) for rapid inference.
 * **Cloud Deployment:** Optimized for and deployed on Streamlit Community Cloud.
 * **Headless Image Processing:** Utilizes `opencv-python-headless` for seamless cloud compatibility without missing system dependencies.
+
+## 📈 Prediction Logging & Analytics
+
+Every model prediction (single and batch) is timed with `time.perf_counter()` and logged to a Supabase `predictions` table with the predicted label, confidence, and inference time in milliseconds. Rows are written with the logged-in user's session, and Row Level Security means each user can only insert and read their own predictions. If logging fails, the app shows a warning and still displays the prediction.
+
+The **📊 Analytics** page has a **Prediction analytics** section. It reads the `prediction_daily_summary` view (daily counts per label, average confidence, number of low-confidence predictions below 0.6, and average inference time) and plots predictions per day by label.
+
+To set it up, run [`sql/001_predictions.sql`](sql/001_predictions.sql) in the Supabase SQL Editor.
 
 ## 💻 Local Installation & Setup
 

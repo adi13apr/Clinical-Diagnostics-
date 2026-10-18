@@ -3,6 +3,7 @@ from PIL import Image
 from services.pdf_handler import PDFReportGenerator
 from datetime import datetime
 import pandas as pd
+import time
 
 def get_severity_badge(diagnosis):
     """Return severity level and color based on diagnosis"""
@@ -13,7 +14,20 @@ def get_severity_badge(diagnosis):
     }
     return severity_map.get(diagnosis, {'level': diagnosis, 'color': '#808080'})
 
-def show_dashboard(user_email, auth_service, data_service, model_service):
+def run_prediction(model_service, prediction_service, image):
+    """Run the model, timing it, and log the prediction (logging failures only warn)"""
+    start = time.perf_counter()
+    result = model_service.predict(image)
+    inference_ms = round((time.perf_counter() - start) * 1000)
+    
+    try:
+        prediction_service.log_prediction(result, inference_ms)
+    except Exception as e:
+        st.warning(f"Could not log prediction: {str(e)}")
+    
+    return result
+
+def show_dashboard(user_email, auth_service, data_service, model_service, prediction_service):
     # Sidebar for User Info & Logout
     st.sidebar.title("🩺 Control Panel")
     st.sidebar.info(f"Radiologist: **{user_email}**")
@@ -30,15 +44,16 @@ def show_dashboard(user_email, auth_service, data_service, model_service):
         st.rerun()
     
     # Import analytics here to avoid circular imports
-    from ui.analytics import show_analytics
+    from ui.analytics import show_analytics, show_prediction_analytics
     
     # Route to selected page
     if page == "📋 Diagnosis":
-        show_diagnosis_page(user_email, auth_service, data_service, model_service)
+        show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service)
     else:
         show_analytics(data_service, user_email)
+        show_prediction_analytics(prediction_service)
 
-def show_diagnosis_page(user_email, auth_service, data_service, model_service):
+def show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service):
     st.title("Clinical Diagnostic Dashboard")
 
     # SECTION: New Analysis
@@ -61,7 +76,7 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service):
                     # Store in session state for persistence across reruns
                     with st.spinner("Analyzing anatomical features..."):
                         # Call the Model Service
-                        result = model_service.predict(image)
+                        result = run_prediction(model_service, prediction_service, image)
                         st.session_state['last_result'] = result
                         st.session_state['last_image'] = image
                         st.session_state['last_patient_name'] = patient_name
@@ -175,7 +190,7 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service):
                     try:
                         # Open and predict
                         image = Image.open(uploaded_file)
-                        result = model_service.predict(image)
+                        result = run_prediction(model_service, prediction_service, image)
                         
                         # Save to database
                         data_service.save_diagnosis(user_email, result, patient_id)

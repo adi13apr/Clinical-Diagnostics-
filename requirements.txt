@@ -8,3 +8,4 @@ numpy
 reportlab
 plotly
 matplotlib
+pandas

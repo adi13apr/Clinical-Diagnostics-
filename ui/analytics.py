@@ -147,3 +147,52 @@ def show_analytics(data_service, user_email):
     recent_df['created_at'] = recent_df['created_at'].dt.strftime('%Y-%m-%d %H:%M:%S')
     recent_df.columns = ['Patient ID', 'Diagnosis', 'Confidence (%)', 'Timestamp']
     st.dataframe(recent_df, use_container_width=True, hide_index=True)
+
+
+def show_prediction_analytics(prediction_service):
+    """Display daily prediction stats from the prediction_daily_summary view"""
+    
+    st.divider()
+    st.header("🧪 Prediction analytics")
+    
+    try:
+        summary = prediction_service.get_daily_summary()
+    except Exception as e:
+        st.warning(f"Could not load prediction analytics: {str(e)}")
+        return
+    
+    if not summary.data:
+        st.info("No predictions logged yet. Run a diagnosis to start collecting prediction analytics.")
+        return
+    
+    df = pd.DataFrame(summary.data)
+    df['day'] = pd.to_datetime(df['day'])
+    
+    colors_map = {
+        'Normal': '#00D084',
+        'Pneumonia': '#FFA500',
+        'Tuberculosis': '#FF0000'
+    }
+    
+    fig = px.bar(
+        df,
+        x='day',
+        y='prediction_count',
+        color='predicted_label',
+        color_discrete_map=colors_map,
+        title="Predictions per Day",
+        labels={'day': 'Date', 'prediction_count': 'Predictions', 'predicted_label': 'Label'}
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    display_df = df.copy()
+    display_df['day'] = display_df['day'].dt.strftime('%Y-%m-%d')
+    display_df = display_df.rename(columns={
+        'day': 'Date',
+        'predicted_label': 'Label',
+        'prediction_count': 'Predictions',
+        'avg_confidence': 'Avg Confidence',
+        'low_confidence_count': 'Low Confidence (<0.6)',
+        'avg_inference_ms': 'Avg Inference (ms)'
+    })
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
