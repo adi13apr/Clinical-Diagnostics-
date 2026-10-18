@@ -116,15 +116,8 @@ class ModelService:
         
         # Map diagnosis string back to class index
         diagnosis = result['diagnosis']
-        prediction_class = None
-        for idx, class_name in self.classes.items():
-            if class_name == diagnosis:
-                prediction_class = idx
-                break
-        
-        if prediction_class is None:
-            raise ValueError(f"Unknown diagnosis: {diagnosis}")
-        
+        prediction_class = self.class_index(diagnosis)
+
         # Prepare tensor
         img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
         
@@ -137,7 +130,26 @@ class ModelService:
             diagnosis
         )
         heatmap_gen.cleanup()
-        
+
         return heatmap_image
-        
-        return heatmap_image
+
+    def class_index(self, class_name):
+        """Class index for a class name such as 'Pneumonia'"""
+        for idx, name in self.classes.items():
+            if name == class_name:
+                return idx
+        raise ValueError(f"Unknown diagnosis: {class_name}")
+
+    def compute_gradcam(self, pil_image, class_name):
+        """Raw Grad-CAM map (last conv layer, 7x7, normalized to [0, 1]) for one class"""
+        from services.heatmap_handler import HeatmapGenerator
+
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
+
+        heatmap_gen = HeatmapGenerator(self.model, self.device)
+        try:
+            return heatmap_gen.grad_cam.generate_cam(img_tensor, self.class_index(class_name))
+        finally:
+            heatmap_gen.cleanup()
