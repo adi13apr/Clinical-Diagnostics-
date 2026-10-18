@@ -33,8 +33,10 @@ def show_report(report_result):
     """Render an agent ReportResult"""
     report = report_result.report
     st.caption(report_result.source_line())
+    if report_result.cached:
+        st.caption("Reused the report already written for this image (no new Gemini requests).")
     if report_result.reason:
-        st.caption(f"AI writer not used: {report_result.reason}")
+        st.caption(f"AI writer not used: {report_result.reason} Showing the template report.")
     st.markdown(f"**Summary.** {report.summary}")
     if report.status == STATUS_REFER:
         st.warning(f"**Recommendation.** {report.recommendation}")

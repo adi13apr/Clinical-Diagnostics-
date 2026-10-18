@@ -34,12 +34,12 @@ TOOL_DECLARATIONS = [
         "name": "get_condition_info",
         "description": (
             "Vetted background text about a condition (overview, typical X-ray findings, what an AI "
-            "result means, typical next steps). Use only this text for medical background."
+            "result means, typical next steps). Use only this text for medical background. "
+            "Omit 'condition' to get the classifier's predicted class."
         ),
         "parameters": {
             "type": "object",
             "properties": {"condition": {"type": "string", "enum": CLASS_NAMES}},
-            "required": ["condition"],
         },
     },
 ]
@@ -81,7 +81,9 @@ class ReportTools:
             }
         return self._gradcam
 
-    def get_condition_info(self, condition):
+    def get_condition_info(self, condition=None):
+        # Defaults to the predicted class so the LLM can call every tool in its first turn
+        condition = condition or self.run_classifier()["predicted_class"]
         if condition not in CLASS_NAMES:
             raise ValueError(f"Unknown condition {condition!r}; expected one of {CLASS_NAMES}")
         return {"condition": condition, **self.condition_info[condition],

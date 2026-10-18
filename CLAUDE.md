@@ -63,6 +63,9 @@ sql/
   003_diagnosis_history_status.sql  `status` column on diagnosis_history
 scripts/
   calibrate.py              Fits the temperature on the notebook's val split, reports on its test split
+  failure_case.py           Renders docs/failure_case_gradcam.png (Grad-CAM of a misclassified test image)
+docs/
+  failure_case_gradcam.png  README figure: pneumonia X-ray called Normal (50.15%, referred), attention on borders
 splits/
   split_manifest.csv        The training notebook's exact train/val/test split (relpath,label,split)
 notebooks/
@@ -71,6 +74,7 @@ outputs/                    Committed calibration results
   calibration.json          Temperature (read by the app at startup), test metrics, coverage table
   reliability.png           Reliability diagram before/after scaling
 tests/                      pytest; conftest.py stubs the network so tests need no checkpoint or Supabase
+  fixtures/                 Verbatim LLM outputs used as regression tests
 data/                       Gitignored. Kaggle datasets + data/cache/calibration_logits.npz
 best_student_model_aligned_final.pth   state_dict for StudentEfficientNet (~16 MB, committed)
 ```
@@ -118,16 +122,23 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
 
 ## Report agent (`agent/`)
 
-- **Flow:** "Generate report" → `generate_report_for_image(model_service, image, prediction, build_llm_client())` → `ReportResult(report, source="llm"|"fallback", model, reason, steps, problems, tool_calls)`.
+- **Flow:** "Generate report" → `generate_report_for_image(model_service, image, prediction, build_llm_client())` → `ReportResult(report, source="llm"|"fallback", model, reason, steps, problems, tool_calls, rejected, error_detail, cached)`.
+  - `rejected` holds the exact text of every LLM output the guard rejected; save real ones to `tests/fixtures/` as regression tests.
+  - `reason` is short and user-facing. The raw provider error goes in `error_detail` and is never shown in the UI.
+- **Cache:** `REPORT_CACHE` is a process-wide, thread-safe LRU of 256 entries, keyed by (SHA-256 of the decoded pixels + mode + size, temperature, model name).
+  - Only `source == "llm"` results are cached. Fallbacks are free to rebuild, and caching one would block a later Gemini attempt.
+  - Hits return `cached=True` with `steps=0`.
+- **Request budget:** the prompt asks for all three tools in the first turn, and `get_condition_info` defaults to the predicted class. A report is then 2 Gemini requests, 3 with a retry. Measured live: 2 requests, 6.5 s, versus 5 requests and 16.6 s calling one tool per turn. The free tier allows 5 requests/minute per model.
+- **429 handling** (`GeminiClient.generate`): read Google's retry delay (the `RetryInfo` detail, else "retry in Ns" in the message). If it's under `RATE_LIMIT_MAX_RETRY_DELAY` (10 s), sleep and retry **once**; otherwise raise `RateLimitError` right away, which falls back with "Gemini rate limit reached (retry in N s)."
 - **Tools** (`ReportTools`): the image and the dashboard's prediction are bound server-side. The LLM sees only tool outputs: no pixels, no patient name or email.
   - `run_classifier` rounds probabilities to 4 dp, so the report can copy them exactly.
   - `get_gradcam` covers the predicted class.
-  - `get_condition_info` reads `condition_info.json` only; there are no web lookups.
+  - `get_condition_info` reads `condition_info.json` only; there are no web lookups. `condition` is optional and defaults to the predicted class.
   - Tool exceptions are returned to the LLM as `{"error": ...}`.
 - **Loop:** at most `MAX_STEPS = 5` LLM calls. The final text must be JSON → `Report.model_validate` → `check_grounding`. On failure the LLM gets the problem and `MAX_RETRIES = 1` more try. After that, or on any LLM exception, it falls back to `fallback_report`.
 - **Grounding guard** (`check_grounding`):
   - `predicted_class`, `calibrated_probability` and `status` must `==` `run_classifier`'s output;
-  - no "diagnosis confirmed" or similar (`BANNED_PATTERNS`);
+  - no assertion of a confirmed diagnosis (`asserts_confirmed_diagnosis`, using `BANNED_PATTERNS`). A match is allowed when a negation cue (not, no, never, without, cannot, n't, until, unless, before) appears in the 4 words before it within the same clause (clauses split on punctuation, "but", "however"). "No doubt" and "not only" don't count as negations. This was added after Gemini wrote "a screening aid, not a confirmed diagnosis" (fixture `gemini_rejected_negated_confirmed.json`);
   - a `refer` case's recommendation must contain "clinician review".
   - The disclaimer is always replaced with `schema.DISCLAIMER`.
 - **`fallback_report`:** a deterministic template built only from tool outputs. It is always schema-valid and grounded (asserted), and it works even when Grad-CAM fails.

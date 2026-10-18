@@ -7,10 +7,15 @@ report is used instead. The LLM never changes the prediction.
 
 Only tool outputs are sent to the LLM: no image pixels and no patient details.
 """
+import dataclasses
+import hashlib
 import json
 import os
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -23,19 +28,28 @@ from services.calibration import REFER_MESSAGE, STATUS_REFER
 GEMINI_MODEL = "gemini-3.8-flash"  # stable per https://ai.google.dev/gemini-api/docs/models
 MAX_STEPS = 5   # LLM calls per report, including the retry
 MAX_RETRIES = 1  # re-asks after an invalid or ungrounded report
+RATE_LIMIT_MAX_RETRY_DELAY = 10.0  # seconds; on a 429, wait and retry once only if Google asks for less
 
 BANNED_PATTERNS = [r"diagnosis\s+(is\s+|has\s+been\s+)?confirmed", r"confirmed\s+diagnosis"]
+# A banned phrase is allowed when its own clause negates it within a few words, e.g. "not a confirmed
+# diagnosis" or "until the diagnosis is confirmed". "No doubt"-style phrases are not negations.
+NEGATION_CUES = re.compile(r"\b(not|no|never|without|cannot|nor|until|unless|before)\b|n't\b")
+NOT_NEGATIONS = re.compile(r"\b(no|without|beyond)\s+(a\s+)?(doubt|question)\b|\bnot\s+only\b")
+CLAUSE_BREAK = re.compile(r"[.;:!?,]|\bbut\b|\bhowever\b")
+NEGATION_WINDOW_WORDS = 4
 
 SYSTEM_PROMPT = f"""You write short, plain-language reports about an AI chest X-ray classifier's result.
 
 Rules:
-1. Call run_classifier first. Its output is authoritative. Copy predicted_class, calibrated_probability
-   and status into the report EXACTLY as returned. Never change, round or reinterpret them.
-2. Call get_gradcam to describe which approximate region influenced the model. Hedge: it is a coarse
+1. In your FIRST turn, call all three tools at once (parallel function calls), with no arguments:
+   run_classifier, get_gradcam and get_condition_info (it defaults to the predicted class).
+   Then write the report. Don't call tools one at a time.
+2. run_classifier's output is authoritative. Copy predicted_class, calibrated_probability and status
+   into the report EXACTLY as returned. Never change, round or reinterpret them.
+3. Use get_gradcam to describe which approximate region influenced the model. Hedge: it is a coarse
    zone, it shows model attention rather than confirmed anatomy, and if focus is "diffuse" say so.
-3. Call get_condition_info for the predicted class. Use only that text for medical background.
-   Do not add facts from elsewhere.
-4. Never say or imply the diagnosis is confirmed. The classifier is a screening aid, not a diagnosis.
+4. Use only get_condition_info's text for medical background. Do not add facts from elsewhere.
+   Never say or imply the diagnosis is confirmed. The classifier is a screening aid, not a diagnosis.
 5. If status is "refer", the recommendation must begin with "{REFER_MESSAGE.capitalize()}." and say
    that clinician review is needed.
 6. summary: 2-3 plain-language sentences for a non-specialist. recommendation: next step for the
@@ -76,14 +90,45 @@ class LLMClient(ABC):
         """Return the next LLMTurn."""
 
 
+class RateLimitError(Exception):
+    """The LLM provider returned 429 and we didn't (or couldn't) wait it out."""
+
+    def __init__(self, retry_delay=None):
+        super().__init__(f"rate limited (retry delay {retry_delay})")
+        self.retry_delay = retry_delay
+
+
+def retry_delay_seconds(error):
+    """Retry delay Google sent with a 429 (RetryInfo detail, else 'retry in Ns' in the message), or None."""
+    body = getattr(error, "details", None)
+    details = body.get("error", {}).get("details", []) if isinstance(body, dict) else []
+    for d in details:
+        if str(d.get("@type", "")).endswith("RetryInfo") and d.get("retryDelay"):
+            return float(str(d["retryDelay"]).rstrip("s"))
+    m = re.search(r"retry in ([\d.]+)\s*s", str(error))
+    return float(m.group(1)) if m else None
+
+
+def describe_llm_error(error):
+    """Short, user-facing reason for an LLM failure (the full error stays in ReportResult.error_detail)."""
+    if isinstance(error, RateLimitError):
+        wait = f" (retry in {error.retry_delay:.0f} s)" if error.retry_delay else ""
+        return f"Gemini rate limit reached{wait}."
+    if hasattr(error, "code") and hasattr(error, "status"):  # google.genai.errors.APIError
+        return f"Gemini error {error.code} {error.status}."
+    return f"LLM call failed ({type(error).__name__})."
+
+
 class GeminiClient(LLMClient):
-    def __init__(self, api_key, model=GEMINI_MODEL, client=None):
+    def __init__(self, api_key, model=GEMINI_MODEL, client=None, sleep=time.sleep):
         from google import genai
-        from google.genai import types
+        from google.genai import errors, types
         self.types = types
+        self.errors = errors
         self.model = model
         self.name = model
         self.client = client or genai.Client(api_key=api_key)
+        self.sleep = sleep
 
     def _contents(self, messages):
         t = self.types
@@ -111,8 +156,20 @@ class GeminiClient(LLMClient):
             automatic_function_calling=t.AutomaticFunctionCallingConfig(disable=True),
             thinking_config=t.ThinkingConfig(thinking_level="low"),
         )
-        response = self.client.models.generate_content(
-            model=self.model, contents=self._contents(messages), config=config)
+        contents = self._contents(messages)
+        for attempt in (1, 2):
+            try:
+                response = self.client.models.generate_content(model=self.model, contents=contents, config=config)
+                break
+            except self.errors.ClientError as e:
+                if e.code != 429:
+                    raise
+                delay = retry_delay_seconds(e)
+                # One retry, and only when Google's requested wait is short; otherwise fall back now
+                if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
+                    self.sleep(delay)
+                    continue
+                raise RateLimitError(delay) from e
         if not response.candidates or response.candidates[0].content is None:
             raise RuntimeError(f"Gemini returned no content: {response.prompt_feedback}")
         content = response.candidates[0].content
@@ -154,6 +211,9 @@ class ReportResult:
     steps: int = 0
     problems: List[str] = field(default_factory=list)
     tool_calls: List[str] = field(default_factory=list)
+    rejected: List[dict] = field(default_factory=list)  # exact LLM outputs the guard rejected, for audit/tests
+    error_detail: Optional[str] = None  # full LLM error text (not shown to users)
+    cached: bool = False                 # served from REPORT_CACHE, no LLM requests spent
 
     def source_line(self):
         """One line saying who wrote the report, for the UI and PDF (the fallback reason is UI-only)."""
@@ -182,14 +242,30 @@ def build_llm_client():
     return GeminiClient(api_key, model) if api_key else None
 
 
+def asserts_confirmed_diagnosis(text):
+    """True if the text claims a confirmed diagnosis.
+
+    Negated or conditional mentions in the same clause ("not a confirmed diagnosis", "does not mean the
+    diagnosis is confirmed", "until a diagnosis is confirmed") don't count.
+    """
+    text = text.lower()
+    for pattern in BANNED_PATTERNS:
+        for match in re.finditer(pattern, text):
+            clause = CLAUSE_BREAK.split(text[:match.start()])[-1]
+            window = " ".join(clause.split()[-NEGATION_WINDOW_WORDS:])
+            if not NEGATION_CUES.search(NOT_NEGATIONS.sub(" ", window)):
+                return True
+    return False
+
+
 def check_grounding(report, truth):
     """Problems that make a schema-valid report unacceptable (empty list = grounded)."""
     problems = []
     for key in ("predicted_class", "calibrated_probability", "status"):
         if getattr(report, key) != truth[key]:
             problems.append(f"{key} is {getattr(report, key)!r} but run_classifier returned {truth[key]!r}")
-    text = " ".join([report.summary, report.recommendation, *report.limitations, report.disclaimer]).lower()
-    if any(re.search(p, text) for p in BANNED_PATTERNS):
+    text = " ".join([report.summary, report.recommendation, *report.limitations, report.disclaimer])
+    if asserts_confirmed_diagnosis(text):
         problems.append("the report must never say the diagnosis is confirmed")
     if truth["status"] == STATUS_REFER and "clinician review" not in report.recommendation.lower():
         problems.append("status is 'refer', so the recommendation must say clinician review is recommended")
@@ -263,12 +339,13 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES):
     truth = tools.run_classifier()  # ground truth for the guard, independent of what the LLM calls
     result = ReportResult(report=None, source="fallback")
 
-    def fall_back(reason):
+    def fall_back(reason, detail=None):
         result.report, result.source, result.reason = fallback_report(tools), "fallback", reason
+        result.error_detail = detail
         return result
 
     if llm is None:
-        return fall_back("No LLM configured (set st.secrets['gemini']['api_key'] or GEMINI_API_KEY)")
+        return fall_back("No LLM configured (set st.secrets['gemini']['api_key'] or GEMINI_API_KEY).")
 
     messages = [{"role": "user", "text": USER_PROMPT}]
     retries_left = max_retries
@@ -277,7 +354,8 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES):
         try:
             turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS)
         except Exception as e:
-            return fall_back(f"LLM call failed: {type(e).__name__}: {e}")
+            detail = f"{type(e).__name__}: {e}" + (f" <- {e.__cause__}" if e.__cause__ else "")
+            return fall_back(describe_llm_error(e), detail)
         messages.append({"role": "assistant", "turn": turn})
 
         if turn.tool_calls:
@@ -292,15 +370,65 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES):
             result.source, result.model = "llm", llm.name
             return result
         result.problems.append(problem)
+        result.rejected.append({"step": step, "text": turn.text, "problem": problem})
         if retries_left == 0:
-            return fall_back(f"Report rejected after {max_retries} retry: {problem}")
+            return fall_back(f"Report rejected after {max_retries} retry: {problem}.")
         retries_left -= 1
         messages.append({"role": "user", "text": f"Your report was rejected: {problem}. "
                                                  "Reply with a corrected JSON report only."})
 
-    return fall_back(f"No valid report within {max_steps} steps")
+    return fall_back(f"No valid report within {max_steps} steps.")
 
 
-def generate_report_for_image(model_service, image, prediction=None, llm=None):
-    """Convenience wrapper used by the dashboard."""
-    return generate_report(ReportTools(model_service, image, prediction), llm)
+class ReportCache:
+    """Thread-safe LRU of LLM-written reports (Streamlit serves sessions from threads)."""
+
+    def __init__(self, max_items=256):
+        self.max_items = max_items
+        self._items = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            if key not in self._items:
+                return None
+            self._items.move_to_end(key)
+            return self._items[key]
+
+    def put(self, key, value):
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self.max_items:
+                self._items.popitem(last=False)
+
+    def __len__(self):
+        return len(self._items)
+
+
+REPORT_CACHE = ReportCache()
+
+
+def image_fingerprint(image):
+    """SHA-256 of the decoded pixels (plus mode and size), so the same scan hashes the same however it was uploaded."""
+    h = hashlib.sha256(f"{image.mode}|{image.size}|".encode())
+    h.update(image.tobytes())
+    return h.hexdigest()
+
+
+def generate_report_for_image(model_service, image, prediction=None, llm=None, cache=REPORT_CACHE):
+    """Dashboard entry point. Reuses a cached LLM report for the same image, temperature and model.
+
+    Only LLM reports are cached: a fallback (e.g. after a rate limit) costs nothing to rebuild, and
+    caching it would stop a later click from trying the LLM again.
+    """
+    key = None
+    if llm is not None and cache is not None:
+        key = (image_fingerprint(image), float(model_service.temperature), llm.name)
+        hit = cache.get(key)
+        if hit is not None:
+            return dataclasses.replace(hit, cached=True, steps=0)
+    result = generate_report(ReportTools(model_service, image, prediction), llm)
+    if key is not None and result.source == "llm":
+        cache.put(key, result)
+    return result
