@@ -32,6 +32,7 @@ sys.path.insert(0, str(REPO))
 # Silence Streamlit's "no runtime" warnings from st.cache_resource / st.secrets
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 from services.model_handler import ModelService  # noqa: E402
+from services.calibration import apply_temperature, expected_calibration_error  # noqa: E402
 
 # Paper-reported student test metrics, used to decide how to label the results
 PAPER_ACC = 97.61
@@ -115,16 +116,19 @@ def compute_logits(service, files, batch_size=32):
 
 
 def cached_logits(service, rows, cache_path, ckpt_hash):
+    """Logits for `rows`, cached with their labels and splits (tests/ reads the cache too)."""
     files = [str(r["file"]) for r in rows]
     if cache_path.exists():
         c = np.load(cache_path, allow_pickle=False)
-        if str(c["ckpt"]) == ckpt_hash and c["files"].tolist() == files:
+        if ({"labels", "splits"} <= set(c.files) and str(c["ckpt"]) == ckpt_hash
+                and c["files"].tolist() == files):
             print(f"Using cached logits from {cache_path}")
             return c["logits"]
     print(f"Running the model on {len(files)} val+test images ({service.device})...")
     logits = compute_logits(service, files)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(cache_path, logits=logits, files=np.array(files), ckpt=ckpt_hash)
+    np.savez(cache_path, logits=logits, files=np.array(files), ckpt=ckpt_hash,
+             labels=np.array([r["label"] for r in rows]), splits=np.array([r["split"] for r in rows]))
     return logits
 
 
@@ -133,16 +137,13 @@ def check_matches_app(service, rows, logits, n=5):
     for r, z in zip(rows[:n], logits[:n]):
         app = service.predict(Image.open(r["file"]))["probabilities"]
         app = np.array([app[service.classes[i]] for i in range(len(service.classes))])
-        if not np.allclose(softmax(z), app, atol=1e-4):
+        if not np.allclose(softmax(z, service.temperature), app, atol=1e-4):
             sys.exit(f"Logits disagree with ModelService.predict on {r['relpath']}")
     print(f"Checked: probabilities match ModelService.predict() on {n} images.")
 
 
 def softmax(z, T=1.0):
-    z = np.asarray(z) / T
-    z = z - z.max(axis=-1, keepdims=True)
-    e = np.exp(z)
-    return e / e.sum(axis=-1, keepdims=True)
+    return apply_temperature(np.asarray(z, dtype=np.float64), T).numpy()
 
 
 def fit_temperature(logits, labels):
@@ -166,19 +167,6 @@ def nll(probs, labels):
     return float(-np.mean(np.log(np.clip(probs[np.arange(len(labels)), labels], 1e-12, None))))
 
 
-def ece_bins(conf, correct, n_bins=N_BINS):
-    edges = np.linspace(0, 1, n_bins + 1)
-    idx = np.clip(np.digitize(conf, edges[1:-1], right=True), 0, n_bins - 1)  # bins are (lo, hi]
-    bins = []
-    for b in range(n_bins):
-        m = idx == b
-        bins.append({"lo": edges[b], "hi": edges[b + 1], "n": int(m.sum()),
-                     "acc": float(correct[m].mean()) if m.any() else None,
-                     "conf": float(conf[m].mean()) if m.any() else None})
-    ece = sum(b["n"] * abs(b["acc"] - b["conf"]) for b in bins if b["n"]) / len(conf)
-    return float(ece), bins
-
-
 def metrics(probs, labels, class_names):
     pred = probs.argmax(1)
     conf = probs.max(1)
@@ -192,7 +180,7 @@ def metrics(probs, labels, class_names):
         p = tp / predicted if predicted else 0.0
         recall[class_names[c]] = float(r)
         f1.append(2 * p * r / (p + r) if p + r else 0.0)
-    ece, bins = ece_bins(conf, correct)
+    ece, bins = expected_calibration_error(conf, correct, N_BINS)
     return {"accuracy": float(correct.mean()), "macro_f1": float(np.mean(f1)),
             "recall": recall, "ece": ece, "nll": nll(probs, labels), "_bins": bins}
 

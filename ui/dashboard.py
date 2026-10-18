@@ -1,6 +1,7 @@
 import streamlit as st
 from PIL import Image
 from services.pdf_handler import PDFReportGenerator
+from services.calibration import REFER_THRESHOLD, REFER_MESSAGE, STATUS_REFER
 from datetime import datetime
 import pandas as pd
 import time
@@ -13,6 +14,20 @@ def get_severity_badge(diagnosis):
         'Tuberculosis': {'level': '🔴 TUBERCULOSIS', 'color': '#FF0000'}  # Red
     }
     return severity_map.get(diagnosis, {'level': diagnosis, 'color': '#808080'})
+
+def get_status_label(status):
+    """Short triage label for tables"""
+    return '⚠️ Refer' if status == STATUS_REFER else '✅ Confident'
+
+def show_status(result):
+    """Banner telling the clinician whether the prediction can be relied on"""
+    confidence = result['confidence'] * 100
+    if result['status'] == STATUS_REFER:
+        st.warning(f"**{REFER_MESSAGE.capitalize()}.** Calibrated confidence {confidence:.1f}% "
+                   f"is below the {REFER_THRESHOLD:.0%} threshold.")
+    else:
+        st.success(f"**Confident.** Calibrated confidence {confidence:.1f}% "
+                   f"meets the {REFER_THRESHOLD:.0%} threshold.")
 
 def run_prediction(model_service, prediction_service, image):
     """Run the model, timing it, and log the prediction (logging failures only warn)"""
@@ -56,6 +71,10 @@ def show_dashboard(user_email, auth_service, data_service, model_service, predic
 def show_diagnosis_page(user_email, auth_service, data_service, model_service, prediction_service):
     st.title("Clinical Diagnostic Dashboard")
 
+    if not model_service.calibrated:
+        st.warning("Calibration file not found (outputs/calibration.json). Probabilities are uncalibrated "
+                   "and every prediction will be marked for clinician review.")
+
     # SECTION: New Analysis
     st.header("New Analysis")
     
@@ -96,11 +115,13 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                     with col1:
                         st.metric("Diagnosis", severity['level'])
                     with col2:
-                        st.metric("Confidence", f"{confidence:.1f}%")
+                        st.metric("Confidence (calibrated)", f"{confidence:.1f}%")
                     with col3:
                         # Show severity indicator
                         st.markdown(f"<div style='background-color:{severity['color']};padding:20px;border-radius:10px;text-align:center;color:white;font-weight:bold;'>SEVERITY</div>", unsafe_allow_html=True)
-                    
+
+                    show_status(result)
+
                     # Show all probabilities
                     st.subheader("Prediction Probabilities:")
                     for class_name, prob in result['probabilities'].items():
@@ -199,6 +220,7 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                             'Patient ID': patient_id,
                             'Diagnosis': result['diagnosis'],
                             'Confidence': f"{result['confidence']*100:.1f}%",
+                            'Triage': get_status_label(result['status']),
                             'Status': '✅ Success'
                         })
                     except Exception as e:
@@ -206,6 +228,7 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                             'Patient ID': patient_id,
                             'Diagnosis': 'Error',
                             'Confidence': 'N/A',
+                            'Triage': 'N/A',
                             'Status': f'❌ {str(e)[:30]}'
                         })
                 
@@ -218,16 +241,19 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                 
                 # Summary statistics
                 successful = len([r for r in results if r['Status'] == '✅ Success'])
-                col1, col2, col3 = st.columns(3)
+                referred = len([r for r in results if r['Triage'] == get_status_label(STATUS_REFER)])
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Processed", len(results))
                 with col2:
                     st.metric("Successful", successful)
                 with col3:
                     st.metric("Failed", len(results) - successful)
-                
+                with col4:
+                    st.metric("Referred for Review", referred)
+
                 st.success(f"Batch processing complete! {successful}/{len(results)} files processed successfully.")
-                st.rerun()
+                # No st.rerun() here: it wiped this table, and the history below is fetched after the batch anyway
 
     # SECTION: History Table
     st.divider()

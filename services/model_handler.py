@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
+from services.calibration import DEFAULT_CALIBRATION_PATH, load_temperature, apply_temperature, triage
 
 # 1. Redefining CLAHE for Inference
 class CLAHETransform:
@@ -36,11 +37,17 @@ class StudentEfficientNet(nn.Module):
         return logits, features
 
 class ModelService:
-    def __init__(self, model_weights_path):
+    def __init__(self, model_weights_path, calibration_path=DEFAULT_CALIBRATION_PATH):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self._load_model(model_weights_path)
         self.classes = {0: 'Normal', 1: 'Pneumonia', 2: 'Tuberculosis'}
-        
+
+        # Temperature from scripts/calibrate.py. Without it T = 1 (raw softmax), whose max
+        # probability never reaches the refer threshold, so every prediction is referred.
+        temperature = load_temperature(calibration_path)
+        self.calibrated = temperature is not None
+        self.temperature = temperature if self.calibrated else 1.0
+
         # 3. Matching your val_test_transforms exactly
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -67,18 +74,21 @@ class ModelService:
         
         with torch.no_grad():
             logits, _ = self.model(img_tensor)
-            probabilities = torch.softmax(logits, dim=1)[0]
+            # Calibrated probabilities; temperature scaling never changes the argmax
+            probabilities = apply_temperature(logits[0].cpu(), self.temperature)
             confidence, prediction = torch.max(probabilities, dim=0)
             prediction = prediction.item()
             confidence = confidence.item()
-            
+
         return {
             'diagnosis': self.classes[prediction],
             'confidence': confidence,
             'probabilities': {
-                self.classes[i]: probabilities[i].item() 
+                self.classes[i]: probabilities[i].item()
                 for i in range(len(self.classes))
-            }
+            },
+            'status': triage(confidence),
+            'temperature': self.temperature
         }
     
     def generate_heatmap(self, pil_image, prediction_result=None):

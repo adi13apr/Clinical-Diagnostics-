@@ -7,7 +7,9 @@ class PredictionService:
         data = {
             "predicted_label": result['diagnosis'],
             "confidence": result['confidence'],
-            "inference_ms": inference_ms
+            "inference_ms": inference_ms,
+            "status": result['status'],
+            "temperature": result['temperature']
         }
         return self.client.table("predictions").insert(data).execute()
 

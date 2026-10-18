@@ -193,6 +193,7 @@ def show_prediction_analytics(prediction_service):
         'prediction_count': 'Predictions',
         'avg_confidence': 'Avg Confidence',
         'low_confidence_count': 'Low Confidence (<0.6)',
-        'avg_inference_ms': 'Avg Inference (ms)'
+        'avg_inference_ms': 'Avg Inference (ms)',
+        'refer_count': 'Referred'
     })
     st.dataframe(display_df, use_container_width=True, hide_index=True)
