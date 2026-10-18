@@ -4,15 +4,23 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from datetime import datetime
+from xml.sax.saxutils import escape
 import io
+from services.calibration import REFER_MESSAGE, REFER_THRESHOLD, STATUS_CONFIDENT, STATUS_REFER
 
 class PDFReportGenerator:
     def __init__(self):
         self.styles = getSampleStyleSheet()
         self.story = []
-        
-    def generate_diagnosis_report(self, patient_name, diagnosis, confidence, probabilities, radiologist_email, timestamp):
-        """Generate a PDF report for a single diagnosis"""
+
+    def generate_diagnosis_report(self, patient_name, diagnosis, confidence, probabilities, radiologist_email, timestamp,
+                                  status=None, report=None, report_source=None):
+        """Generate a PDF report for a single diagnosis
+
+        status: 'confident', 'refer' or None (records saved before triage existed)
+        report: optional agent Report (summary, recommendation, limitations, disclaimer)
+        report_source: optional line describing who wrote the report
+        """
         
         # Create a BytesIO buffer
         pdf_buffer = io.BytesIO()
@@ -45,7 +53,26 @@ class PDFReportGenerator:
         # Title
         story.append(Paragraph("🫁 Clinical Diagnostic Report", title_style))
         story.append(Spacer(1, 0.3*inch))
-        
+
+        # Referral banner first, so a "refer" result can't be missed
+        if status == STATUS_REFER:
+            referral_style = ParagraphStyle('Referral', parent=normal_style, fontSize=12, leading=16,
+                                            textColor=colors.HexColor('#8B0000'))
+            referral_table = Table([[Paragraph(
+                f"<b>REFERRAL: CLINICIAN REVIEW REQUIRED</b><br/>{escape(REFER_MESSAGE.capitalize())}. "
+                f"The calibrated confidence ({confidence:.1f}%) is below the {REFER_THRESHOLD:.0%} threshold, "
+                f"so this AI result must not be relied on without clinician review.", referral_style)]],
+                colWidths=[6*inch])
+            referral_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FDECEA')),
+                ('BOX', (0, 0), (-1, -1), 2, colors.HexColor('#C62828')),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ]))
+            story.append(referral_table)
+            story.append(Spacer(1, 0.3*inch))
+
         # Patient Information Section
         story.append(Paragraph("Patient Information", heading_style))
         patient_data = [
@@ -78,9 +105,14 @@ class PDFReportGenerator:
         
         diagnosis_color = severity_colors.get(diagnosis, colors.grey)
         
+        triage_labels = {
+            STATUS_REFER: 'REFER - clinician review recommended',
+            STATUS_CONFIDENT: f'Confident (calibrated confidence >= {REFER_THRESHOLD:.0%})',
+        }
         diagnosis_data = [
             ['Primary Diagnosis:', diagnosis],
             ['Confidence Score:', f"{confidence:.1f}%"],
+            ['Triage Status:', triage_labels.get(status, 'Not recorded')],
         ]
         diagnosis_table = Table(diagnosis_data, colWidths=[2*inch, 4*inch])
         diagnosis_table.setStyle(TableStyle([
@@ -94,7 +126,8 @@ class PDFReportGenerator:
             ('FONTSIZE', (0, 0), (-1, -1), 11),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
             ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-        ]))
+        ] + ([('TEXTCOLOR', (1, 2), (1, 2), colors.HexColor('#C62828')),
+              ('FONTNAME', (1, 2), (1, 2), 'Helvetica-Bold')] if status == STATUS_REFER else [])))
         story.append(diagnosis_table)
         story.append(Spacer(1, 0.3*inch))
         
@@ -117,7 +150,24 @@ class PDFReportGenerator:
         ]))
         story.append(prob_table)
         story.append(Spacer(1, 0.5*inch))
-        
+
+        # AI-written report (escaped: LLM text may contain &, < or >)
+        if report is not None:
+            story.append(Paragraph("AI-Generated Report", heading_style))
+            if report_source:
+                story.append(Paragraph(f"<i>{escape(report_source)}</i>", normal_style))
+                story.append(Spacer(1, 0.1*inch))
+            story.append(Paragraph(f"<b>Summary:</b> {escape(report.summary)}", normal_style))
+            story.append(Spacer(1, 0.1*inch))
+            story.append(Paragraph(f"<b>Recommendation:</b> {escape(report.recommendation)}", normal_style))
+            story.append(Spacer(1, 0.1*inch))
+            story.append(Paragraph("<b>Limitations:</b>", normal_style))
+            for limitation in report.limitations:
+                story.append(Paragraph(f"&bull; {escape(limitation)}", normal_style))
+            story.append(Spacer(1, 0.1*inch))
+            story.append(Paragraph(f"<i>{escape(report.disclaimer)}</i>", normal_style))
+            story.append(Spacer(1, 0.4*inch))
+
         # Footer
         story.append(Paragraph("This report was generated by the Clinical Diagnostic System. "
                               "Please consult with a qualified radiologist for final diagnosis.", 

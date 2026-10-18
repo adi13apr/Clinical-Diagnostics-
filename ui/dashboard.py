@@ -29,6 +29,88 @@ def show_status(result):
         st.success(f"**Confident.** Calibrated confidence {confidence:.1f}% "
                    f"meets the {REFER_THRESHOLD:.0%} threshold.")
 
+def show_report(report_result):
+    """Render an agent ReportResult"""
+    report = report_result.report
+    st.caption(report_result.source_line())
+    if report_result.reason:
+        st.caption(f"AI writer not used: {report_result.reason}")
+    st.markdown(f"**Summary.** {report.summary}")
+    if report.status == STATUS_REFER:
+        st.warning(f"**Recommendation.** {report.recommendation}")
+    else:
+        st.info(f"**Recommendation.** {report.recommendation}")
+    st.markdown("**Limitations**")
+    for limitation in report.limitations:
+        st.markdown(f"- {limitation}")
+    st.caption(report.disclaimer)
+
+def show_single_result(user_email, model_service, image):
+    """Prediction, heatmap, AI report and PDF for the last single-image run (kept in session_state)"""
+    result = st.session_state['last_result']
+    patient_name = st.session_state['last_patient_name']
+    diagnosis = result['diagnosis']
+    confidence = result['confidence'] * 100
+    severity = get_severity_badge(diagnosis)
+
+    # Show diagnosis with color badge and confidence
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Diagnosis", severity['level'])
+    with col2:
+        st.metric("Confidence (calibrated)", f"{confidence:.1f}%")
+    with col3:
+        # Show severity indicator
+        st.markdown(f"<div style='background-color:{severity['color']};padding:20px;border-radius:10px;text-align:center;color:white;font-weight:bold;'>SEVERITY</div>", unsafe_allow_html=True)
+
+    show_status(result)
+
+    # Show all probabilities
+    st.subheader("Prediction Probabilities:")
+    for class_name, prob in result['probabilities'].items():
+        st.progress(prob, text=f"{class_name}: {prob*100:.1f}%")
+
+    # Heatmap generated when the diagnosis ran
+    if st.session_state.get('last_heatmap') is not None:
+        st.divider()
+        st.subheader("🔥 AI Interpretation Heatmap")
+        st.info("Red areas indicate regions that most influenced the AI diagnosis. Darker blue indicates lower influence.")
+        st.image(st.session_state['last_heatmap'], caption="Grad-CAM Attention Map - Shows which regions influenced the diagnosis", use_container_width=True)
+
+    # AI report: the LLM explains the classifier's output but can't change it
+    st.divider()
+    st.subheader("📝 AI Report")
+    if st.button("Generate report"):
+        from agent.agent import build_llm_client, generate_report_for_image
+        with st.spinner("Writing report..."):
+            st.session_state['last_report'] = generate_report_for_image(
+                model_service, image, prediction=result, llm=build_llm_client())
+    report_result = st.session_state.get('last_report')
+    if report_result is not None:
+        show_report(report_result)
+
+    # Generate and offer PDF download
+    st.divider()
+    pdf_generator = PDFReportGenerator()
+    pdf_data = pdf_generator.generate_diagnosis_report(
+        patient_name=patient_name,
+        diagnosis=diagnosis,
+        confidence=confidence,
+        probabilities=result['probabilities'],
+        radiologist_email=user_email,
+        timestamp=st.session_state['last_timestamp'],
+        status=result['status'],
+        report=report_result.report if report_result else None,
+        report_source=report_result.source_line() if report_result else None
+    )
+
+    st.download_button(
+        label="📥 Download Report (PDF)",
+        data=pdf_data,
+        file_name=f"Diagnosis_{patient_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        mime="application/pdf"
+    )
+
 def run_prediction(model_service, prediction_service, image):
     """Run the model, timing it, and log the prediction (logging failures only warn)"""
     start = time.perf_counter()
@@ -91,75 +173,38 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                 image = Image.open(uploaded_file)
                 st.image(image, caption="Uploaded Scan", use_container_width=True)
                 
+                # Results live in session_state so later buttons (Generate report, PDF) don't erase them
+                upload_key = (getattr(uploaded_file, 'file_id', uploaded_file.name), patient_name)
+                
                 if st.button("Run AI Diagnosis"):
-                    # Store in session state for persistence across reruns
                     with st.spinner("Analyzing anatomical features..."):
                         # Call the Model Service
                         result = run_prediction(model_service, prediction_service, image)
                         st.session_state['last_result'] = result
                         st.session_state['last_image'] = image
                         st.session_state['last_patient_name'] = patient_name
+                        st.session_state['last_upload_key'] = upload_key
+                        st.session_state['last_timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        st.session_state['last_heatmap'] = None
+                        st.session_state['last_report'] = None
                         
                         # Save the result to Supabase
-                        data_service.save_diagnosis(user_email, result, patient_name)
-                    
-                    # Display results with confidence
-                    diagnosis = result['diagnosis']
-                    confidence = result['confidence'] * 100
-                    severity = get_severity_badge(diagnosis)
-                    
-                    st.success(f"Analysis Complete!")
-                    
-                    # Show diagnosis with color badge and confidence
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Diagnosis", severity['level'])
-                    with col2:
-                        st.metric("Confidence (calibrated)", f"{confidence:.1f}%")
-                    with col3:
-                        # Show severity indicator
-                        st.markdown(f"<div style='background-color:{severity['color']};padding:20px;border-radius:10px;text-align:center;color:white;font-weight:bold;'>SEVERITY</div>", unsafe_allow_html=True)
-
-                    show_status(result)
-
-                    # Show all probabilities
-                    st.subheader("Prediction Probabilities:")
-                    for class_name, prob in result['probabilities'].items():
-                        st.progress(prob, text=f"{class_name}: {prob*100:.1f}%")
-                    
-                    # Generate and display heatmap (with caching)
-                    st.divider()
-                    st.subheader("🔥 AI Interpretation Heatmap")
-                    st.info("Red areas indicate regions that most influenced the AI diagnosis. Darker blue indicates lower influence.")
+                        try:
+                            data_service.save_diagnosis(user_email, result, patient_name)
+                        except Exception as e:
+                            st.error(f"Could not save to diagnostic history: {str(e)}")
                     
                     with st.spinner("Generating interpretation map (this may take 5-10 seconds)..."):
                         try:
                             # Pass the result to avoid redundant prediction
-                            heatmap_image = model_service.generate_heatmap(image, result)
-                            st.session_state['last_heatmap'] = heatmap_image
-                            st.image(heatmap_image, caption="Grad-CAM Attention Map - Shows which regions influenced the diagnosis", use_container_width=True)
+                            st.session_state['last_heatmap'] = model_service.generate_heatmap(image, result)
                         except Exception as e:
                             st.warning(f"Could not generate heatmap: {str(e)}")
                     
-                    # Generate and offer PDF download
-                    st.divider()
-                    pdf_generator = PDFReportGenerator()
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    pdf_data = pdf_generator.generate_diagnosis_report(
-                        patient_name=patient_name,
-                        diagnosis=diagnosis,
-                        confidence=confidence,
-                        probabilities=result['probabilities'],
-                        radiologist_email=user_email,
-                        timestamp=timestamp
-                    )
-                    
-                    st.download_button(
-                        label="📥 Download Report (PDF)",
-                        data=pdf_data,
-                        file_name=f"Diagnosis_{patient_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf"
-                    )
+                    st.success("Analysis Complete!")
+                
+                if st.session_state.get('last_upload_key') == upload_key:
+                    show_single_result(user_email, model_service, image)
     
     # TAB 2: Batch Upload
     with tab2:
@@ -293,7 +338,7 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
         st.subheader(f"Results: {len(filtered_df)} record(s)")
         
         # Create table header
-        col1, col2, col3, col4, col5, col6 = st.columns([1.5, 1.5, 2, 1.2, 1.5, 1.5])
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([1.5, 1.5, 2, 1.2, 1.5, 1.3, 1.5])
         with col1:
             st.write("**Patient ID**")
         with col2:
@@ -305,13 +350,17 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
         with col5:
             st.write("**Severity**")
         with col6:
+            st.write("**Triage**")
+        with col7:
             st.write("**Action**")
         
         st.divider()
         
         # Display each record with download button in same row
         for idx, (_, record) in enumerate(filtered_df.iterrows()):
-            col1, col2, col3, col4, col5, col6 = st.columns([1.5, 1.5, 2, 1.2, 1.5, 1.5])
+            col1, col2, col3, col4, col5, col6, col7 = st.columns([1.5, 1.5, 2, 1.2, 1.5, 1.3, 1.5])
+            # Records saved before triage existed have no status (NaN in the DataFrame)
+            status = record.get('status') if isinstance(record.get('status'), str) else None
             
             with col1:
                 st.write(record['patient_name'])
@@ -324,6 +373,8 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
             with col5:
                 st.write(record['Severity'])
             with col6:
+                st.write(get_status_label(status) if status else "—")
+            with col7:
                 if st.button("📥 Download", key=f"download_{idx}", use_container_width=True):
                     pdf_generator = PDFReportGenerator()
                     probabilities = {
@@ -337,7 +388,8 @@ def show_diagnosis_page(user_email, auth_service, data_service, model_service, p
                         confidence=record.get('confidence_score', 0),
                         probabilities=probabilities,
                         radiologist_email=record.get('radiologist_email', user_email),
-                        timestamp=record.get('created_at', 'Unknown')
+                        timestamp=record.get('created_at', 'Unknown'),
+                        status=status
                     )
                     st.download_button(
                         label="Click to Download PDF",

@@ -9,3 +9,5 @@ reportlab
 plotly
 matplotlib
 pandas
+google-genai
+pydantic

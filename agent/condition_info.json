@@ -1,0 +1,28 @@
+{
+  "_meta": {
+    "review_status": "DRAFT - general background text written for this project. It must be reviewed and signed off by a qualified clinician before clinical use.",
+    "scope": "Background for patients and clinicians reading an AI screening result. Not diagnostic or treatment guidance.",
+    "sources": [
+      "https://www.who.int/news-room/fact-sheets/detail/tuberculosis",
+      "https://www.who.int/news-room/fact-sheets/detail/pneumonia"
+    ]
+  },
+  "Normal": {
+    "overview": "The classifier did not find patterns it associates with pneumonia or tuberculosis in this chest X-ray.",
+    "typical_xray_findings": "Clear lung fields without areas of consolidation, cavities or nodules that the model was trained to recognise.",
+    "what_this_result_means": "A 'Normal' result does not rule out disease. Early or subtle disease, and conditions the model was not trained on, can look normal to the classifier.",
+    "typical_next_steps": "If symptoms such as persistent cough, fever, weight loss or breathlessness are present, a clinician should assess the patient regardless of this result."
+  },
+  "Pneumonia": {
+    "overview": "Pneumonia is an infection that inflames the air sacs of one or both lungs. It can be caused by bacteria, viruses or fungi.",
+    "typical_xray_findings": "Areas of increased opacity (consolidation) in part of a lung, sometimes with air bronchograms or fluid around the lung.",
+    "what_this_result_means": "The classifier found patterns similar to the pneumonia images it was trained on. X-ray appearance alone cannot identify the cause, and other conditions can look similar.",
+    "typical_next_steps": "A clinician should correlate the image with symptoms, examination and, where appropriate, laboratory tests before deciding on treatment."
+  },
+  "Tuberculosis": {
+    "overview": "Tuberculosis (TB) is a bacterial infection, usually affecting the lungs, caused by Mycobacterium tuberculosis. It is curable and preventable.",
+    "typical_xray_findings": "Opacities, nodules or cavities, often in the upper parts of the lungs, sometimes with enlarged lymph nodes or fluid around the lung.",
+    "what_this_result_means": "The classifier found patterns similar to the tuberculosis images it was trained on. A chest X-ray can suggest TB but cannot confirm it.",
+    "typical_next_steps": "TB is confirmed with microbiological tests (for example sputum testing) ordered by a clinician, following local TB guidelines."
+  }
+}
