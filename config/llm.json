@@ -1,0 +1,59 @@
+{
+  "_note": "LLM provider and limits. 'provider' can be overridden with env LLM_PROVIDER. Limits are per model and enforced client-side by agent/rate_limit.py.",
+  "provider": "groq",
+  "providers": {
+    "groq": {
+      "kind": "openai_compatible",
+      "base_url": "https://api.groq.com/openai/v1",
+      "secret_section": "groq",
+      "env_key": "GROQ_API_KEY",
+      "report_model": "openai/gpt-oss-120b",
+      "judge_model": "qwen/qwen3.8-27b"
+    },
+    "gemini": {
+      "kind": "gemini",
+      "secret_section": "gemini",
+      "env_key": "GEMINI_API_KEY",
+      "report_model": "gemini-3.8-flash",
+      "judge_model": "gemini-3.8-flash"
+    }
+  },
+  "limits": {
+    "openai/gpt-oss-120b": {
+      "rpm": 30,
+      "rpd": 1000,
+      "tpm": 8000,
+      "tpd": 200000,
+      "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-18); rpm/tpd from console.groq.com/docs/rate-limits (not reported in headers)",
+      "otpm": null
+    },
+    "qwen/qwen3.8-27b": {
+      "rpm": 30,
+      "rpd": 1000,
+      "tpm": 8000,
+      "tpd": 200000,
+      "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-18); rpm/tpd from console.groq.com/docs/rate-limits (not reported in headers); otpm 1000 from a 429 'Request too large ... output tokens per minute (OTPM): Limit 1000' on this account (2026-10-18; not in the docs table or headers). Groq checks max_completion_tokens against it up front.",
+      "otpm": 1000
+    },
+    "gemini-3.8-flash": {
+      "rpm": 5,
+      "rpd": 20,
+      "tpm": null,
+      "tpd": null,
+      "source": "Gemini free tier: 429 QuotaFailure GenerateRequestsPerDayPerProjectPerModel-FreeTier limit 20 (2026-10-18)"
+    }
+  },
+  "request_options": {
+    "openai/gpt-oss-120b": {
+      "reasoning_effort": "low",
+      "include_reasoning": false,
+      "max_completion_tokens": 2000
+    },
+    "qwen/qwen3.8-27b": {
+      "reasoning_effort": "none",
+      "reasoning_format": "hidden",
+      "max_completion_tokens": 600,
+      "_why": "instruct mode: with reasoning a judgement used ~1.2k output tokens, over the 1000 OTPM limit"
+    }
+  }
+}

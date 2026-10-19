@@ -1,0 +1,156 @@
+{
+  "temperature": 0.1318066441424598,
+  "label": "paper's held-out test set",
+  "class_names": [
+    "Normal",
+    "Pneumonia",
+    "Tuberculosis"
+  ],
+  "fitted_on": {
+    "split": "val",
+    "n": 1006
+  },
+  "evaluated_on": {
+    "split": "test",
+    "n": 1006,
+    "per_class": {
+      "Normal": 509,
+      "Pneumonia": 427,
+      "Tuberculosis": 70
+    }
+  },
+  "paper_comparison": {
+    "paper_accuracy": 97.61,
+    "paper_macro_f1": 98.2,
+    "accuracy_gap_pt": 0.0,
+    "macro_f1_gap_pt": 0.07,
+    "tolerance_pt": 1.0,
+    "within_tolerance": true
+  },
+  "test_metrics": {
+    "before": {
+      "accuracy": 0.9761431411530815,
+      "macro_f1": 0.9827392258469029,
+      "recall": {
+        "Normal": 0.9862475442043221,
+        "Pneumonia": 0.9601873536299765,
+        "Tuberculosis": 1.0
+      },
+      "ece": 0.3951518010606872,
+      "nll": 0.5653256678915297
+    },
+    "after": {
+      "accuracy": 0.9761431411530815,
+      "macro_f1": 0.9827392258469029,
+      "recall": {
+        "Normal": 0.9862475442043221,
+        "Pneumonia": 0.9601873536299765,
+        "Tuberculosis": 1.0
+      },
+      "ece": 0.0116438871009087,
+      "nll": 0.08996729394534816
+    },
+    "ece_bins": 15
+  },
+  "normal_by_source": {
+    "pneumonia": {
+      "n": 143,
+      "recall": 0.951048951048951,
+      "predicted": {
+        "Normal": 136,
+        "Pneumonia": 7,
+        "Tuberculosis": 0
+      }
+    },
+    "tb": {
+      "n": 366,
+      "recall": 1.0,
+      "predicted": {
+        "Normal": 366,
+        "Pneumonia": 0,
+        "Tuberculosis": 0
+      }
+    }
+  },
+  "coverage": {
+    "raw": [
+      {
+        "threshold": 0.5,
+        "kept": 680,
+        "coverage": 0.6759443339960238,
+        "accuracy": 0.9941176470588236
+      },
+      {
+        "threshold": 0.6,
+        "kept": 466,
+        "coverage": 0.46322067594433397,
+        "accuracy": 0.9935622317596566
+      },
+      {
+        "threshold": 0.7,
+        "kept": 70,
+        "coverage": 0.06958250497017893,
+        "accuracy": 1.0
+      },
+      {
+        "threshold": 0.8,
+        "kept": 69,
+        "coverage": 0.06858846918489066,
+        "accuracy": 1.0
+      },
+      {
+        "threshold": 0.9,
+        "kept": 0,
+        "coverage": 0.0,
+        "accuracy": null
+      }
+    ],
+    "calibrated": [
+      {
+        "threshold": 0.5,
+        "kept": 1006,
+        "coverage": 1.0,
+        "accuracy": 0.9761431411530815
+      },
+      {
+        "threshold": 0.6,
+        "kept": 1003,
+        "coverage": 0.9970178926441352,
+        "accuracy": 0.9790628115653041
+      },
+      {
+        "threshold": 0.7,
+        "kept": 1000,
+        "coverage": 0.9940357852882704,
+        "accuracy": 0.982
+      },
+      {
+        "threshold": 0.8,
+        "kept": 997,
+        "coverage": 0.9910536779324056,
+        "accuracy": 0.9829488465396189
+      },
+      {
+        "threshold": 0.9,
+        "kept": 989,
+        "coverage": 0.9831013916500994,
+        "accuracy": 0.9868554095045501
+      }
+    ]
+  },
+  "caveats": [
+    "Source confound: each class is tied to its source dataset. Pneumonia images come only from paultimothymooney/chest-xray-pneumonia (pediatric, JPEG), Tuberculosis only from tawsifurrahman/tuberculosis-tb-chest-xray-dataset (adult, PNG), and Normal mixes both. The model can partly separate Pneumonia from Tuberculosis by source (file format, resolution, patient age) rather than pathology, so these test-split numbers are likely optimistic for images from a new hospital or scanner."
+  ],
+  "provenance": {
+    "weights": "best_student_model_aligned_final.pth",
+    "weights_sha256": "c09667e067dd4f8121a39990d064462aac9137840b8cf874cec7f9496e27c4ac",
+    "manifest": "splits/split_manifest.csv",
+    "datasets": [
+      "paultimothymooney/chest-xray-pneumonia",
+      "tawsifurrahman/tuberculosis-tb-chest-xray-dataset"
+    ],
+    "preprocessing": "services.model_handler.ModelService.transform",
+    "device": "cpu",
+    "torch": "2.14.1+cpu"
+  }
+}

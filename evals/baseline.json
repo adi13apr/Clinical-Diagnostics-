@@ -1,0 +1,19 @@
+{
+  "run": "evals/runs/20261018T161443Z.jsonl",
+  "dataset_hash": "c475a686fb48a2abdd03437fdf583260e6c1f7b18436b42f831cfd9c2ece35b8",
+  "created": "2026-10-18T16:51:22+00:00",
+  "reports": 36,
+  "cases": 36,
+  "note": "",
+  "deterministic_pass_rates": {
+    "schema_valid": 1.0,
+    "class_matches_classifier": 1.0,
+    "probability_matches_classifier": 1.0,
+    "status_matches_classifier": 1.0,
+    "refer_includes_clinician_review": 1.0,
+    "no_confirmed_diagnosis_claim": 1.0,
+    "limitations_present": 1.0,
+    "length_limits": 1.0,
+    "guard_replay_consistent": 1.0
+  }
+}

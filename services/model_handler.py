@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
+from services.calibration import DEFAULT_CALIBRATION_PATH, load_temperature, apply_temperature, triage
+from services.tracing import safe_set, trace_span
 
 # 1. Redefining CLAHE for Inference
 class CLAHETransform:
@@ -36,11 +38,17 @@ class StudentEfficientNet(nn.Module):
         return logits, features
 
 class ModelService:
-    def __init__(self, model_weights_path):
+    def __init__(self, model_weights_path, calibration_path=DEFAULT_CALIBRATION_PATH):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self._load_model(model_weights_path)
         self.classes = {0: 'Normal', 1: 'Pneumonia', 2: 'Tuberculosis'}
-        
+
+        # Temperature from scripts/calibrate.py. Without it T = 1 (raw softmax), whose max
+        # probability never reaches the refer threshold, so every prediction is referred.
+        temperature = load_temperature(calibration_path)
+        self.calibrated = temperature is not None
+        self.temperature = temperature if self.calibrated else 1.0
+
         # 3. Matching your val_test_transforms exactly
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -58,30 +66,45 @@ class ModelService:
         model.eval()
         return model
 
-    def predict(self, pil_image):
-        # Ensure image is RGB (as required by Swin/EfficientNet teachers)
-        if pil_image.mode != 'RGB':
-            pil_image = pil_image.convert('RGB')
-            
-        img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            logits, _ = self.model(img_tensor)
-            probabilities = torch.softmax(logits, dim=1)[0]
+    def predict(self, pil_image, tracer=None):
+        with trace_span(tracer, "preprocess") as span:
+            safe_set(span, input_mode=pil_image.mode, input_size=list(pil_image.size))
+            # Ensure image is RGB (as required by Swin/EfficientNet teachers)
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+            img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
+
+        with trace_span(tracer, "classify") as span:
+            safe_set(span, device=str(self.device))
+            with torch.no_grad():
+                logits, _ = self.model(img_tensor)
+
+        with trace_span(tracer, "calibrate") as span:
+            # Calibrated probabilities; temperature scaling never changes the argmax
+            probabilities = apply_temperature(logits[0].detach().cpu(), self.temperature)
             confidence, prediction = torch.max(probabilities, dim=0)
             prediction = prediction.item()
             confidence = confidence.item()
-            
+            safe_set(span, temperature=self.temperature, predicted_class=self.classes[prediction],
+                     confidence=round(confidence, 4), status=triage(confidence))
+
         return {
             'diagnosis': self.classes[prediction],
             'confidence': confidence,
             'probabilities': {
-                self.classes[i]: probabilities[i].item() 
+                self.classes[i]: probabilities[i].item()
                 for i in range(len(self.classes))
-            }
+            },
+            'status': triage(confidence),
+            'temperature': self.temperature
         }
     
-    def generate_heatmap(self, pil_image, prediction_result=None):
+    def generate_heatmap(self, pil_image, prediction_result=None, tracer=None):
+        """Grad-CAM figure for the image (traced as a 'gradcam' span)"""
+        with trace_span(tracer, "gradcam", output="figure"):
+            return self._generate_heatmap(pil_image, prediction_result)
+
+    def _generate_heatmap(self, pil_image, prediction_result=None):
         """Generate Grad-CAM heatmap for the image
         
         Args:
@@ -100,21 +123,14 @@ class ModelService:
         
         # Get prediction (or use provided one)
         if prediction_result is None:
-            result = self.predict(pil_image)
+            result = self.predict(pil_image)  # untraced: the caller's trace already holds the prediction
         else:
             result = prediction_result
         
         # Map diagnosis string back to class index
         diagnosis = result['diagnosis']
-        prediction_class = None
-        for idx, class_name in self.classes.items():
-            if class_name == diagnosis:
-                prediction_class = idx
-                break
-        
-        if prediction_class is None:
-            raise ValueError(f"Unknown diagnosis: {diagnosis}")
-        
+        prediction_class = self.class_index(diagnosis)
+
         # Prepare tensor
         img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
         
@@ -127,7 +143,27 @@ class ModelService:
             diagnosis
         )
         heatmap_gen.cleanup()
-        
+
         return heatmap_image
-        
-        return heatmap_image
+
+    def class_index(self, class_name):
+        """Class index for a class name such as 'Pneumonia'"""
+        for idx, name in self.classes.items():
+            if name == class_name:
+                return idx
+        raise ValueError(f"Unknown diagnosis: {class_name}")
+
+    def compute_gradcam(self, pil_image, class_name, tracer=None):
+        """Raw Grad-CAM map (last conv layer, 7x7, normalized to [0, 1]) for one class"""
+        from services.heatmap_handler import HeatmapGenerator
+
+        with trace_span(tracer, "gradcam", output="map", explained_class=class_name):
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+            img_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
+
+            heatmap_gen = HeatmapGenerator(self.model, self.device)
+            try:
+                return heatmap_gen.grad_cam.generate_cam(img_tensor, self.class_index(class_name))
+            finally:
+                heatmap_gen.cleanup()
