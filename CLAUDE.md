@@ -232,6 +232,20 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 - Login state for routing lives in `st.session_state.user` (the Supabase `User` object). The dashboard only uses `.email`.
 - `PredictionService` **must** be given `auth_provider.client`. Its tables depend on RLS seeing the user's session.
 
+### Google sign-in (Supabase OAuth, PKCE)
+
+- **The button is a real link.** "Continue with Google" is an `st.link_button` pointing at `AuthService.google_sign_in_url(app_base_url())`: Supabase `/auth/v1/authorize?provider=google&code_challenge=…&redirect_to=<app>?oauth_state=<random>`. A plain `st.button` can't work, because the server can't redirect the browser.
+- **The code verifier lives server-side.** Returning from Google starts a **new Streamlit session**, so the PKCE verifier can't live in `session_state` or in the Supabase client's memory (supabase-py's own `sign_in_with_oauth` stores it there). It is generated with `supabase_auth.helpers` and kept in the process-wide `PendingOAuthStore`, keyed by a random single-use `oauth_state` that rides in `redirect_to`. Entries expire after 10 min. This works because Streamlit Cloud runs one process; multiple replicas would need shared storage.
+- **The callback:** `app.py` calls `handle_oauth_callback(auth_provider)` while logged out.
+  - It reads `?code=&oauth_state=` (or `?error=`) and clears the query params right away, since the code is single-use.
+  - Then it calls `complete_google_sign_in` → `exchange_code_for_session({"auth_code", "code_verifier"})` on this session's auth client, so RLS sees the new session.
+  - Finally it sets `st.session_state.user` and reruns.
+- **App URL:** `app_base_url()` uses `[supabase] redirect_url` if set, else `st.context.url`. If neither is known, the button is shown disabled instead of breaking the login page.
+- **External setup** (not in code):
+  - Supabase → Authentication → Providers → Google: enabled, with a Google Cloud OAuth client ID and secret.
+  - Supabase → Authentication → URL Configuration → Redirect URLs: `https://clinical-diagnosis.streamlit.app/**` and `http://localhost:8501/**`. The `/**` is needed because `redirect_to` carries `?oauth_state=…`; without a match, Supabase falls back to the Site URL and drops the state.
+  - Google Cloud OAuth client: authorized redirect URI `https://<project-ref>.supabase.co/auth/v1/callback`.
+
 ### `diagnosis_history` (per-patient record)
 
 - Columns, as used in code: `radiologist_email`, `patient_name`, `prediction` (class name string), `confidence_score` (percent, 0–100, 2 dp), `status` (`confident`/`refer`, migration 003; NULL on older rows, shown as "—"), `created_at` (server default). Probabilities are **not** stored.
@@ -285,5 +299,5 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 - The batch tab still marks a row "Error" if the history save fails, even though the prediction and log succeeded.
 - `diagnosis_history` is accessed through the anon `DataService` client; its protection depends on RLS policies not in the repo.
 - History PDF downloads use made-up probabilities (0.33/0.33/0.34).
-- `login_google()` discards the OAuth URL, so the Google button does nothing visible.
+- Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
 - `use_container_width` is deprecated in current Streamlit (warning says removal after 2025-12-31), and requirements are unpinned.

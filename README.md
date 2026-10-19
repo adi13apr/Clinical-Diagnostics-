@@ -76,12 +76,18 @@ streamlit run app.py
 [supabase]
 url = "..."
 key = "..."        # anon key
+redirect_url = "https://clinical-diagnosis.streamlit.app/"   # where Google sign-in returns (local: http://localhost:8501/)
 
 [groq]             # optional: without it, reports use the template
 api_key = "..."
 ```
 
 Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
+
+**Google sign-in** needs three settings outside the code:
+1. Supabase → Authentication → Providers → **Google**: enable it, and paste a Google Cloud OAuth client ID and secret.
+2. Supabase → Authentication → URL Configuration → **Redirect URLs**: add `https://clinical-diagnosis.streamlit.app/**` and `http://localhost:8501/**`.
+3. Google Cloud Console → that OAuth client → **Authorized redirect URIs**: add `https://<project-ref>.supabase.co/auth/v1/callback`.
 
 | Task | Command |
 | --- | --- |
