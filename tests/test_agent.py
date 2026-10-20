@@ -574,4 +574,34 @@ def test_fallback_for_normal_has_no_forced_follow_up(make_tools):
 
 
 def test_prompt_states_the_follow_up_rule():
-    assert "must never say that no referral, action or follow-up is needed" in SYSTEM_PROMPT
+    prompt = " ".join(SYSTEM_PROMPT.split())  # ignore line wrapping
+    assert "must never say that no referral, action or follow-up is needed" in prompt
+    # The refer sentence is for refer cases only (an ambiguous rule made confident reports use it)
+    assert 'Only if status is "refer"' in prompt and "never call the result uncertain" in prompt
+
+
+def test_regression_confident_report_called_uncertain_is_rejected():
+    """Verbatim gpt-oss report from the 2026-10-20 run: 99.97% Pneumonia opening with 'Refer: uncertain'."""
+    fixture = json.loads((FIXTURES / "gptoss_confident_called_uncertain.json").read_text(encoding="utf-8"))
+    assert fixture["truth"]["status"] == "confident"
+    assert fixture["report"]["recommendation"].startswith("Refer: uncertain")
+    report, problem = parse_report(json.dumps(fixture["report"]), fixture["truth"])
+    assert report is None and "must not call the result uncertain" in problem
+
+
+@pytest.mark.parametrize("case", [PNEUMONIA_CONFIDENT, TB_CONFIDENT, CONFIDENT])
+def test_confident_report_with_refer_sentence_is_rejected_then_falls_back(make_tools, case):
+    tools = make_tools(case)
+    truth = tools.run_classifier()
+    assert truth["status"] == "confident"
+    bad = report_json(truth, recommendation="Refer: uncertain, clinician review recommended. See a clinician.")
+    result = generate_report(tools, MockLLMClient(full_script(truth, bad, bad)))
+    assert result.source == "fallback" and "uncertain" in result.reason
+    assert "Refer: uncertain" not in result.report.recommendation  # the template uses it only for refer cases
+
+
+def test_refer_report_still_uses_refer_sentence(make_tools):
+    tools = make_tools(PNEUMONIA_REFER)
+    truth = tools.run_classifier()
+    ok = report_json(truth)  # report_json writes the refer sentence for refer cases
+    assert generate_report(tools, MockLLMClient(full_script(truth, ok))).source == "llm"

@@ -60,9 +60,11 @@ Rules:
    zone, it shows model attention rather than confirmed anatomy, and if focus is "diffuse" say so.
 4. Use only get_condition_info's text for medical background. Do not add facts from elsewhere.
    Never say or imply the diagnosis is confirmed. The classifier is a screening aid, not a diagnosis.
-5. If status is "refer", the recommendation must begin with "{REFER_MESSAGE.capitalize()}." and say
-   that clinician review is needed. If predicted_class is Pneumonia or Tuberculosis, the recommendation
-   must advise clinician follow-up and must never say that no referral, action or follow-up is needed.
+5. Only if status is "refer": the recommendation must begin with "{REFER_MESSAGE.capitalize()}." and say
+   that clinician review is needed. If status is "confident": never call the result uncertain and never
+   use that refer sentence. Separately, whatever the status, if predicted_class is Pneumonia or
+   Tuberculosis the recommendation must advise clinician follow-up and must never say that no referral,
+   action or follow-up is needed.
 6. summary: 2-3 plain-language sentences for a non-specialist. recommendation: next step for the
    reader. limitations: short bullet strings taken from get_condition_info (what_this_result_means
    and model_limitations); don't invent others.
@@ -483,10 +485,23 @@ def check_grounding(report, truth):
         problems.append("the report must never say the diagnosis is confirmed")
     if truth["status"] == STATUS_REFER and "clinician review" not in report.recommendation.lower():
         problems.append("status is 'refer', so the recommendation must say clinician review is recommended")
+    if truth["status"] != STATUS_REFER and labels_confident_as_refer(report):
+        problems.append(f"status is '{truth['status']}', so the report must not call the result uncertain or use "
+                        f"the refer sentence \"{REFER_MESSAGE.capitalize()}\"")
     if dismisses_abnormal_result(truth["predicted_class"], report.recommendation):
         problems.append(f"predicted_class is {truth['predicted_class']}, so the recommendation must not say "
                         "no referral, action or follow-up is needed; advise clinician follow-up")
     return problems
+
+
+def labels_confident_as_refer(report):
+    """True if a report uses the refer sentence ("Refer: uncertain…"). Only refer cases may.
+
+    Added after the 2026-10-20 run: a prompt change made 5 of 8 confident Pneumonia/TB reports open with
+    the refer sentence (calling a 99.99% result uncertain); the judge caught it, the guard didn't.
+    """
+    text = f"{report.summary} {report.recommendation}".lower()
+    return REFER_MESSAGE.lower() in text or report.recommendation.lower().lstrip().startswith("refer:")
 
 
 def dismisses_abnormal_result(predicted_class, recommendation):

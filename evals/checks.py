@@ -3,7 +3,7 @@ import json
 
 from pydantic import ValidationError
 
-from agent.agent import asserts_confirmed_diagnosis, dismisses_abnormal_result, parse_report
+from agent.agent import asserts_confirmed_diagnosis, dismisses_abnormal_result, labels_confident_as_refer, parse_report
 from agent.schema import Report, count_sentences
 
 # Length limits for what a clinician or patient reads on screen / in the PDF
@@ -88,6 +88,13 @@ def check_abnormal_result_not_dismissed(record):
     return not dismisses_abnormal_result(record["classifier"]["predicted_class"], record["report"]["recommendation"])
 
 
+def check_confident_not_called_uncertain(record):
+    """A confident result must not use the refer sentence ("Refer: uncertain…"). Same rule as the guard."""
+    if record["classifier"]["status"] == "refer":
+        return None
+    return not labels_confident_as_refer(Report.model_construct(**record["report"]))
+
+
 CHECKS = {
     "schema_valid": check_schema_valid,
     "class_matches_classifier": check_class_matches,
@@ -99,6 +106,7 @@ CHECKS = {
     "length_limits": check_length_limits,
     "guard_replay_consistent": check_guard_replay_consistent,
     "abnormal_result_not_dismissed": check_abnormal_result_not_dismissed,
+    "confident_not_called_uncertain": check_confident_not_called_uncertain,
 }
 
 
