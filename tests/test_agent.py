@@ -253,6 +253,19 @@ def test_condition_info_covers_every_class(make_tools):
     assert "error" in tools.call("search_web", {})
 
 
+def test_condition_text_never_reads_as_a_confirmation(make_tools):
+    # "TB is confirmed with tests..." read like "this patient's TB is confirmed" next to a TB result.
+    # Condition text may explain how a condition is confirmed, but never state that it is.
+    import re
+    tools = make_tools(CONFIDENT)
+    pattern = re.compile(r"\b(tb|tuberculosis|pneumonia|disease|infection|it)\s+(is|has been)\s+confirmed\b")
+    for name in CLASS_NAMES:
+        info = tools.get_condition_info(name)
+        for key in ("overview", "typical_xray_findings", "what_this_result_means", "typical_next_steps"):
+            assert not pattern.search(info[key].lower()), f"{name}.{key}: {info[key]}"
+    assert "cannot confirm TB" in tools.get_condition_info("Tuberculosis")["typical_next_steps"]
+
+
 def test_gradcam_uses_last_conv_layer(monkeypatch, calibration_file):
     # Random-init EfficientNet (no download): the CAM must have spatial structure, unlike the old 1x1 avgpool target
     monkeypatch.setattr(ModelService, "_load_model", lambda self, path: StudentEfficientNet().eval())
