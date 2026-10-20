@@ -21,9 +21,11 @@ python scripts/calibrate.py        # re-fit temperature; needs the datasets in d
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
 python -m evals.run --live --resume  # continue the live eval (real model + LLM; needs data/ and a key)
 python -m evals.benchmark --simulated  # old (sync) vs new (async) runner with fake-latency clients
+cd web && npm install && npm run dev   # React UI on :5173 (needs web/.env.local and the API)
+cd web && npm run lint && npm run build
 ```
 
-CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`.
+CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`. A second job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
 
 The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 
@@ -58,6 +60,7 @@ api/                        FastAPI backend for the React UI (see "API"); reuses
   settings.py               Settings.from_env(): env vars, else .streamlit/secrets.toml [supabase]
 Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
 requirements-api.txt        requirements.txt + fastapi, uvicorn, python-multipart, PyJWT[crypto]
+web/                        React UI (plain JSX) for the API; see "Web UI" and web/README.md
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
   model_handler.py          CLAHETransform, StudentEfficientNet, ModelService (load + calibrated predict + heatmap)
   calibration.py            Temperature loading, apply_temperature, triage, ECE. No Streamlit import.
@@ -312,22 +315,40 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 ## API (`api/`)
 
 - **Run:** `uvicorn api.main:create_app --factory`. The factory takes injectable `model_service`, `verifier`, `db_factory`, `llm_factory`, `report_cache` and `uploads`; tests pass fakes, production builds them from `Settings`. The checkpoint is loaded in the lifespan (only when no `model_service` was injected), so importing `api.main` loads nothing.
-- **Endpoints:** `POST /predict`, `GET /gradcam/{trace_id}`, `POST /report/{trace_id}`, `GET /history`, `GET /analytics`, `GET /traces/{trace_id}`, and `GET /health` (the only one without auth). `trace_id` path params are `uuid.UUID` (422 if malformed).
+- **Endpoints:** `POST /predict`, `GET /gradcam/{trace_id}`, `GET /gradcam/{trace_id}/map`, `POST /report/{trace_id}`, `GET /history`, `GET /analytics`, `GET /traces/{trace_id}`, and `GET /health` (the only one without auth). `trace_id` path params are `uuid.UUID` (422 if malformed).
 - **Auth:** `current_user` reads the bearer token and calls `SupabaseJWTVerifier.verify` in a thread (it may fetch JWKS or call Supabase).
   - ES256/RS256 are checked locally against `{url}/auth/v1/.well-known/jwks.json` (cached by `PyJWKClient`).
   - HS256 is checked with `SUPABASE_JWT_SECRET` if set; otherwise `GET /auth/v1/user` is called.
   - Required claims: `aud == "authenticated"`, `iss == {url}/auth/v1`, `exp`, `sub`. `AuthError` → 401, `AuthUnavailable` → 503.
+  - **Claims that need no key are checked first** (`_check_claims` on the unverified payload: `iss`, `exp`, `aud`, `sub`), so a token that is expired, malformed or from **another Supabase project** gets 401 even when the JWKS can't be fetched. Only a token that could be valid gets 503 for unreachable keys. The wrong-project 401 names both issuers.
+  - **Settings precedence trap:** env `SUPABASE_URL`/`SUPABASE_KEY` win over `secrets.toml` (needed for deploys). A stale Windows user variable once pointed the API at a deleted project, so every login got 503 "Could not fetch Supabase signing keys" (DNS `getaddrinfo failed`). `Settings.from_env` now warns when the two differ, and the lifespan logs the issuer, where the URL came from, and the result of a one-off JWKS fetch (`check_keys`; `check_keys_on_startup` is only set by `from_env`, so tests never touch the network).
+  - **Logging (API only):** `api/` uses `logging` (`configure_logging()` in `create_app` adds a root handler only when none exists; `api.*` at INFO). Key-fetch failures log the URL and the full cause chain (`describe()`); rejected tokens log the reason at WARNING. Never log the token. The Streamlit app still has no logging framework.
 - **Own data only:** `user_db` builds a `SyncPostgrestClient` per request with `Authorization: Bearer <user token>` (same `.table()` API the services take), so RLS applies. Queries also filter `user_id` (`PredictionService.get_history`, `SupabaseTraceStore.read/read_trace`). The view `prediction_daily_summary` relies on RLS alone (`security_invoker`).
   - **Never fall back to local `traces/` JSONL in the API.** It holds every user's spans. `/analytics` returns `pipeline: null` plus a warning instead; `/traces` returns 404.
   - `diagnosis_history` is not used by the API (anon client, unknown RLS). `/history` reads `predictions`, which has no patient names.
 - **Uploads:** content type must be `image/jpeg`/`image/png` **and** Pillow must decode JPEG/PNG (else 415); empty → 400; over `max_upload_bytes` → 413 (early from `Content-Length` in middleware, exact after reading); over 40M pixels → 413. CORS is added last so it's outermost (the early 413 still gets CORS headers).
-- **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG is cached on the entry. It is one process only, like `PendingOAuthStore`.
+- **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG (`heatmap_png`) and the raw map (`cam_map`: 7×7 values rounded to 4 dp, plus `summarize_cam_regions`) are cached on the entry.
+- **`/gradcam/{id}/map`** exists for the web UI's overlay and opacity slider: it returns the predicted class's map from `compute_gradcam` (one `gradcam` span with `output=map`). Clients must stretch it over the whole image, because the model saw the image resized to a square. It is one process only, like `PendingOAuthStore`.
 - **Threads:** PyTorch, Grad-CAM, image decoding and Supabase calls run in `asyncio.to_thread`. Reports run `generate_report_for_image` (the same cache, guard and fallback as the app) on a separate 4-thread pool (`REPORT_WORKERS`), because one report can wait about 60 s on Groq's limit and must not starve the default pool. `tests/test_api.py::test_prediction_does_not_block_the_event_loop` fails if model work runs on the loop.
 - **SerializedModel:** wraps `ModelService` with one lock around `predict`, `generate_heatmap` and `compute_gradcam`. Grad-CAM hooks the shared network, so a concurrent forward pass would corrupt its activations. Always pass the wrapper (not the raw service) to `generate_report_for_image`, because its `get_gradcam` tool runs the model too.
 - **Tracing:** same span names as the dashboard. `/predict` makes the trace (`prediction` → `preprocess`/`classify`/`calibrate`, `log_prediction`), and `/gradcam` and `/report` add to the same `trace_id`. Sinks are local JSONL plus `SupabaseTraceStore(user db)`; sink errors become a response warning.
 - **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
 - **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
 - **Deploy (Hugging Face Docker Space):** set `SUPABASE_URL`, `SUPABASE_KEY`, optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY` and `MAX_UPLOAD_MB` as Space secrets. The Space README needs `sdk: docker` and `app_port: 7860`. The `.pth` (>10 MB) needs Git LFS on the Space repo.
+
+## Web UI (`web/`)
+
+- **Stack:** Vite 8, React 19, Tailwind 4 (`@tailwindcss/vite`, theme tokens in `src/index.css`), shadcn/ui as **JSX** (`components.json` `tsx: false`; generated files in `src/components/ui/`), Framer Motion, Recharts 3, TanStack Query 5, React Router 8 (`RouterProvider` comes from `react-router/dom`), supabase-js 2. ESLint 9 flat config with `react-hooks`, `react-refresh` and `jsx-a11y`. **ESLint 10 isn't used:** `eslint-plugin-jsx-a11y` doesn't support it yet. Node >= 22.22.
+- **Plain JavaScript, no TypeScript.** The API client (`src/lib/api.js`) has JSDoc typedefs for every response; keep them in step with `api/schemas.py`.
+- **Env:** `VITE_API_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` in `web/.env.local` (gitignored). Without the Supabase values the login page explains what to set.
+- **Auth:** supabase-js with `flowType: "pkce"`. Google sign-in redirects to `window.location.origin`, so Supabase's Redirect URLs need `http://localhost:5173/**` and the deployed site. This is separate from the Streamlit `PendingOAuthStore`: the browser keeps the verifier.
+- **State:** server data through the hooks in `src/hooks/queries.js` (keys include the user id; the cache is cleared on sign-out). The Diagnose page's upload, prediction and report live in `DiagnosisProvider` above the router, so they survive navigation; a different user resets it.
+- **Numbers shown to users:** model probabilities go through `probability()` in `src/lib/format.js`. It never shows 100% or 0% (99.99% / <0.1%) and rounds to 4 dp like `run_classifier`, so the page agrees with the report text. Rates use `percent()`.
+- **Grad-CAM overlay:** `src/lib/colormap.js` reproduces the Python overlay (jet colormap, cv2-style bilinear resize from 7×7, stretched over the whole image). The slider sets the canvas opacity.
+- **PDF:** `src/lib/pdf.js` (jsPDF, dynamically imported). The patient name is typed in the browser and only goes into the file; the API never receives it. Helvetica only covers Latin-1, so text goes through `plain()`.
+- **Charts:** class colours are `--chart-normal/-pneumonia/-tuberculosis`, validated for colour-blind separation in both themes (TB is a raspberry red, because the red/amber pair failed in dark mode). Light Normal/Pneumonia are under 3:1 contrast, so every chart has a legend and a table view (`ChartCard`). Recharts gets colours through `useCssVars`, which watches the `<html>` class, because SVG attributes don't resolve `var()` reliably.
+- **Layout:** `AppShell` shows a bottom tab bar under `md`, an icon rail at `md`, and the full sidebar at `lg`. History, Analytics and Traces are lazy routes; the auth route has a `HydrateFallback`.
+- **Referral wording:** the banner and PDF use `referralReason()`, not the API's `referral_message` (a terse status string). When calibration is missing, everything is referred even above 0.9, and the text says so.
 
 ## Conventions
 
@@ -358,4 +379,6 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 - Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
 - API: uploads and the report cache live in one process's memory. A restart loses uploads (404 → predict again), and more than one replica would need shared storage. `REPORT_CACHE` is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).
 - API: the Docker image hasn't been built yet (Docker daemon unavailable when it was written).
+- Web UI: History's search box filters only the loaded page (the API has no text search); class, triage and date filters are server-side.
+- Web UI: no automated frontend tests yet; CI runs lint and build only. It was checked by hand in Edge (light, dark, phone, tablet, keyboard) against the real model with faked login. It isn't deployed yet.
 - `use_container_width` is deprecated in current Streamlit (warning says removal after 2025-12-31), and requirements are unpinned.

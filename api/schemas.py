@@ -30,6 +30,15 @@ class PredictResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list, description="Non-fatal problems, e.g. logging failed")
 
 
+class GradcamMapResponse(BaseModel):
+    trace_id: str
+    explained_class: ClassName = Field(description="The predicted class; the map shows evidence for it")
+    cam: List[List[float]] = Field(description="Grad-CAM map, rows top to bottom, 0-1. Stretch it over the "
+                                               "whole image: the model saw the image resized to a square")
+    regions: dict = Field(description="services.heatmap_handler.summarize_cam_regions: zone shares, peak "
+                                      "zone, focal/diffuse, border attention (a 3x2 grid, not a lung segmentation)")
+
+
 class ReportResponse(BaseModel):
     trace_id: str
     report: Report

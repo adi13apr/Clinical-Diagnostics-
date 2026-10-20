@@ -10,6 +10,7 @@ send that token, so Supabase row-level security only ever returns the caller's o
 """
 import asyncio
 import io
+import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.agent import REPORT_CACHE, build_llm_client, generate_report_for_image
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
 from api.schemas import (
-    AnalyticsResponse, DailyVolume, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
+    AnalyticsResponse, DailyVolume, GradcamMapResponse, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
     PipelineSummary, PredictResponse, ReportResponse, SpanOut, TraceResponse,
 )
 from api.settings import LOCALHOST_ORIGIN_REGEX, Settings
@@ -43,11 +44,23 @@ REPORT_WORKERS = 4                  # report threads mostly wait on the LLM; kep
 TRACE_READ_LIMIT = 5000             # spans read for /analytics
 
 bearer = HTTPBearer(auto_error=False, description="Supabase access token of the signed-in user")
+log = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """Show the API's own INFO/WARNING/ERROR lines under uvicorn, which only configures its own loggers.
+
+    Left alone when something (pytest, a host) already configured the root logger.
+    """
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s:     %(name)s: %(message)s")
+        logging.getLogger("api").setLevel(logging.INFO)
 
 
 def create_app(settings=None, model_service=None, verifier=None, db_factory=None, llm_factory=None,
                report_cache=REPORT_CACHE, uploads=None):
     """Build the app. Tests inject fakes; by default everything comes from Settings.from_env()."""
+    configure_logging()
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
@@ -56,6 +69,14 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
             from services.model_handler import ModelService
             service = await asyncio.to_thread(ModelService, settings.model_path)
             app.state.model = SerializedModel(service)
+        verifier = app.state.verifier
+        if verifier is None:
+            log.warning("Auth is not configured: set SUPABASE_URL and SUPABASE_KEY. Every request but /health gets 503.")
+        else:
+            log.info("Verifying Supabase tokens issued by %s (URL from %s)", getattr(verifier, "issuer", "?"),
+                     settings.supabase_url_source or "settings")
+            if settings.check_keys_on_startup and hasattr(verifier, "check_keys"):
+                await asyncio.to_thread(verifier.check_keys)
         yield
         app.state.report_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -175,6 +196,17 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         return Response(upload.heatmap_png, media_type="image/png",
                         headers={"Cache-Control": "private, max-age=3600"})
 
+    @app.get("/gradcam/{trace_id}/map", response_model=GradcamMapResponse)
+    async def gradcam_map(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+        """The raw map, so a client can draw its own overlay (e.g. with an opacity slider)."""
+        upload = find_upload(request, trace_id, user)
+        if upload.cam_map is None:
+            tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
+            upload.cam_map = await asyncio.to_thread(compute_cam_map, model, upload, tracer)
+        cam, regions = upload.cam_map
+        return GradcamMapResponse(trace_id=str(trace_id), explained_class=upload.prediction["diagnosis"],
+                                  cam=cam, regions=regions)
+
     @app.post("/report/{trace_id}", response_model=ReportResponse)
     async def report(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
         upload = find_upload(request, trace_id, user)
@@ -290,6 +322,13 @@ def render_heatmap(model, upload, tracer):
     buf = io.BytesIO()
     figure.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def compute_cam_map(model, upload, tracer):
+    from services.heatmap_handler import summarize_cam_regions
+    cam = model.compute_gradcam(upload.image(), upload.prediction["diagnosis"], tracer=tracer)
+    finish_trace(tracer)
+    return [[round(float(v), 4) for v in row] for row in cam], summarize_cam_regions(cam)
 
 
 def write_report(model, upload, llm_factory, cache, tracer):

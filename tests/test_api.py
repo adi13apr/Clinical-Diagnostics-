@@ -1,8 +1,11 @@
 """FastAPI backend (api/). Supabase, the LLM and the network are faked; the model is a stub."""
 import asyncio
 import io
+import logging
+import socket
 import threading
 import time
+import urllib.error
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -18,7 +21,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from agent.agent import MockLLMClient, ReportCache
-from api.auth import AuthError, SupabaseJWTVerifier
+from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier
 from api.main import create_app, daily_volume
 from api.settings import Settings
 from api.state import SerializedModel, UploadStore
@@ -225,7 +228,8 @@ def test_health_needs_no_login(client):
 # ---- Auth ----
 
 TRACE = str(uuid.uuid4())
-PROTECTED = [("post", "/predict"), ("get", f"/gradcam/{TRACE}"), ("post", f"/report/{TRACE}"),
+PROTECTED = [("post", "/predict"), ("get", f"/gradcam/{TRACE}"), ("get", f"/gradcam/{TRACE}/map"),
+             ("post", f"/report/{TRACE}"),
              ("get", "/history"), ("get", "/analytics"), ("get", f"/traces/{TRACE}")]
 
 
@@ -247,6 +251,100 @@ def test_every_endpoint_but_health_needs_a_token(client, method, path):
 def test_bad_tokens_are_rejected(client, token):
     res = client.get("/history", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 401
+
+
+class UnreachableJWKS:
+    """The JWKS endpoint of a Supabase project whose hostname doesn't resolve (a stale SUPABASE_URL)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def _fail(self):
+        self.calls += 1
+        try:
+            raise urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))
+        except urllib.error.URLError as e:
+            raise jwt.PyJWKClientConnectionError(f'Fail to fetch data from the url, err: "{e}"') from e
+
+    def get_signing_key_from_jwt(self, token):
+        self._fail()
+
+    def get_signing_keys(self):
+        self._fail()
+
+
+OTHER_ISSUER = "https://another-project.supabase.co/auth/v1"
+
+
+def es256_token(**claims):
+    key = ec.generate_private_key(ec.SECP256R1())
+    return make_token(secret=key, alg="ES256", **claims)
+
+
+def test_token_from_another_project_is_401_without_fetching_keys(caplog):
+    # Regression: a stale SUPABASE_URL in the shell pointed the API at a dead project, so every login
+    # got 503 "Could not fetch Supabase signing keys". A token from another project is a 401 that
+    # names both projects, and needs no key download.
+    jwks = UnreachableJWKS()
+    verifier = SupabaseJWTVerifier(SUPABASE_URL, jwk_client=jwks)
+    with pytest.raises(AuthError) as err, caplog.at_level(logging.WARNING, logger="api.auth"):
+        verifier.verify(es256_token(iss=OTHER_ISSUER))
+    assert OTHER_ISSUER in str(err.value) and ISSUER in str(err.value)
+    assert jwks.calls == 0
+    assert "Rejected token" in caplog.text
+
+
+@pytest.mark.parametrize("claims", [
+    {"exp": int(time.time()) - 3600},   # expired
+    {"aud": "anon"},
+    {"sub": ""},
+])
+def test_bad_tokens_are_401_even_when_signing_keys_are_unreachable(claims):
+    jwks = UnreachableJWKS()
+    with pytest.raises(AuthError):
+        SupabaseJWTVerifier(SUPABASE_URL, jwk_client=jwks).verify(es256_token(**claims))
+    assert jwks.calls == 0
+
+
+def test_unreachable_signing_keys_are_503_and_the_cause_is_logged(caplog):
+    verifier = SupabaseJWTVerifier(SUPABASE_URL, jwk_client=UnreachableJWKS())
+    with pytest.raises(AuthUnavailable), caplog.at_level(logging.ERROR, logger="api.auth"):
+        verifier.verify(es256_token())
+    assert f"{ISSUER}/.well-known/jwks.json" in caplog.text
+    assert "getaddrinfo failed" in caplog.text
+    with caplog.at_level(logging.ERROR, logger="api.auth"):
+        assert verifier.check_keys() is False  # the startup check logs the same cause
+
+
+def test_http_status_for_wrong_project_expired_and_unreachable_keys(model_service, store):
+    verifier = SupabaseJWTVerifier(SUPABASE_URL, jwk_client=UnreachableJWKS())
+    app = create_app(Settings(supabase_url=SUPABASE_URL, supabase_key="anon"), model_service=model_service,
+                     verifier=verifier, db_factory=store.factory, llm_factory=lambda: None,
+                     report_cache=ReportCache())
+    client = TestClient(app)
+
+    def status(token):
+        return client.get("/history", headers={"Authorization": f"Bearer {token}"}).status_code
+
+    assert status(es256_token(iss=OTHER_ISSUER)) == 401
+    assert status(es256_token(exp=int(time.time()) - 3600)) == 401
+    assert status("not-a-jwt") == 401
+    assert status(es256_token()) == 503  # a token that could be valid, but the keys can't be fetched
+
+
+def test_env_supabase_url_that_differs_from_secrets_is_warned_about(tmp_path, caplog):
+    secrets = tmp_path / "secrets.toml"
+    secrets.write_text('[supabase]\nurl = "https://current.supabase.co"\nkey = "anon-current"\n')
+    with caplog.at_level(logging.WARNING, logger="api.settings"):
+        settings = Settings.from_env({"SUPABASE_URL": "https://stale.supabase.co"}, secrets_path=secrets)
+    assert settings.supabase_url == "https://stale.supabase.co"   # the environment still wins (deploys)
+    assert settings.supabase_url_source == "environment variable SUPABASE_URL"
+    assert "stale.supabase.co" in caplog.text and "current.supabase.co" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="api.settings"):
+        settings = Settings.from_env({}, secrets_path=secrets)
+    assert settings.supabase_url == "https://current.supabase.co" and caplog.text == ""
 
 
 def test_asymmetric_tokens_are_checked_against_jwks():
@@ -383,6 +481,29 @@ def test_gradcam_is_private_to_the_uploader(client):
     assert client.get(f"/gradcam/{trace_id}", headers=auth(BOB)).status_code == 404
     assert client.get(f"/gradcam/{uuid.uuid4()}", headers=auth()).status_code == 404
     assert client.get("/gradcam/not-a-uuid", headers=auth()).status_code == 422
+
+
+def test_gradcam_map_returns_the_raw_map_once_per_upload(client, model_service, store):
+    trace_id = predict(client)["trace_id"]
+    calls = []
+    original = model_service.compute_gradcam
+    model_service.compute_gradcam = lambda *a, **k: calls.append(a[1]) or original(*a, **k)
+    for _ in range(2):
+        res = client.get(f"/gradcam/{trace_id}/map", headers=auth())
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["explained_class"] == "Normal" and calls == ["Normal"]
+        assert len(body["cam"]) == 7 and all(len(row) == 7 for row in body["cam"])
+        assert body["cam"][0][0] == 0.5
+        assert body["regions"]["focus"] == "diffuse" and len(body["regions"]["region_shares"]) == 6
+    spans = [s for s in store.tables["traces"] if s["trace_id"] == trace_id and s["name"] == "gradcam"]
+    assert len(spans) == 1 and spans[0]["attributes"]["output"] == "map"
+
+
+def test_gradcam_map_is_private_to_the_uploader(client):
+    trace_id = predict(client)["trace_id"]
+    assert client.get(f"/gradcam/{trace_id}/map", headers=auth(BOB)).status_code == 404
+    assert client.get(f"/gradcam/{trace_id}/map").status_code == 401
 
 
 # ---- /report ----

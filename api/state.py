@@ -16,6 +16,7 @@ class Upload:
         self.prediction = prediction   # ModelService.predict() result
         self.created = created
         self.heatmap_png = None        # filled by the first GET /gradcam
+        self.cam_map = None            # filled by the first GET /gradcam/{id}/map: (cam, regions)
 
     def image(self):
         """Decode again on use: the same bytes give the same pixels, so the report cache still matches."""
