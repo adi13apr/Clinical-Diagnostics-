@@ -25,7 +25,8 @@
       "tpm": 8000,
       "tpd": 200000,
       "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-18); rpm/tpd from console.groq.com/docs/rate-limits (not reported in headers)",
-      "otpm": null
+      "otpm": null,
+      "max_concurrent": 1
     },
     "qwen/qwen3.8-27b": {
       "rpm": 30,
@@ -33,14 +34,16 @@
       "tpm": 8000,
       "tpd": 200000,
       "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-18); rpm/tpd from console.groq.com/docs/rate-limits (not reported in headers); otpm 1000 from a 429 'Request too large ... output tokens per minute (OTPM): Limit 1000' on this account (2026-10-18; not in the docs table or headers). Groq checks max_completion_tokens against it up front.",
-      "otpm": 1000
+      "otpm": 1000,
+      "max_concurrent": 1
     },
     "gemini-3.8-flash": {
       "rpm": 5,
       "rpd": 20,
       "tpm": null,
       "tpd": null,
-      "source": "Gemini free tier: 429 QuotaFailure GenerateRequestsPerDayPerProjectPerModel-FreeTier limit 20 (2026-10-18)"
+      "source": "Gemini free tier: 429 QuotaFailure GenerateRequestsPerDayPerProjectPerModel-FreeTier limit 20 (2026-10-18)",
+      "max_concurrent": 1
     }
   },
   "request_options": {
@@ -55,5 +58,7 @@
       "max_completion_tokens": 600,
       "_why": "instruct mode: with reasoning a judgement used ~1.2k output tokens, over the 1000 OTPM limit"
     }
-  }
+  },
+  "request_timeout_s": 120,
+  "_request_timeout_note": "Async eval runner: a single LLM request (after rate-limit waits) is cancelled after this many seconds and treated as an infrastructure error (the run stops and can be resumed)."
 }

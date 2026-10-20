@@ -4,13 +4,15 @@ Structured output on either provider: Groq/OpenAI-compatible strict json_schema,
 response_schema. The judge never sees the true label: it judges the report against what
 the tools returned.
 """
+import asyncio
 import json
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from agent.agent import (
-    RATE_LIMIT_MAX_RETRY_DELAY, RateLimitError, openai_quota_info, openai_retry_after, openai_usage, quota_info,
-    retry_delay_seconds, split_request_options,
+    DEFAULT_REQUEST_TIMEOUT_S, RATE_LIMIT_MAX_RETRY_DELAY, RateLimitError, openai_quota_info, openai_retry_after,
+    openai_usage, quota_info, retry_delay_seconds, split_request_options,
 )
 from agent.llm_config import load_llm_config, provider_settings, request_options
 from agent.rate_limit import DailyCapReached, budget_for, estimate_tokens
@@ -40,29 +42,49 @@ JUDGE_JSON_SCHEMA = {"type": "object", "additionalProperties": False, "required"
 
 
 class OpenAICompatibleJudge:
-    """Judge on a Chat Completions endpoint (Groq) with strict json_schema output."""
+    """Judge on a Chat Completions endpoint (Groq) with strict json_schema output.
+
+    judge() is sync; ajudge() is the async path used by the eval runner (AsyncOpenAI, asyncio.sleep,
+    the model's semaphore slot, timeout_s). Same request, same 429 rule, same parsing.
+    """
 
     def __init__(self, api_key, model, base_url=None, client=None, sleep=time.sleep, budget=None, options=None,
-                 provider="Groq", rubric_path=RUBRIC_PATH):
+                 provider="Groq", rubric_path=RUBRIC_PATH, async_client=None, async_sleep=asyncio.sleep,
+                 timeout_s=DEFAULT_REQUEST_TIMEOUT_S):
         if client is None:
             from openai import OpenAI
             client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         self.client, self.model, self.sleep, self.budget, self.provider = client, model, sleep, budget, provider
         self.options = dict(options or {})
         self.rubric = Path(rubric_path).read_text(encoding="utf-8")
+        self._api_key, self._base_url = api_key, base_url
+        self._async_client, self.async_sleep, self.timeout_s = async_client, async_sleep, timeout_s
 
-    def judge(self, tool_outputs, report):
-        import openai
+    def _request(self, tool_outputs, report):
         messages = [{"role": "system", "content": JUDGE_SYSTEM},
                     {"role": "user", "content": judge_prompt(tool_outputs, report, self.rubric)}]
         response_format = {"type": "json_schema",
                            "json_schema": {"name": "judge_result", "strict": True, "schema": JUDGE_JSON_SCHEMA}}
+        max_out = int(self.options.get("max_completion_tokens", 1000))
+        return messages, response_format, (estimate_tokens(messages) + max_out, max_out)
+
+    def _rate_limit_error(self, error, delay):
+        return RateLimitError(delay, *openai_quota_info(error), provider=self.provider,
+                              resets="the provider's daily window")
+
+    def _parse(self, response, reservation):
+        if self.budget is not None and response.usage is not None:
+            self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+        return JudgeResult.model_validate_json(response.choices[0].message.content), openai_usage(response.usage)
+
+    def judge(self, tool_outputs, report):
+        import openai
+        messages, response_format, size = self._request(tool_outputs, report)
         for attempt in (1, 2):
             reservation = None
             if self.budget is not None:
                 try:
-                    max_out = int(self.options.get("max_completion_tokens", 1000))
-                    reservation = self.budget.acquire(estimate_tokens(messages) + max_out, max_out)
+                    reservation = self.budget.acquire(*size)
                 except DailyCapReached as cap:
                     raise RateLimitError.from_daily_cap(cap, self.provider) from cap
             try:
@@ -75,11 +97,40 @@ class OpenAICompatibleJudge:
                 if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
                     self.sleep(delay)
                     continue
-                raise RateLimitError(delay, *openai_quota_info(e), provider=self.provider,
-                                     resets="the provider's daily window") from e
-        if self.budget is not None and response.usage is not None:
-            self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
-        return JudgeResult.model_validate_json(response.choices[0].message.content), openai_usage(response.usage)
+                raise self._rate_limit_error(e, delay) from e
+        return self._parse(response, reservation)
+
+    async def ajudge(self, tool_outputs, report):
+        import openai
+        messages, response_format, size = self._request(tool_outputs, report)
+        for attempt in (1, 2):
+            reservation = None
+            if self.budget is not None:
+                try:
+                    reservation = await self.budget.aacquire(*size)
+                except DailyCapReached as cap:
+                    raise RateLimitError.from_daily_cap(cap, self.provider) from cap
+            try:
+                async with (self.budget.slot() if self.budget is not None else nullcontext()):
+                    response = await asyncio.wait_for(
+                        self._async().chat.completions.create(
+                            model=self.model, messages=messages, response_format=response_format,
+                            **split_request_options(self.options)),
+                        self.timeout_s)
+                break
+            except openai.RateLimitError as e:
+                delay = openai_retry_after(e)
+                if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
+                    await self.async_sleep(delay)
+                    continue
+                raise self._rate_limit_error(e, delay) from e
+        return self._parse(response, reservation)
+
+    def _async(self):
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+            self._async_client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url, max_retries=0)
+        return self._async_client
 
 
 class GeminiJudge:
@@ -139,19 +190,31 @@ def build_judge(model=None, config=None):
     if settings["kind"] == "gemini":
         return GeminiJudge(settings["api_key"], model, budget=budget)
     return OpenAICompatibleJudge(settings["api_key"], model, settings["base_url"], budget=budget,
-                                 options=request_options(model, config), provider=name.capitalize())
+                                 options=request_options(model, config), provider=name.capitalize(),
+                                 timeout_s=config.get("request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S))
 
 
 class MockJudge:
     """Returns fixed scores (tests)."""
     model = "mock-judge"
 
-    def __init__(self, scores=None):
+    def __init__(self, scores=None, delay_s=0.0):
         self.scores = scores or {"faithfulness": 5, "uncertainty_language": 4, "actionability": 4,
                                  "plain_language": 3}
         self.calls = 0
+        self.delay_s = delay_s  # simulated latency (benchmarks/tests)
 
     def judge(self, tool_outputs, report):
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        return self._result()
+
+    async def ajudge(self, tool_outputs, report):
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self._result()
+
+    def _result(self):
         self.calls += 1
         return JudgeResult.model_validate(
             {k: {"score": v, "reason": f"mock {k}"} for k, v in self.scores.items()}), None

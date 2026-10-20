@@ -7,6 +7,7 @@ report is used instead. The LLM never changes the prediction.
 
 Only tool outputs are sent to the LLM: no image pixels and no patient details.
 """
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -15,6 +16,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -31,6 +33,7 @@ GEMINI_MODEL = "gemini-3.8-flash"  # stable per https://ai.google.dev/gemini-api
 MAX_STEPS = 5   # LLM calls per report, including the retry
 MAX_RETRIES = 1  # re-asks after an invalid or ungrounded report
 RATE_LIMIT_MAX_RETRY_DELAY = 10.0  # seconds; on a 429, wait and retry once only if Google asks for less
+DEFAULT_REQUEST_TIMEOUT_S = 120.0  # async requests (eval runner) give up after this; counts as infrastructure
 
 BANNED_PATTERNS = [r"diagnosis\s+(is\s+|has\s+been\s+)?confirmed", r"confirmed\s+diagnosis"]
 # A banned phrase is allowed when its own clause negates it within a few words, e.g. "not a confirmed
@@ -272,16 +275,23 @@ class GeminiClient(LLMClient):
 
 
 class OpenAICompatibleClient(LLMClient):
-    """Chat Completions API with tool calling (Groq, or any OpenAI-compatible endpoint)."""
+    """Chat Completions API with tool calling (Groq, or any OpenAI-compatible endpoint).
+
+    generate() is the sync path (the app). agenerate() is the async path (the eval runner): same
+    request, same 429 rule, same parsing, but it awaits AsyncOpenAI, waits with asyncio.sleep, holds
+    the model's asyncio.Semaphore slot while in flight, and gives up after timeout_s.
+    """
 
     def __init__(self, api_key, model, base_url, client=None, sleep=time.sleep, budget=None, options=None,
-                 provider="Groq"):
+                 provider="Groq", async_client=None, async_sleep=asyncio.sleep, timeout_s=DEFAULT_REQUEST_TIMEOUT_S):
         if client is None:
             from openai import OpenAI
             client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)  # retries are handled here
         self.client, self.model, self.name = client, model, model
         self.sleep, self.budget, self.provider = sleep, budget, provider
         self.options = dict(options or {})
+        self._api_key, self._base_url = api_key, base_url
+        self._async_client, self.async_sleep, self.timeout_s = async_client, async_sleep, timeout_s
 
     def _messages(self, system, messages):
         out = [{"role": "system", "content": system}]
@@ -295,12 +305,20 @@ class OpenAICompatibleClient(LLMClient):
                          "content": json.dumps(result, default=str)} for call, result in m["results"]]
         return out
 
-    def generate(self, system, messages, tools, tools_allowed=True):
-        import openai
+    def _prepare(self, system, messages, tools, tools_allowed):
         payload = self._messages(system, messages)
         tool_specs = [{"type": "function", "function": {"name": d["name"], "description": d["description"],
                                                         "parameters": d["parameters"]}} for d in tools]
         options = dict(self.options, **({} if tools_allowed else {"tool_choice": "none"}))
+        return payload, tool_specs, options
+
+    def _rate_limit_error(self, error, delay):
+        return RateLimitError(delay, *openai_quota_info(error), provider=self.provider,
+                              resets="the provider's daily window")
+
+    def generate(self, system, messages, tools, tools_allowed=True):
+        import openai
+        payload, tool_specs, options = self._prepare(system, messages, tools, tools_allowed)
         retries = 0
         for attempt in (1, 2):
             reservation = self._reserve(payload, tool_specs)
@@ -314,8 +332,38 @@ class OpenAICompatibleClient(LLMClient):
                     self.sleep(delay)
                     retries += 1
                     continue
-                raise RateLimitError(delay, *openai_quota_info(e), provider=self.provider,
-                                     resets="the provider's daily window") from e
+                raise self._rate_limit_error(e, delay) from e
+        return self._parse(response, retries, reservation)
+
+    async def agenerate(self, system, messages, tools, tools_allowed=True):
+        import openai
+        payload, tool_specs, options = self._prepare(system, messages, tools, tools_allowed)
+        retries = 0
+        for attempt in (1, 2):
+            reservation = await self._areserve(payload, tool_specs)
+            try:
+                async with (self.budget.slot() if self.budget is not None else nullcontext()):
+                    response = await asyncio.wait_for(
+                        self._async().chat.completions.create(
+                            model=self.model, messages=payload, tools=tool_specs, **split_request_options(options)),
+                        self.timeout_s)
+                break
+            except openai.RateLimitError as e:
+                delay = openai_retry_after(e)
+                if attempt == 1 and delay is not None and delay < RATE_LIMIT_MAX_RETRY_DELAY:
+                    await self.async_sleep(delay)
+                    retries += 1
+                    continue
+                raise self._rate_limit_error(e, delay) from e
+        return self._parse(response, retries, reservation)
+
+    def _async(self):
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+            self._async_client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url, max_retries=0)
+        return self._async_client
+
+    def _parse(self, response, retries, reservation):
         usage = response.usage
         if self.budget is not None and usage is not None:
             self.budget.record(reservation, usage.total_tokens, usage.completion_tokens)
@@ -336,12 +384,23 @@ class OpenAICompatibleClient(LLMClient):
         return LLMTurn(text=None if calls else (message.content or ""), tool_calls=calls, raw=raw,
                        usage=openai_usage(usage), finish_reason=choice.finish_reason, rate_limit_retries=retries)
 
+    def _reservation_size(self, payload, tool_specs):
+        max_out = int(self.options.get("max_completion_tokens", 1000))
+        return estimate_tokens(payload, tool_specs) + max_out, max_out
+
     def _reserve(self, payload, tool_specs):
         if self.budget is None:
             return None
         try:
-            max_out = int(self.options.get("max_completion_tokens", 1000))
-            return self.budget.acquire(estimate_tokens(payload, tool_specs) + max_out, max_out)
+            return self.budget.acquire(*self._reservation_size(payload, tool_specs))
+        except DailyCapReached as cap:
+            raise RateLimitError.from_daily_cap(cap, self.provider) from cap
+
+    async def _areserve(self, payload, tool_specs):
+        if self.budget is None:
+            return None
+        try:
+            return await self.budget.aacquire(*self._reservation_size(payload, tool_specs))
         except DailyCapReached as cap:
             raise RateLimitError.from_daily_cap(cap, self.provider) from cap
 
@@ -397,12 +456,23 @@ class MockLLMClient(LLMClient):
     """Scripted client for tests. Each script item is an LLMTurn or a callable(messages) -> LLMTurn."""
     name = "mock"
 
-    def __init__(self, script):
+    def __init__(self, script, delay_s=0.0):
         self.script = list(script)
         self.calls = []
         self.tools_allowed = []
+        self.delay_s = delay_s  # simulated network latency (benchmarks/tests)
 
     def generate(self, system, messages, tools, tools_allowed=True):
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        return self._next(messages, tools_allowed)
+
+    async def agenerate(self, system, messages, tools, tools_allowed=True):
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self._next(messages, tools_allowed)
+
+    def _next(self, messages, tools_allowed):
         self.calls.append(list(messages))
         self.tools_allowed.append(tools_allowed)
         if not self.script:
@@ -455,7 +525,8 @@ def build_llm_client(role="report", model=None, config=None):
     if settings["kind"] == "gemini":
         return GeminiClient(settings["api_key"], model, budget=budget)
     return OpenAICompatibleClient(settings["api_key"], model, settings["base_url"], budget=budget,
-                                  options=request_options(model, config), provider=name.capitalize())
+                                  options=request_options(model, config), provider=name.capitalize(),
+                                  timeout_s=config.get("request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S))
 
 
 def asserts_confirmed_diagnosis(text):
@@ -591,13 +662,86 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES, tr
     Traced as a 'report' span holding llm_call, tool_call, guard and fallback_used spans.
     """
     with trace_span(tracer, "report", llm=getattr(llm, "name", None)) as span:
-        result = _generate_report(tools, llm, max_steps, max_retries, tracer)
-        trace_event(tracer, "fallback_used", used=result.source == "fallback", reason=result.reason)
-        safe_set(span, source=result.source, steps=result.steps, rejected=len(result.rejected))
+        result = _drive_sync(_report_loop(tools, llm, max_steps, max_retries, tracer), llm, tracer)
+        _close_report_span(span, result, tracer)
     return result
 
 
-def _generate_report(tools, llm, max_steps, max_retries, tracer):
+async def agenerate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES, tracer=None):
+    """Async generate_report (eval runner): identical decisions, LLM calls awaited."""
+    with trace_span(tracer, "report", llm=getattr(llm, "name", None)) as span:
+        result = await _drive_async(_report_loop(tools, llm, max_steps, max_retries, tracer), llm, tracer)
+        _close_report_span(span, result, tracer)
+    return result
+
+
+def _close_report_span(span, result, tracer):
+    trace_event(tracer, "fallback_used", used=result.source == "fallback", reason=result.reason)
+    safe_set(span, source=result.source, steps=result.steps, rejected=len(result.rejected))
+
+
+@dataclass
+class LLMRequest:
+    """One LLM call the report loop needs made."""
+    step: int
+    messages: list
+    tools_allowed: bool
+
+
+def _drive_sync(loop, llm, tracer):
+    """Run the report loop, making each requested LLM call synchronously."""
+    try:
+        request = next(loop)
+        while True:
+            try:
+                with _llm_span(tracer, llm, request) as span:
+                    turn = llm.generate(SYSTEM_PROMPT, request.messages, TOOL_DECLARATIONS,
+                                        tools_allowed=request.tools_allowed)
+                    safe_set(span, **llm_call_attributes(turn, llm.name))
+                outcome = turn
+            except Exception as e:
+                outcome = e
+            request = loop.send(outcome)
+    except StopIteration as stop:
+        return stop.value
+
+
+async def _drive_async(loop, llm, tracer):
+    """Run the report loop, awaiting each LLM call (agenerate) so other coroutines run meanwhile.
+
+    A client without agenerate (e.g. GeminiClient) is called synchronously, inline: no threads.
+    """
+    try:
+        request = next(loop)
+        while True:
+            try:
+                with _llm_span(tracer, llm, request) as span:
+                    if hasattr(llm, "agenerate"):
+                        turn = await llm.agenerate(SYSTEM_PROMPT, request.messages, TOOL_DECLARATIONS,
+                                                   tools_allowed=request.tools_allowed)
+                    else:
+                        turn = llm.generate(SYSTEM_PROMPT, request.messages, TOOL_DECLARATIONS,
+                                            tools_allowed=request.tools_allowed)
+                    safe_set(span, **llm_call_attributes(turn, llm.name))
+                outcome = turn
+            except Exception as e:
+                outcome = e
+            request = loop.send(outcome)
+    except StopIteration as stop:
+        return stop.value
+
+
+def _llm_span(tracer, llm, request):
+    return trace_span(tracer, "llm_call", model=llm.name, step=request.step, tools_allowed=request.tools_allowed)
+
+
+def _report_loop(tools, llm, max_steps, max_retries, tracer):
+    """The report agent's decisions, shared by the sync and async drivers.
+
+    A generator: it yields an LLMRequest whenever it needs the model, receives the outcome (an LLMTurn
+    or the exception the call raised) via send(), and returns the ReportResult. All retry, guard and
+    fallback logic lives here, so both drivers behave identically.
+    """
     truth = tools.run_classifier()  # ground truth for the guard, independent of what the LLM calls
     result = ReportResult(report=None, source="fallback")
 
@@ -618,11 +762,9 @@ def _generate_report(tools, llm, max_steps, max_retries, tracer):
         # Once every tool has been called the model has all the facts: forbid further tool calls so the
         # turn can only be the final answer (avoids malformed tool calls such as Groq's tool_use_failed)
         tools_allowed = not all_tools <= set(result.tool_calls)
-        try:
-            with trace_span(tracer, "llm_call", model=llm.name, step=step, tools_allowed=tools_allowed) as span:
-                turn = llm.generate(SYSTEM_PROMPT, messages, TOOL_DECLARATIONS, tools_allowed=tools_allowed)
-                safe_set(span, **llm_call_attributes(turn, llm.name))
-        except Exception as e:
+        outcome = yield LLMRequest(step, messages, tools_allowed)
+        if isinstance(outcome, Exception):
+            e = outcome
             detail = f"{type(e).__name__}: {e}" + (f" <- {e.__cause__}" if e.__cause__ else "")
             kind = classify_llm_error(e)
             if kind == "model" and retries_left > 0:
@@ -633,6 +775,7 @@ def _generate_report(tools, llm, max_steps, max_retries, tracer):
                                         "error_detail": detail[:500]})
                 continue
             return fall_back(describe_llm_error(e), detail, kind)
+        turn = outcome
         messages.append({"role": "assistant", "turn": turn})
 
         if turn.tool_calls:
