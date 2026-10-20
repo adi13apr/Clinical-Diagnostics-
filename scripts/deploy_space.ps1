@@ -22,6 +22,9 @@
 
 .EXAMPLE
     .\scripts\deploy_space.ps1 -Space adi13apr/clinical-diagnostics-api -Push
+
+.EXAMPLE
+    .\scripts\deploy_space.ps1 -Space adi13apr/clinical-diagnostics-api -DockerTest -WorkRoot D:\deploy
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -29,7 +32,8 @@ param(
     [string]$Ref = "main",          # git branch, tag or commit to deploy
     [switch]$DockerTest,            # build + run the image locally and check /health
     [switch]$Push,                  # force-push the snapshot to the Space
-    [int]$Port = 7860
+    [int]$Port = 7860,
+    [string]$WorkRoot = $env:TEMP   # where the snapshot folder goes (e.g. D:\deploy if C: is full)
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,9 +97,9 @@ if ($Remote -and $Remote -ne $Commit) {
 
 # --- 2. Snapshot ---------------------------------------------------------------------------
 $Name = ($Space -split '/')[1]
-$Work = Join-Path $env:TEMP ("hf-space-{0}-{1}" -f $Name, (Get-Date -Format "yyyyMMdd-HHmmss"))
+$Work = Join-Path $WorkRoot ("hf-space-{0}-{1}" -f $Name, (Get-Date -Format "yyyyMMdd-HHmmss"))
 Step "Exporting a clean snapshot to $Work"
-New-Item -ItemType Directory -Path $Work | Out-Null
+New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $Tar = "$Work.tar"
 Native "git archive" { git -C $Repo archive --format=tar -o $Tar $Commit -- $Paths }
 Native "tar" { tar -xf $Tar -C $Work }
