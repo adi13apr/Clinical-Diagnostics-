@@ -112,6 +112,27 @@ def test_negated_claim_passes_and_guard_replay_detects_changes():
     assert run_checks(accepted_now)["guard_replay_consistent"] is False
 
 
+ABNORMAL_CASE = next(c for c in CASES if c.snapshot.predicted_class != "Normal")
+NORMAL_CASE = next(c for c in CASES if c.snapshot.predicted_class == "Normal")
+
+
+@pytest.mark.parametrize("recommendation", [
+    "No immediate referral is required, but a clinician should review the image.",   # c32, verbatim start
+    "No immediate follow‑up is required.",                                      # non-breaking hyphen
+    "No immediate imaging follow-up is required based on this result.",
+    "No further action is needed.",
+])
+def test_abnormal_result_must_not_be_dismissed(recommendation):
+    assert run_checks(make_record(ABNORMAL_CASE, recommendation=recommendation))["abnormal_result_not_dismissed"] is False
+    # Normal predictions are exempt (the human reviewer accepted this wording there)
+    assert run_checks(make_record(NORMAL_CASE, recommendation=recommendation))["abnormal_result_not_dismissed"] is None
+
+
+def test_abnormal_result_with_a_real_next_step_passes():
+    ok = make_record(ABNORMAL_CASE, recommendation="Proceed with clinical evaluation and appropriate tests.")
+    assert run_checks(ok)["abnormal_result_not_dismissed"] is True
+
+
 def test_pass_rates_exclude_not_applicable():
     records = [make_record(REFER_CASE), make_record(CONFIDENT_CASE),
                make_record(REFER_CASE, recommendation="Rest.")]

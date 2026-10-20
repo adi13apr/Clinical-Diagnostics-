@@ -36,9 +36,14 @@ The raw model was strongly **under**-confident: its probabilities never reached 
 
 36 test cases, made up of every model error, every refer case, and 6 correct ones ([`evals/results/2026-10-18.md`](evals/results/2026-10-18.md)):
 
-- **Deterministic checks: 100% on all 9.** These are: class, probability and status match the classifier; refer cases recommend clinician review; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run. CI replays this run on every push and fails if any rate drops.
+- **Deterministic checks: 9 of 10 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
+  - The 10th check, added after human review, flags Pneumonia/TB reports that say no referral or action is needed. It fails on 1 of 13 (`c32`).
+  - CI replays this run on every push and fails if any rate drops.
 - All 36 reports were written by the LLM: no template fallbacks and no guard rejections.
-- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.78–4.94 out of 5 on faithfulness, uncertainty language, actionability and plain language. **The judge is not validated:** the 15-report human scoring sheet (`evals/human_labels.csv`) hasn't been filled in yet, and the scores sit near the ceiling.
+- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.78–4.94 out of 5 on faithfulness, uncertainty language, actionability and plain language.
+- **Judge vs human:** I scored 15 reports blind with the same rubric. They agree on 82% of scores exactly and 97% within one point, but both of us rated almost everything 5, so that number is flattering.
+  - The one report I marked down (`c32`: "No immediate referral is required" for a 99.99% Pneumonia result) got 5/5 from the judge on faithfulness and actionability.
+  - **The judge confirms good reports but missed the one bad report a human caught**, which is why that case now has its own deterministic check rather than relying on the judge.
 
 ### Failure case: confidently wrong
 
