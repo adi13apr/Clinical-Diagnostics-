@@ -1,6 +1,6 @@
 """Eval runner.
 
-    python -m evals.run --live [--resume [RUN]] [--limit N]             # real model + LLM agent/judge, resumable
+    python -m evals.run --live [--resume [RUN]] [--limit N] [--sync]    # real model + LLM agent/judge, resumable
     python -m evals.run --replay [--run RUN] [--update-baseline]        # re-score saved outputs, no network (CI)
     python -m evals.run --export-human-labels [--run RUN]               # blank sheet for human scoring
     python -m evals.run --agreement [--run RUN]                         # judge vs human agreement
@@ -10,8 +10,10 @@ record for a case wins, so a crash or rate limit loses nothing) and write a summ
 to evals/results/<date>.md.
 """
 import argparse
+import asyncio
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,10 +73,10 @@ def check_dataset_hash(records, expected, run_path):
 
 # ---- Live ----
 
-def run_case(case, service, llm, roots):
+def _prepare_case(case, service, roots):
+    """Load the image and run the classifier (CPU, a fraction of a second): (tools, tracer)."""
     from PIL import Image
 
-    from agent.agent import generate_report
     from agent.tools import ReportTools
     from services.tracing import Tracer, trace_span
 
@@ -83,11 +85,14 @@ def run_case(case, service, llm, roots):
     tracer = Tracer()  # in-memory only: eval runs don't write to traces/
     with trace_span(tracer, "prediction"):
         prediction = service.predict(image, tracer=tracer)
-    tools = ReportTools(service, image, prediction, tracer=tracer)
-    result = generate_report(tools, llm, tracer=tracer)
+    return ReportTools(service, image, prediction, tracer=tracer), tracer
+
+
+def _finish_case(case, tools, tracer, result):
+    """The record's report fields (identical for the sync and async runners)."""
     if result.source == "fallback" and result.error_kind in ("rate_limit", "infrastructure"):
-        # Quota, network, auth or server failure: says nothing about report quality, so stop and
-        # retry later. A 'model' failure (e.g. an invalid tool call) IS a result and is recorded.
+        # Quota, network, auth, server or timeout failure: says nothing about report quality, so stop
+        # and retry later. A 'model' failure (e.g. an invalid tool call) IS a result and is recorded.
         raise StopRun(f"{result.reason} {(result.error_detail or '')[:300]}")
 
     truth = tools.run_classifier()
@@ -116,12 +121,130 @@ def run_case(case, service, llm, roots):
     }
 
 
+def run_case(case, service, llm, roots):
+    from agent.agent import generate_report
+    tools, tracer = _prepare_case(case, service, roots)
+    return _finish_case(case, tools, tracer, generate_report(tools, llm, tracer=tracer))
+
+
+async def arun_case(case, service, llm, roots):
+    from agent.agent import agenerate_report
+    tools, tracer = _prepare_case(case, service, roots)
+    return _finish_case(case, tools, tracer, await agenerate_report(tools, llm, tracer=tracer))
+
+
+def new_record(case, run_id, data_hash, provider, model, fields):
+    return {"record_version": RECORD_VERSION, "case_id": case.case_id, "run_id": run_id,
+            "dataset_hash": data_hash, "provider": provider, "agent_model": model,
+            "recorded_at": datetime.now(timezone.utc).isoformat(), **fields, "judge": None, "judge_error": None}
+
+
+def with_judgement(record, judge, scores, usage, latency_ms):
+    return dict(record, judge={"model": judge.model, "scores": scores.model_dump(), "usage": usage,
+                               "latency_ms": round(latency_ms, 1)}, judge_error=None)
+
+
+def progress_line(i, n, case, record):
+    j = record["judge"]
+    return (f"[{i}/{n}] {case.case_id}: {record['report_source']}, "
+            f"judge {'-'.join(str(j['scores'][c]['score']) for c in CRITERIA) if j else record['judge_error']}"
+            f" ({record.get('agent_usage', {}).get('llm_calls', '?')} agent calls)")
+
+
+def run_pipeline_sync(todo, records, make_record, judge, append, log=print):
+    """The original runner: report case N, judge case N, then case N+1. Returns a stop message or None."""
+    from agent.agent import RateLimitError, describe_llm_error
+    try:
+        for i, case in enumerate(todo, 1):
+            record = records.get(case.case_id)
+            if record and record.get("judge"):
+                continue
+            if record is None:
+                record = make_record(case)
+                append(record)
+            try:
+                started = time.perf_counter()
+                scores, usage = judge.judge(record["tool_outputs"], record["report"])
+                record = with_judgement(record, judge, scores, usage, (time.perf_counter() - started) * 1000)
+            except RateLimitError as e:
+                append(dict(record, judge_error=f"RateLimitError: {e}"))
+                raise StopRun(f"judge: {describe_llm_error(e)} [{e}]")
+            except Exception as e:
+                record = dict(record, judge_error=f"{type(e).__name__}: {e}")
+            append(record)
+            records[case.case_id] = record
+            log(progress_line(i, len(todo), case, record))
+    except StopRun as e:
+        return str(e)
+    return None
+
+
+async def run_pipeline_async(todo, records, amake_record, judge, append, log=print):
+    """Async runner: while the report for case N+1 is being written, the judge scores case N.
+
+    One event loop, two coroutines: this loop writes reports (report model) and hands each new record
+    to a single judge worker (judge model) through a queue. Each side waits on its own model's rate
+    limit and network, so their waits overlap. No threads. Same records, same resume and stop rules
+    as run_pipeline_sync; only the order of lines in the run file can differ (the last record per
+    case wins when loading).
+    """
+    from agent.agent import RateLimitError, describe_llm_error
+    queue = asyncio.Queue()
+    stopped = []  # first stop message; after a stop, queued records stay unjudged (resume re-judges them)
+
+    async def judge_worker():
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            i, case, record = item
+            if stopped:
+                continue
+            try:
+                started = time.perf_counter()
+                if hasattr(judge, "ajudge"):
+                    scores, usage = await judge.ajudge(record["tool_outputs"], record["report"])
+                else:
+                    scores, usage = judge.judge(record["tool_outputs"], record["report"])
+                record = with_judgement(record, judge, scores, usage, (time.perf_counter() - started) * 1000)
+            except RateLimitError as e:
+                append(dict(record, judge_error=f"RateLimitError: {e}"))
+                stopped.append(f"judge: {describe_llm_error(e)} [{e}]")
+                continue
+            except Exception as e:
+                record = dict(record, judge_error=f"{type(e).__name__}: {e}")
+            append(record)
+            records[case.case_id] = record
+            log(progress_line(i, len(todo), case, record))
+
+    worker = asyncio.create_task(judge_worker())
+    try:
+        for i, case in enumerate(todo, 1):
+            if stopped:
+                break
+            record = records.get(case.case_id)
+            if record and record.get("judge"):
+                continue
+            if record is None:
+                try:
+                    record = await amake_record(case)
+                except StopRun as e:
+                    stopped.append(str(e))
+                    break
+                append(record)
+            await queue.put((i, case, record))  # the judge takes it; this loop moves on to the next report
+    finally:
+        await queue.put(None)
+        await worker
+    return stopped[0] if stopped else None
+
+
 def live(args):
     import logging
     logging.getLogger("streamlit").setLevel(logging.ERROR)  # ModelService's st.cache_resource outside the app
 
     sys.path.insert(0, str(REPO / "scripts"))
-    from agent.agent import RateLimitError, build_llm_client, describe_llm_error
+    from agent.agent import build_llm_client
     from agent.llm_config import provider_settings
     from calibrate import find_root
     from evals.judge import build_judge
@@ -145,46 +268,34 @@ def live(args):
         records = load_run(run_path)
         check_dataset_hash(records, data_hash, run_path)
     else:
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        run_path = RUNS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
+        run_path = Path(args.run_file) if args.run_file else \
+            RUNS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl"
+        run_path.parent.mkdir(parents=True, exist_ok=True)
         records = {}
     run_id = run_path.stem
+    mode = "sync" if args.sync else "async"
     print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, provider {provider}, "
-          f"reports {model}, judge {judge.model}")
+          f"reports {model}, judge {judge.model}, {mode} runner")
     service = ModelService(str(REPO / "best_student_model_aligned_final.pth"))
     roots = {"pneumonia": find_root(REPO / "data" / "pneumonia", "chest_xray", "train"),
              "tb": find_root(REPO / "data" / "tb", "TB_Chest_Radiography_Database", "Tuberculosis")}
 
     todo = cases[:args.limit] if args.limit else cases
-    try:
-        for i, case in enumerate(todo, 1):
-            record = records.get(case.case_id)
-            if record and record.get("judge"):
-                continue
-            if record is None:
-                record = {"record_version": RECORD_VERSION, "case_id": case.case_id, "run_id": run_id,
-                          "dataset_hash": data_hash, "provider": provider, "agent_model": model,
-                          "recorded_at": datetime.now(timezone.utc).isoformat(),
-                          **run_case(case, service, llm, roots), "judge": None, "judge_error": None}
-                append_record(run_path, record)
-            try:
-                scores, usage = judge.judge(record["tool_outputs"], record["report"])
-                record = dict(record, judge={"model": judge.model, "scores": scores.model_dump(), "usage": usage},
-                              judge_error=None)
-            except RateLimitError as e:
-                append_record(run_path, dict(record, judge_error=f"RateLimitError: {e}"))
-                raise StopRun(f"judge: {describe_llm_error(e)} [{e}]")
-            except Exception as e:
-                record = dict(record, judge_error=f"{type(e).__name__}: {e}")
-            append_record(run_path, record)
-            records[case.case_id] = record
-            j = record["judge"]
-            print(f"[{i}/{len(todo)}] {case.case_id}: {record['report_source']}, "
-                  f"judge {'-'.join(str(j['scores'][c]['score']) for c in CRITERIA) if j else record['judge_error']}"
-                  f" ({record.get('agent_usage', {}).get('llm_calls', '?')} agent calls)", flush=True)
-    except StopRun as e:
+    started = time.perf_counter()
+    if args.sync:
+        stop = run_pipeline_sync(
+            todo, records,
+            lambda case: new_record(case, run_id, data_hash, provider, model, run_case(case, service, llm, roots)),
+            judge, lambda r: append_record(run_path, r))
+    else:
+        async def amake_record(case):
+            return new_record(case, run_id, data_hash, provider, model, await arun_case(case, service, llm, roots))
+        stop = asyncio.run(run_pipeline_async(todo, records, amake_record, judge, lambda r: append_record(run_path, r)))
+    elapsed = time.perf_counter() - started
+    print(f"\n{mode} runner wall time: {elapsed:.1f} s for {len(todo)} cases")
+    if stop:
         remaining = sum(1 for c in todo if not (records.get(c.case_id) or {}).get("judge"))
-        print(f"\nStopped: {e}\n{remaining} cases left. "
+        print(f"\nStopped: {stop}\n{remaining} cases left. "
               f"Resume with: python -m evals.run --live --resume {relative(run_path)}")
         return 2
 
@@ -193,6 +304,8 @@ def live(args):
         print(f"\n{len(done)}/{len(todo)} cases fully scored. Resume with: "
               f"python -m evals.run --live --resume {relative(run_path)}")
         return 2
+    if args.limit or args.run_file:
+        return 0  # partial or side runs (e.g. benchmarks) never overwrite the dated results file
     summary = build_summary(load_run(run_path), cases, data_hash, run_path, load_baseline(), load_agreement(run_path))
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"{datetime.now(timezone.utc):%Y-%m-%d}.md"
@@ -394,6 +507,8 @@ def main(argv=None):
     ap.add_argument("--resume", nargs="?", const="latest", help="continue a live run (default: latest)")
     ap.add_argument("--run", help="run file to replay / export / compare (default: baseline run or latest)")
     ap.add_argument("--limit", type=int, help="only the first N cases")
+    ap.add_argument("--sync", action="store_true", help="with --live: use the original sequential runner")
+    ap.add_argument("--run-file", help="with --live: write this run file instead of evals/runs/<timestamp>.jsonl")
     ap.add_argument("--judge-model", help="judge model (default: the agent's model)")
     ap.add_argument("--update-baseline", action="store_true", help="with --replay: write evals/baseline.json")
     ap.add_argument("--summary-out", help="with --replay: also write the markdown summary to this file")

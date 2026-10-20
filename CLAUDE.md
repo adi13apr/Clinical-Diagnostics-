@@ -18,6 +18,7 @@ pytest                             # no Supabase, dataset or GPU needed
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
 python -m evals.run --live --resume  # continue the live eval (real model + LLM; needs data/ and a key)
+python -m evals.benchmark --simulated  # old (sync) vs new (async) runner with fake-latency clients
 ```
 
 CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`.
@@ -61,7 +62,7 @@ agent/                      LLM report agent (see "Report agent")
   tools.py                  ReportTools: run_classifier, get_gradcam, get_condition_info; TOOL_DECLARATIONS
   agent.py                  LLMClient / OpenAICompatibleClient / GeminiClient / MockLLMClient, tool loop, guard, fallback
   llm_config.py             Provider selection + keys from config/llm.json, st.secrets, env
-  rate_limit.py             Token-aware per-model ModelBudget (rpm, tpm, daily caps), budget_for()
+  rate_limit.py             Token-aware per-model ModelBudget (rpm, tpm, otpm, daily caps; sync + async), budget_for()
   condition_info.json       Static condition text (DRAFT: needs clinical sign-off)
 ui/                         Streamlit pages; functions named show_*(...)
   login_pages.py            show_login_ui(auth_service), handle_oauth_callback (Google sign-in return)
@@ -173,6 +174,12 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `get_condition_info` reads `condition_info.json` only; there are no web lookups. `condition` is optional and defaults to the predicted class. It also returns `model_limitations` (from `_model_limitations`), which holds the dataset/source-confound caveat. That caveat used to be required by the system prompt without being in any tool output, and the pilot judge flagged it as ungrounded. Report limitations must come from this tool; the template report uses them verbatim.
   - Tool exceptions are returned to the LLM as `{"error": ...}`.
 - **Loop:** at most `MAX_STEPS = 5` LLM calls. The final text must be JSON → `Report.model_validate` → `check_grounding`. On failure the LLM gets the problem and `MAX_RETRIES = 1` more try. After that, or on any LLM exception, it falls back to `fallback_report`.
+- **One loop, two drivers.** All decisions live in `_report_loop`, a generator that yields an `LLMRequest` and receives the call's outcome (an `LLMTurn` or the exception). `generate_report` drives it synchronously (the app). `agenerate_report` drives it with `await llm.agenerate(...)` (the eval runner; clients without `agenerate`, e.g. Gemini, are called inline, not in a thread). **Change agent behaviour only in `_report_loop`**, so both paths stay identical (`tests/test_async_eval.py` checks this).
+- **Async clients:** `OpenAICompatibleClient.agenerate` and `OpenAICompatibleJudge.ajudge` share `_prepare`/`_parse` with their sync methods.
+  - They use `AsyncOpenAI` (created lazily, `max_retries=0`), wait with `asyncio.sleep`, and reserve with `budget.aacquire`.
+  - Each request holds `budget.slot()` (the model's `asyncio.Semaphore`, `max_concurrent` in `config/llm.json`, 1 by default) and is wrapped in `asyncio.wait_for(..., timeout_s)` (`request_timeout_s`, 120). The timeout covers the network request only, not rate-limit waits.
+  - A timeout raises `TimeoutError`, which is classified `infrastructure`, so the eval stops and can be resumed.
+- **`ModelBudget` serves both:** `_try_reserve` never sleeps. `acquire` loops with `time.sleep`; `aacquire` loops with `asyncio.sleep` under an `asyncio.Lock`. Sync and async share the same counters. asyncio primitives are kept per event loop (`_primitives`).
 - **Grounding guard** (`check_grounding`):
   - `predicted_class`, `calibrated_probability` and `status` must `==` `run_classifier`'s output;
   - no assertion of a confirmed diagnosis (`asserts_confirmed_diagnosis`, using `BANNED_PATTERNS`). A match is allowed when a negation cue (not, no, never, without, cannot, n't, until, unless, before) appears in the 4 words before it within the same clause (clauses split on punctuation, "but", "however"). "No doubt" and "not only" don't count as negations. This was added after Gemini wrote "a screening aid, not a confirmed diagnosis" (fixture `gemini_rejected_negated_confirmed.json`);
@@ -216,6 +223,13 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `dataset_caveat_present` (**eval only, not in the guard**): the first `model_limitations` item must appear verbatim in the limitations, with whitespace and hyphens normalised. It fails on `c07` in the baseline run (35/36), where gpt-oss skipped `get_condition_info` and invented limitations. To block it in the guard, `check_grounding` would need the condition-info output, plus a new run and baseline. Run records now include `tool_calls`.
 - **Current baseline run:** `20261020T075220Z` (11 of 12 checks at 100%). The human labels belong to `20261018T161443Z`.
 - **Judge** (`judge.py`, `build_judge()`): Groq `qwen/qwen3.8-27b`, a different model family from the report model to avoid self-preference. It uses strict `json_schema` (`JUDGE_JSON_SCHEMA`: closed objects, scores as an integer enum 1–5, and Pydantic validates the result). `GeminiJudge` (`response_schema`) is used when the provider is gemini. `rubric.md` is sent verbatim. The judge sees tool outputs and the report only, never the true label. `--judge-model` overrides the model.
+- **Async runner (default; `--sync` = old):** `run_pipeline_async`, in one event loop, writes reports in order and puts each new record on a queue for a single judge coroutine, so judging case N overlaps the report for case N+1. No threads.
+  - `run_pipeline_sync` is the original loop. Both take plain callables (`make_record`/`amake_record`, `judge`, `append`), so tests and `evals/benchmark.py` drive them with fake-latency clients.
+  - **Same records:** `run_case`/`arun_case` share `_prepare_case`/`_finish_case`; only line order in the run file can differ, and the last record per case wins.
+  - **Stops:** a report-side `StopRun` stops new reports, but queued records are still judged. A judge `RateLimitError` records the `judge_error` and stops; any report already in progress still gets appended, and resume judges it.
+  - Records now include `judge.latency_ms`.
+  - `--run-file PATH` writes a side run. `--limit` and `--run-file` runs never write `evals/results/<date>.md`; before this fix, `--limit` overwrote it.
+- **Benchmark** (`evals/benchmark.py`): `--simulated` uses real timings scaled down 50× (report = baseline run mean, judge ≈ 1 s) and writes `evals/results/benchmark_simulated.md`. Result: **1.01×** at the real ratio (the judge's time is all that can overlap; the report model's own token limit is the bottleneck), 1.19× with a 15 s judge, 1.65× when both take equal time. `--live` runs 5 cases each way into scratch files, with a cooldown between them, and writes `benchmark_live.md`.
 - **Live runs** (`run.py --live`):
   - Agent and judge come from `build_llm_client("report")` / `build_judge()` with per-model budgets from `config/llm.json`; a model used by both shares one budget. A google-genai `Client` closes its HTTP connection when garbage-collected, so always keep a reference to it.
   - Records are appended; the last record per case wins. `--resume` skips judged cases and re-judges unjudged ones.
