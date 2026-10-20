@@ -64,7 +64,8 @@ agent/                      LLM report agent (see "Report agent")
   rate_limit.py             Token-aware per-model ModelBudget (rpm, tpm, daily caps), budget_for()
   condition_info.json       Static condition text (DRAFT: needs clinical sign-off)
 ui/                         Streamlit pages; functions named show_*(...)
-  login_pages.py            show_login_ui(auth_service)
+  login_pages.py            show_login_ui(auth_service), handle_oauth_callback (Google sign-in return)
+  privacy.py                Public privacy policy at ?page=privacy (linked from Google's consent screen)
   dashboard.py              show_dashboard(...) sidebar nav → show_diagnosis_page (single/batch/history);
                             run_prediction() = time + predict + log; show_status() = triage banner;
                             show_single_result() renders the last single run from session_state
@@ -241,6 +242,9 @@ There are two kinds of client, both using the anon key from `st.secrets`:
   - Then it calls `complete_google_sign_in` → `exchange_code_for_session({"auth_code", "code_verifier"})` on this session's auth client, so RLS sees the new session.
   - Finally it sets `st.session_state.user` and reruns.
 - **App URL:** `app_base_url()` uses `[supabase] redirect_url` if set, else `st.context.url`. If neither is known, the button is shown disabled instead of breaking the login page.
+- **Run one server only.** The verifier is in the memory of the process that made the link, so the same process must handle the return. With two `streamlit run` processes (8501 and 8502), Google returns to whichever `redirect_url` names, and the sign-in fails.
+- **Privacy page:** `app.py` serves `ui/privacy.py` for `?page=privacy` **before** building any service, so it needs no secrets or login. Google's Branding page needs this public URL to publish the app beyond test users. Keep its claims true to the code: images aren't stored, Groq gets tool outputs only, and history visibility is enforced by app filtering (not proven RLS).
+- **Tests and secrets:** AppTest reads the developer's real `.streamlit/secrets.toml`, so auth UI tests monkeypatch `app_base_url` instead of relying on secrets being absent.
 - **External setup** (not in code):
   - Supabase → Authentication → Providers → Google: enabled, with a Google Cloud OAuth client ID and secret.
   - Supabase → Authentication → URL Configuration → Redirect URLs: `https://clinical-diagnosis.streamlit.app/**` and `http://localhost:8501/**`. The `/**` is needed because `redirect_to` carries `?oauth_state=…`; without a match, Supabase falls back to the Site URL and drops the state.

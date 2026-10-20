@@ -1,5 +1,12 @@
 # app.py
 import streamlit as st
+
+# Public privacy policy (Google's consent screen links here): served before any login or service setup
+if st.query_params.get("page") == "privacy":
+    from ui.privacy import show_privacy_page
+    show_privacy_page()
+    st.stop()
+
 from services.auth_handler import AuthService
 from services.data_handler import DataService
 from services.model_handler import ModelService

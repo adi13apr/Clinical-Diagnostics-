@@ -142,8 +142,10 @@ def login_app():
     show_login_ui(AuthService(client=SimpleNamespace(auth=None), url="https://proj.supabase.co"))
 
 
-def test_login_page_without_known_app_url_still_renders():
-    # Under AppTest st.context.url is None and no redirect_url is configured: email login must keep working
+def test_login_page_without_known_app_url_still_renders(monkeypatch):
+    # No redirect_url and no st.context.url: email login must keep working. Patched so the test doesn't
+    # depend on a developer's local .streamlit/secrets.toml (AppTest reads it).
+    monkeypatch.setattr("ui.login_pages.app_base_url", lambda: None)
     at = AppTest.from_function(login_app).run(timeout=60)
     assert not at.exception
     google = [b for b in at.button if b.label == "Continue with Google"]
@@ -160,6 +162,22 @@ def test_login_page_links_to_supabase_google_authorize(monkeypatch):
     assert link.url.startswith("https://proj.supabase.co/auth/v1/authorize?") and "provider=google" in link.url
     at.run(timeout=60)
     assert at.get("link_button")[0].proto.url == link.url  # reruns reuse the same sign-in state
+
+
+def test_privacy_page_is_public():
+    # Served before any service setup, so it works without secrets or a login (Google links to it)
+    at = AppTest.from_file("../app.py")  # relative to this test file
+    at.query_params["page"] = "privacy"
+    at.run(timeout=120)
+    assert not at.exception
+    assert at.title[0].value == "Privacy policy"
+    text = " ".join(m.value for m in at.markdown)
+    assert "not stored" in text and "Groq" in text and "github.com/adi13apr/Clinical-Diagnostics-/issues" in text
+
+
+def test_login_page_links_to_privacy_policy():
+    at = AppTest.from_function(login_app).run(timeout=60)
+    assert any("?page=privacy" in m.value for m in at.markdown)
 
 
 def test_no_code_means_nothing_happens():

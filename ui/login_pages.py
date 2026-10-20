@@ -86,3 +86,6 @@ def show_login_ui(auth_service):
                         st.error("This email is already registered. Please log in instead.")
                     else:
                         st.error(f"Registration failed: {str(e)}")
+
+    from ui.privacy import PRIVACY_PATH
+    st.markdown(f"[Privacy policy]({PRIVACY_PATH})")
