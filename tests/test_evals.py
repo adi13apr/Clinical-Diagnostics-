@@ -133,6 +133,19 @@ def test_abnormal_result_with_a_real_next_step_passes():
     assert run_checks(ok)["abnormal_result_not_dismissed"] is True
 
 
+def test_dataset_caveat_must_be_quoted_from_the_tool():
+    caveat = ("The model was trained and evaluated on two public datasets in which each disease came from a "
+              "different source, so performance may be lower.")
+    record = make_record(CONFIDENT_CASE, limitations=[caveat.replace("-", "‑")])  # unicode hyphens are fine
+    record["tool_outputs"]["condition_info"]["model_limitations"] = [caveat, "Grad-CAM is approximate."]
+    assert run_checks(record)["dataset_caveat_present"] is True
+    # c07 in 20261020T075220Z: invented limitations, no caveat
+    record["report"]["limitations"] = ["Model limitations: may be affected by image quality and positioning."]
+    assert run_checks(record)["dataset_caveat_present"] is False
+    del record["tool_outputs"]["condition_info"]["model_limitations"]
+    assert run_checks(record)["dataset_caveat_present"] is None
+
+
 def test_pass_rates_exclude_not_applicable():
     records = [make_record(REFER_CASE), make_record(CONFIDENT_CASE),
                make_record(REFER_CASE, recommendation="Rest.")]

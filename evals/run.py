@@ -104,6 +104,7 @@ def run_case(case, service, llm, roots):
         "fallback_reason": result.reason,
         "fallback_error_kind": result.error_kind,
         "steps": result.steps,
+        "tool_calls": result.tool_calls,  # which tools the model actually called (c07 skipped one)
         "rejected": result.rejected,
         "agent_usage": {
             "llm_calls": len(llm_calls),
