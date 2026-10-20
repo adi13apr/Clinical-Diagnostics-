@@ -1,12 +1,7 @@
-from supabase import create_client
-import streamlit as st
-
 class DataService:
-    def __init__(self):
-        self.client = create_client(
-            st.secrets["supabase"]["url"], 
-            st.secrets["supabase"]["key"]
-        )
+    def __init__(self, client):
+        # Must be the logged-in auth client: RLS (sql/005) only shows a user their own rows
+        self.client = client
 
     def save_diagnosis(self, email, result, patient_name):
         # Handle both old format (string) and new format (dict with diagnosis + confidence)

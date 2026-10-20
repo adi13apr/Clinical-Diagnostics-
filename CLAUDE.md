@@ -32,7 +32,7 @@ The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 ```toml
 [supabase]
 url = "..."
-key = "..."   # anon key
+key = "..."   # anon/publishable key, NEVER the service_role/secret key (it skips RLS)
 
 [groq]            # default provider (config/llm.json); without a key "Generate report" uses the template
 api_key = "..."   # or env GROQ_API_KEY
@@ -46,7 +46,8 @@ api_key = "..."   # or env GEMINI_API_KEY
 Database setup: run the files in `sql/` in order, in the Supabase SQL Editor, **before** deploying code that depends on them:
 - `002` adds `status` / `temperature` to `predictions`. Without it every prediction-log insert fails, which the app reports as a warning only.
 - `003` adds `status` to `diagnosis_history`. Without it every history insert fails: the single tab shows an error and batch rows show "Error".
-- `004` creates `traces` and adds `predictions.trace_id`. Without it every prediction-log insert fails (warning only), and spans go to local `traces/` only. The `diagnosis_history` table has no migration in the repo; it already exists in the Supabase project.
+- `004` creates `traces` and adds `predictions.trace_id`. Without it every prediction-log insert fails (warning only), and spans go to local `traces/` only.
+- `005` replaces `diagnosis_history`'s old "any logged-in user can read every row" policies with owner-only ones (`radiologist_email` = the JWT's `email`). The table itself has no create migration in the repo; it already exists in the Supabase project.
 
 ## Layout
 
@@ -89,6 +90,7 @@ sql/
   002_prediction_status.sql `status` + `temperature` columns, `refer_count` in the view
   003_diagnosis_history_status.sql  `status` column on diagnosis_history
   004_traces.sql            `traces` table (one row per span, RLS) + predictions.trace_id
+  005_diagnosis_history_owner_rls.sql  owner-only RLS on diagnosis_history (by email)
 config/
   pricing.json              NOMINAL per-model prices for cost estimates; billing_tier "free" → billed $0
   llm.json                  Provider (groq | gemini; env LLM_PROVIDER), report/judge models, per-model limits, request options
@@ -258,15 +260,12 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
 
 ## Supabase
 
-There are two kinds of client, both using the anon key from `st.secrets`:
+There is one client, `AuthService.client`, built with the anon/publishable key from `st.secrets`. It lives for one browser session (`st.session_state.auth_provider`) and carries the logged-in user's JWT after `login_email` or Google sign-in. `AuthService`, `PredictionService`, `SupabaseTraceStore` and `DataService` all use it, so RLS applies to `predictions`, `prediction_daily_summary`, `traces` and `diagnosis_history`.
 
-| Client | Lifetime | Session | Used by | Tables |
-| --- | --- | --- | --- | --- |
-| `AuthService.client` | one per browser session (`st.session_state.auth_provider`) | logged-in user's JWT after `login_email` | `AuthService`, `PredictionService`, `SupabaseTraceStore` | `predictions`, `prediction_daily_summary`, `traces` |
-| `DataService.client` | rebuilt every rerun | none (anon role) | `DataService` | `diagnosis_history` |
+- **Never use the service_role/secret key in the app.** It skips RLS. Until 2026-10 `DataService` built its own client with whatever `[supabase] key` held, and that was a service_role key, which was also committed in the first commit (`744ea86`) and is public in git history. It was rotated and the legacy keys disabled; history access now depends on `sql/005`.
 
 - Login state for routing lives in `st.session_state.user` (the Supabase `User` object). The dashboard only uses `.email`.
-- `PredictionService` **must** be given `auth_provider.client`. Its tables depend on RLS seeing the user's session.
+- `PredictionService` and `DataService` **must** be given `auth_provider.client`. Their tables depend on RLS seeing the user's session.
 
 ### Google sign-in (Supabase OAuth, PKCE)
 
@@ -289,7 +288,7 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 
 - Columns, as used in code: `radiologist_email`, `patient_name`, `prediction` (class name string), `confidence_score` (percent, 0–100, 2 dp), `status` (`confident`/`refer`, migration 003; NULL on older rows, shown as "—"), `created_at` (server default). Probabilities are **not** stored.
 - `confidence_score` is calibrated from the calibration commit onward. Older rows hold raw, much lower values.
-- It is read with `.eq("radiologist_email", email)` from an anon client. Access control depends entirely on that table's RLS policies, which are not in the repo.
+- It is read with `.eq("radiologist_email", email)` through the logged-in client. RLS (`sql/005`) enforces the same rule in the database: a user can insert and select only rows whose `radiologist_email` matches their JWT `email` (case-insensitive). There is no `user_id` column.
 
 ### `predictions` (prediction log)
 
@@ -325,7 +324,7 @@ There are two kinds of client, both using the anon key from `st.secrets`:
   - **Logging (API only):** `api/` uses `logging` (`configure_logging()` in `create_app` adds a root handler only when none exists; `api.*` at INFO). Key-fetch failures log the URL and the full cause chain (`describe()`); rejected tokens log the reason at WARNING. Never log the token. The Streamlit app still has no logging framework.
 - **Own data only:** `user_db` builds a `SyncPostgrestClient` per request with `Authorization: Bearer <user token>` (same `.table()` API the services take), so RLS applies. Queries also filter `user_id` (`PredictionService.get_history`, `SupabaseTraceStore.read/read_trace`). The view `prediction_daily_summary` relies on RLS alone (`security_invoker`).
   - **Never fall back to local `traces/` JSONL in the API.** It holds every user's spans. `/analytics` returns `pipeline: null` plus a warning instead; `/traces` returns 404.
-  - `diagnosis_history` is not used by the API (anon client, unknown RLS). `/history` reads `predictions`, which has no patient names.
+  - `diagnosis_history` is not used by the API. `/history` reads `predictions`, which has no patient names.
 - **Uploads:** content type must be `image/jpeg`/`image/png` **and** Pillow must decode JPEG/PNG (else 415); empty → 400; over `max_upload_bytes` → 413 (early from `Content-Length` in middleware, exact after reading); over 40M pixels → 413. CORS is added last so it's outermost (the early 413 still gets CORS headers).
 - **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG (`heatmap_png`) and the raw map (`cam_map`: 7×7 values rounded to 4 dp, plus `summarize_cam_regions`) are cached on the entry.
 - **`/gradcam/{id}/map`** exists for the web UI's overlay and opacity slider: it returns the predicted class's map from `compute_gradcam` (one `gradcam` span with `output=map`). Clients must stretch it over the whole image, because the model saw the image resized to a square. It is one process only, like `PendingOAuthStore`.
@@ -374,7 +373,6 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 - The grounding guard checks the structured fields and banned phrases, not the meaning of the free text. A summary could still describe the wrong condition in words while keeping `predicted_class` correct.
 - The PDF still labels the prediction "Primary Diagnosis" and the title emoji renders as a box (Helvetica has no emoji).
 - The batch tab still marks a row "Error" if the history save fails, even though the prediction and log succeeded.
-- `diagnosis_history` is accessed through the anon `DataService` client; its protection depends on RLS policies not in the repo.
 - History PDF downloads use made-up probabilities (0.33/0.33/0.34).
 - Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
 - API: uploads and the report cache live in one process's memory. A restart loses uploads (404 → predict again), and more than one replica would need shared storage. `REPORT_CACHE` is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).

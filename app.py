@@ -22,7 +22,7 @@ if "auth_provider" not in st.session_state:
 auth_provider = st.session_state.auth_provider
 prediction_provider = PredictionService(auth_provider.client)
 trace_store = SupabaseTraceStore(auth_provider.client)  # same logged-in client, so RLS applies
-data_provider = DataService()
+data_provider = DataService(auth_provider.client)  # logged-in client, so RLS applies
 model_provider = ModelService("best_student_model_aligned_final.pth")
 
 # 2. Check if anyone is logged in
