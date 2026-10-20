@@ -112,7 +112,7 @@ redirect_url = "https://clinical-diagnosis.streamlit.app/"   # where Google sign
 api_key = "..."
 ```
 
-Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
+Run `sql/001`–`005` in the Supabase SQL Editor before deploying.
 
 **Google sign-in** needs three settings outside the code:
 1. Supabase → Authentication → Providers → **Google**: enable it, and paste a Google Cloud OAuth client ID and secret.
