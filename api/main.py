@@ -1,0 +1,332 @@
+"""FastAPI backend for the React UI.
+
+Reuses services/ (model, calibration, tracing, Supabase) and agent/ (report, guard, fallback, cache);
+the Streamlit app is unchanged. Run locally with:
+
+    uvicorn api.main:create_app --factory --port 8000
+
+Every endpoint except /health needs `Authorization: Bearer <Supabase access token>`. Database calls
+send that token, so Supabase row-level security only ever returns the caller's own rows.
+"""
+import asyncio
+import io
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from PIL import Image, UnidentifiedImageError
+
+from agent.agent import REPORT_CACHE, build_llm_client, generate_report_for_image
+from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
+from api.schemas import (
+    AnalyticsResponse, DailyVolume, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
+    PipelineSummary, PredictResponse, ReportResponse, SpanOut, TraceResponse,
+)
+from api.settings import LOCALHOST_ORIGIN_REGEX, Settings
+from api.state import SerializedModel, UploadStore
+from services.calibration import REFER_MESSAGE, REFER_THRESHOLD, STATUS_REFER
+from services.prediction_handler import PredictionService
+from services.tracing import SupabaseTraceStore, finish_trace, make_tracer, summarize_spans, trace_span
+
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
+ALLOWED_FORMATS = {"JPEG", "PNG"}   # what Pillow finds in the bytes, whatever the client claimed
+MAX_IMAGE_PIXELS = 40_000_000       # decompression-bomb guard (a 6000 x 6000 scan is 36M)
+MULTIPART_OVERHEAD = 64 * 1024      # Content-Length allowance for multipart headers and boundaries
+REPORT_WORKERS = 4                  # report threads mostly wait on the LLM; kept off the default pool
+TRACE_READ_LIMIT = 5000             # spans read for /analytics
+
+bearer = HTTPBearer(auto_error=False, description="Supabase access token of the signed-in user")
+
+
+def create_app(settings=None, model_service=None, verifier=None, db_factory=None, llm_factory=None,
+               report_cache=REPORT_CACHE, uploads=None):
+    """Build the app. Tests inject fakes; by default everything comes from Settings.from_env()."""
+    settings = settings or Settings.from_env()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        if app.state.model is None:  # ~16 MB checkpoint, loaded once per process
+            from services.model_handler import ModelService
+            service = await asyncio.to_thread(ModelService, settings.model_path)
+            app.state.model = SerializedModel(service)
+        yield
+        app.state.report_pool.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(title="Clinical Diagnostic Portal API", version="1.0", lifespan=lifespan,
+                  description="Chest X-ray screening aid (Normal / Pneumonia / Tuberculosis). Not a diagnosis.")
+    app.state.settings = settings
+    app.state.model = SerializedModel(model_service) if model_service is not None else None
+    app.state.verifier = verifier or (
+        SupabaseJWTVerifier(settings.supabase_url, settings.supabase_key, settings.jwt_secret)
+        if settings.supabase_url else None)
+    app.state.db_factory = db_factory or (
+        user_db_factory(settings.supabase_url, settings.supabase_key) if settings.supabase_url else None)
+    app.state.llm_factory = llm_factory or build_llm_client
+    app.state.report_cache = report_cache
+    app.state.uploads = uploads or UploadStore(settings.upload_ttl_s, settings.upload_max_items)
+    app.state.report_pool = ThreadPoolExecutor(REPORT_WORKERS, thread_name_prefix="report")
+
+    @app.middleware("http")
+    async def reject_large_uploads(request, call_next):
+        # Early 413 from the header, before the body is read; read_upload() checks the real size
+        if request.url.path == "/predict":
+            length = request.headers.get("content-length")
+            if length and length.isdigit() and int(length) > settings.max_upload_bytes + MULTIPART_OVERHEAD:
+                return JSONResponse({"detail": too_large(settings.max_upload_bytes)}, status_code=413)
+        return await call_next(request)
+
+    # Added last so it's outermost: every response, including the early 413, gets CORS headers
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.frontend_urls,
+        allow_origin_regex=LOCALHOST_ORIGIN_REGEX,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    # ---- Dependencies ----
+
+    async def current_user(request: Request,
+                           credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
+        if credentials is None or credentials.scheme.lower() != "bearer":
+            raise HTTPException(401, "Missing bearer token", headers={"WWW-Authenticate": "Bearer"})
+        if request.app.state.verifier is None:
+            raise HTTPException(503, "Auth is not configured (set SUPABASE_URL and SUPABASE_KEY)")
+        try:
+            # May fetch signing keys or ask Supabase, so off the event loop
+            return await asyncio.to_thread(request.app.state.verifier.verify, credentials.credentials)
+        except AuthError as e:
+            raise HTTPException(401, str(e), headers={"WWW-Authenticate": "Bearer"})
+        except AuthUnavailable as e:
+            raise HTTPException(503, str(e))
+
+    def user_db(request: Request, user=Depends(current_user)):
+        """Database client acting as this user (sync dependency: FastAPI runs it in a thread)."""
+        client = request.app.state.db_factory(user.token)
+        try:
+            yield client
+        finally:
+            close = getattr(client, "aclose", None)  # postgrest's sync client names its close aclose()
+            if close is not None:
+                close()
+
+    def model(request: Request):
+        if request.app.state.model is None:
+            raise HTTPException(503, "Model not loaded")
+        return request.app.state.model
+
+    User = Annotated[object, Depends(current_user)]
+    Db = Annotated[object, Depends(user_db)]
+    Model = Annotated[object, Depends(model)]
+
+    def find_upload(request, trace_id, user):
+        upload = request.app.state.uploads.get(str(trace_id), user.id)
+        if upload is None:
+            # Same answer for "never existed", "expired" and "someone else's"
+            raise HTTPException(404, "Upload not found or expired; run /predict again")
+        return upload
+
+    # ---- Endpoints ----
+
+    @app.get("/health", response_model=HealthResponse)
+    async def health(request: Request):
+        state = request.app.state
+        if not hasattr(state, "llm_configured"):
+            state.llm_configured = state.llm_factory() is not None  # keys don't change while running
+        loaded = state.model is not None
+        return HealthResponse(
+            status="ok", model_loaded=loaded,
+            calibrated=bool(loaded and state.model.calibrated),
+            temperature=state.model.temperature if loaded else None,
+            auth_configured=state.verifier is not None, llm_configured=state.llm_configured)
+
+    @app.post("/predict", response_model=PredictResponse)
+    async def predict(request: Request, user: User, db: Db, model: Model,
+                      file: Annotated[UploadFile, File(description="Chest X-ray, JPEG or PNG")]):
+        data = await read_upload(file, settings.max_upload_bytes)
+        image = await asyncio.to_thread(decode_image, data)
+        trace_id = str(uuid.uuid4())
+        tracer = make_tracer(SupabaseTraceStore(db), trace_id=trace_id)
+        result, inference_ms, warnings = await asyncio.to_thread(
+            predict_and_log, model, PredictionService(db), image, tracer, trace_id)
+        request.app.state.uploads.put(trace_id, user.id, data, result)
+        return PredictResponse(
+            trace_id=trace_id, predicted_class=result["diagnosis"], confidence=result["confidence"],
+            probabilities=result["probabilities"], status=result["status"],
+            referral_threshold=REFER_THRESHOLD,
+            referral_message=REFER_MESSAGE if result["status"] == STATUS_REFER else None,
+            temperature=result["temperature"], calibrated=model.calibrated,
+            inference_ms=inference_ms, warnings=warnings)
+
+    @app.get("/gradcam/{trace_id}", response_class=Response,
+             responses={200: {"content": {"image/png": {}}, "description": "Grad-CAM figure (PNG)"}})
+    async def gradcam(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+        upload = find_upload(request, trace_id, user)
+        if upload.heatmap_png is None:
+            tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
+            upload.heatmap_png = await asyncio.to_thread(render_heatmap, model, upload, tracer)
+        return Response(upload.heatmap_png, media_type="image/png",
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.post("/report/{trace_id}", response_model=ReportResponse)
+    async def report(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+        upload = find_upload(request, trace_id, user)
+        state = request.app.state
+        tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))  # same trace as the prediction
+        loop = asyncio.get_running_loop()
+        # Up to ~60 s, mostly waiting on the LLM's rate limit: its own pool, so it can't starve predictions
+        result = await loop.run_in_executor(
+            state.report_pool, write_report, model, upload, state.llm_factory, state.report_cache, tracer)
+        return ReportResponse(
+            trace_id=str(trace_id), report=result.report, source=result.source, model=result.model,
+            source_line=result.source_line(), reason=result.reason, cached=result.cached,
+            warnings=trace_warnings(tracer))
+
+    @app.get("/history", response_model=HistoryPage)
+    async def history(user: User, db: Db, query: Annotated[HistoryQuery, Query()]):
+        since = day_start(query.date_from) if query.date_from else None
+        until = day_start(query.date_to + timedelta(days=1)) if query.date_to else None
+        res = await asyncio.to_thread(
+            PredictionService(db).get_history, user.id, limit=query.limit, offset=query.offset,
+            label=query.label, status=query.status, since=since, until=until)
+        items = [HistoryItem(**{k: row.get(k) for k in HistoryItem.model_fields}) for row in res.data]
+        return HistoryPage(items=items, total=res.count if res.count is not None else len(items),
+                           limit=query.limit, offset=query.offset)
+
+    @app.get("/analytics", response_model=AnalyticsResponse)
+    async def analytics(user: User, db: Db, days: Annotated[int, Query(ge=1, le=365)] = 30):
+        summary, spans = await asyncio.gather(
+            asyncio.to_thread(lambda: PredictionService(db).get_daily_summary().data),
+            asyncio.to_thread(SupabaseTraceStore(db).read, TRACE_READ_LIMIT, user.id),
+            return_exceptions=True)
+        warnings = []
+        if isinstance(summary, Exception):
+            warnings.append(f"Could not load the prediction summary ({type(summary).__name__})")
+            summary = []
+        if isinstance(spans, Exception):
+            # No fallback to local traces/: that file holds every user's spans
+            warnings.append(f"Could not load traces ({type(spans).__name__})")
+            spans = None
+        daily = daily_volume(summary, days)
+        total = sum(d.predictions for d in daily)
+        referred = sum(d.referred for d in daily)
+        pipeline = None
+        if spans is not None:
+            pipeline = PipelineSummary(spans=len(spans), **summarize_spans(spans))
+        return AnalyticsResponse(days=days, total_predictions=total, total_referred=referred,
+                                 referral_rate=round(referred / total, 4) if total else None,
+                                 daily=daily, pipeline=pipeline, warnings=warnings)
+
+    @app.get("/traces/{trace_id}", response_model=TraceResponse)
+    async def trace(trace_id: uuid.UUID, user: User, db: Db):
+        rows = await asyncio.to_thread(SupabaseTraceStore(db).read_trace, str(trace_id), user.id)
+        if not rows:
+            raise HTTPException(404, "Trace not found")
+        spans = [SpanOut(**{k: row.get(k) for k in SpanOut.model_fields if k != "attributes"},
+                         attributes=row.get("attributes") or {}) for row in rows]
+        return TraceResponse(trace_id=str(trace_id), spans=spans)
+
+    return app
+
+
+# ---- Helpers (plain functions; the blocking ones run in worker threads) ----
+
+def too_large(max_bytes):
+    return f"File too large (limit {max_bytes / 1024 / 1024:g} MB)"
+
+
+async def read_upload(file, max_bytes):
+    """The upload's bytes, after the type and size checks (415 / 413)."""
+    if (file.content_type or "").lower() not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(415, "Only JPEG and PNG images are accepted")
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(413, too_large(max_bytes))
+    if not data:
+        raise HTTPException(400, "Empty file")
+    return data
+
+
+def decode_image(data):
+    """Pillow image from validated bytes; 415 if it isn't really a JPEG/PNG, 413 if absurdly large."""
+    try:
+        image = Image.open(io.BytesIO(data))
+        if image.format not in ALLOWED_FORMATS:
+            raise HTTPException(415, "Only JPEG and PNG images are accepted")
+        if image.size[0] * image.size[1] > MAX_IMAGE_PIXELS:
+            raise HTTPException(413, "Image has too many pixels")
+        image.load()
+    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
+        raise HTTPException(415, "The file is not a readable JPEG or PNG image")
+    return image
+
+
+def predict_and_log(model, prediction_service, image, tracer, trace_id):
+    """Same spans as the dashboard's run_prediction: prediction -> preprocess/classify/calibrate, log_prediction."""
+    warnings = []
+    with trace_span(tracer, "prediction"):
+        start = time.perf_counter()
+        result = model.predict(image, tracer=tracer)
+        inference_ms = round((time.perf_counter() - start) * 1000)
+        try:
+            with trace_span(tracer, "log_prediction"):
+                prediction_service.log_prediction(result, inference_ms, trace_id=trace_id)
+        except Exception as e:
+            warnings.append(f"Could not log prediction ({type(e).__name__})")
+    finish_trace(tracer)
+    return result, inference_ms, warnings + trace_warnings(tracer)
+
+
+def render_heatmap(model, upload, tracer):
+    figure = model.generate_heatmap(upload.image(), upload.prediction, tracer=tracer)
+    finish_trace(tracer)
+    buf = io.BytesIO()
+    figure.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def write_report(model, upload, llm_factory, cache, tracer):
+    result = generate_report_for_image(model, upload.image(), prediction=upload.prediction,
+                                       llm=llm_factory(), cache=cache, tracer=tracer)
+    finish_trace(tracer)
+    return result
+
+
+def trace_warnings(tracer):
+    if tracer is not None and tracer.sink_errors:
+        return ["Trace not fully saved; it may be missing from /traces"]
+    return []
+
+
+def day_start(day):
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).isoformat()
+
+
+def daily_volume(summary_rows, days, today=None):
+    """prediction_daily_summary rows (one per day and label) -> one DailyVolume per day, newest first."""
+    first = (today or datetime.now(timezone.utc).date()) - timedelta(days=days - 1)
+    by_day = {}
+    for row in summary_rows:
+        day = str(row["day"])[:10]
+        if date.fromisoformat(day) < first:
+            continue
+        d = by_day.setdefault(day, {"predictions": 0, "referred": 0, "by_label": {}, "ms": 0.0, "timed": 0})
+        count = int(row.get("prediction_count") or 0)
+        d["predictions"] += count
+        d["referred"] += int(row.get("refer_count") or 0)
+        d["by_label"][row["predicted_label"]] = d["by_label"].get(row["predicted_label"], 0) + count
+        if row.get("avg_inference_ms") is not None:
+            d["ms"] += float(row["avg_inference_ms"]) * count
+            d["timed"] += count
+    return [DailyVolume(day=day, predictions=d["predictions"], referred=d["referred"],
+                        referral_rate=round(d["referred"] / d["predictions"], 4) if d["predictions"] else 0.0,
+                        by_label=d["by_label"],
+                        avg_inference_ms=round(d["ms"] / d["timed"], 1) if d["timed"] else None)
+            for day, d in sorted(by_day.items(), reverse=True)]

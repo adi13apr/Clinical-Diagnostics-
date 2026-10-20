@@ -129,6 +129,41 @@ Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
 
 `CLAUDE.md` describes the code layout and conventions in detail.
 
+## API (backend for the React UI, in progress)
+
+`api/` is a FastAPI server built on the same services as the Streamlit app: same model, calibration, report agent (cache, guard, fallback), tracing and Supabase tables. The Streamlit app is unchanged.
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /predict` | Upload a JPEG/PNG (max 10 MB). Returns class, calibrated probabilities, `confident`/`refer`, and a `trace_id` |
+| `GET /gradcam/{trace_id}` | Grad-CAM figure (PNG) for that upload |
+| `POST /report/{trace_id}` | AI report, with the same guard and template fallback as the app |
+| `GET /history` | Your past predictions: `limit`, `offset`, `label`, `status`, `date_from`, `date_to` |
+| `GET /analytics` | Daily volume, referral rate, average latency per pipeline step |
+| `GET /traces/{trace_id}` | Every step of one prediction, for the trace viewer |
+| `GET /health` | Is the model loaded and calibrated; is the LLM configured. No login needed |
+
+- **Login:** every endpoint except `/health` needs `Authorization: Bearer <Supabase access token>`. The server checks the token, then queries Supabase *as that user*, so row-level security returns only their own rows.
+- **Uploads stay in memory.** They're never written to disk, and `/gradcam` and `/report` can use them for an hour. After a restart, call `/predict` again.
+- **History** comes from the `predictions` log, so it has no patient names.
+
+```bash
+pip install -r requirements-api.txt
+uvicorn api.main:create_app --factory --port 8000     # docs at http://localhost:8000/docs
+```
+
+Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `SUPABASE_URL`, `SUPABASE_KEY` | Project URL and anon key (required) |
+| `SUPABASE_JWT_SECRET` | Only for projects still on the legacy HS256 JWT secret. Without it, those tokens are checked by asking Supabase (one extra request each) |
+| `FRONTEND_URL` | Deployed React app's origin(s), comma-separated. `localhost` on any port is always allowed |
+| `GROQ_API_KEY` | Optional. Without it, reports use the template |
+| `MAX_UPLOAD_MB` | Default 10 |
+
+**Hugging Face Spaces:** create a Docker Space and push this repo to it. The Space's `README.md` needs `sdk: docker` and `app_port: 7860` in its front matter. Set the variables above as Space secrets. The checkpoint is over 10 MB, so the Space repo has to store `*.pth` with Git LFS.
+
 ## License
 
 This project is licensed under the MIT License.

@@ -11,6 +11,10 @@ DISCLAIMER = (
     "must review the image and the patient's clinical findings."
 )
 
+# Also used by the API's request/response models
+ClassName = Literal["Normal", "Pneumonia", "Tuberculosis"]
+Status = Literal["confident", "refer"]
+
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -21,9 +25,9 @@ def count_sentences(text):
 class Report(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    predicted_class: Literal["Normal", "Pneumonia", "Tuberculosis"]
+    predicted_class: ClassName
     calibrated_probability: float = Field(ge=0, le=1, description="Copied exactly from run_classifier")
-    status: Literal["confident", "refer"]
+    status: Status
     summary: str = Field(description="Plain language, 2-3 sentences")
     recommendation: str = Field(min_length=1)
     limitations: List[str] = Field(min_length=1)
