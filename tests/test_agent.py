@@ -10,9 +10,9 @@ from PIL import Image
 from pypdf import PdfReader
 
 from agent.agent import (
-    MAX_STEPS, SYSTEM_PROMPT, GeminiClient, LLMTurn, MockLLMClient, RateLimitError, ReportCache, ToolCall,
-    asserts_confirmed_diagnosis, check_grounding, fallback_report, generate_report, generate_report_for_image,
-    parse_report, retry_delay_seconds,
+    CLINICIAN_FOLLOW_UP, MAX_STEPS, SYSTEM_PROMPT, GeminiClient, LLMTurn, MockLLMClient, RateLimitError,
+    ReportCache, ToolCall, asserts_confirmed_diagnosis, check_grounding, fallback_report, generate_report,
+    generate_report_for_image, parse_report, retry_delay_seconds,
 )
 from agent.schema import DISCLAIMER, Report
 from agent.tools import CLASS_NAMES, TOOL_DECLARATIONS, ReportTools
@@ -508,3 +508,70 @@ def test_fallback_reports_are_not_cached(make_service, calibration_file, stub_gr
     result = generate_report_for_image(service, Image.new("L", (64, 64), 128),
                                        llm=MockLLMClient([rate_limited]), cache=cache)
     assert result.source == "fallback" and len(cache) == 0  # a later click can still try Gemini
+
+
+# Guard: Pneumonia/TB reports must not dismiss follow-up (human review of c32)
+
+PNEUMONIA_CONFIDENT = ([0.0, 3.0, 0.0], 0.1318)  # Pneumonia, calibrated ~1.0
+TB_CONFIDENT = ([0.0, 0.0, 3.0], 0.1318)         # Tuberculosis, calibrated ~1.0
+PNEUMONIA_REFER = ([0.5, 0.7, 0.0], 1.0)         # Pneumonia, calibrated ~0.4
+
+
+def test_regression_c32_dismissed_referral_is_rejected():
+    """The exact gpt-oss report a human marked down and the LLM judge scored 5/5."""
+    fixture = json.loads((FIXTURES / "gptoss_c32_dismissed_referral.json").read_text(encoding="utf-8"))
+    assert fixture["human_scores"]["actionability"] == 3 and fixture["judge_scores"]["actionability"] == 5
+    assert fixture["report"]["recommendation"].startswith("No immediate referral is required")
+    report, problem = parse_report(json.dumps(fixture["report"]), fixture["truth"])
+    assert report is None and "must not say no referral, action or follow-up is needed" in problem
+
+
+@pytest.mark.parametrize("case", [PNEUMONIA_CONFIDENT, TB_CONFIDENT])
+@pytest.mark.parametrize("recommendation", ["No follow-up is needed.", "No immediate referral is required.",
+                                            "No further action is necessary at this time."])
+def test_abnormal_report_dismissing_follow_up_is_rejected_then_falls_back(make_tools, case, recommendation):
+    tools = make_tools(case)
+    truth = tools.run_classifier()
+    assert truth["predicted_class"] in ("Pneumonia", "Tuberculosis")
+    bad = report_json(truth, recommendation=recommendation)
+    result = generate_report(tools, MockLLMClient(full_script(truth, bad, bad)))  # rejected, retried, rejected
+    assert result.source == "fallback" and len(result.rejected) == 2
+    assert "follow-up" in result.reason
+    assert CLINICIAN_FOLLOW_UP in result.report.recommendation
+
+
+def test_abnormal_dismissal_retry_can_recover(make_tools):
+    tools = make_tools(PNEUMONIA_CONFIDENT)
+    truth = tools.run_classifier()
+    bad = report_json(truth, recommendation="No immediate referral is required.")
+    good = report_json(truth, recommendation="A clinician should follow up with examination and tests.")
+    llm = MockLLMClient(full_script(truth, bad, good))
+    result = generate_report(tools, llm)
+    assert result.source == "llm" and len(result.rejected) == 1
+    assert "must not say no referral" in llm.calls[-1][-1]["text"]  # the retry tells the model what was wrong
+
+
+def test_normal_report_may_say_no_immediate_action(make_tools):
+    # The human reviewer accepted this wording for confident Normal results
+    tools = make_tools(CONFIDENT)
+    truth = tools.run_classifier()
+    ok = report_json(truth, recommendation="No immediate action is required, but see a clinician if symptoms appear.")
+    assert generate_report(tools, MockLLMClient(full_script(truth, ok))).source == "llm"
+
+
+@pytest.mark.parametrize("case", [PNEUMONIA_CONFIDENT, TB_CONFIDENT, PNEUMONIA_REFER, REFER])
+def test_fallback_for_pneumonia_or_tb_always_recommends_clinician_follow_up(make_tools, case):
+    tools = make_tools(case)
+    truth = tools.run_classifier()
+    assert truth["predicted_class"] in ("Pneumonia", "Tuberculosis")
+    report = fallback_report(tools)
+    assert CLINICIAN_FOLLOW_UP in report.recommendation
+    assert check_grounding(report, truth) == []
+
+
+def test_fallback_for_normal_has_no_forced_follow_up(make_tools):
+    assert CLINICIAN_FOLLOW_UP not in fallback_report(make_tools(CONFIDENT)).recommendation
+
+
+def test_prompt_states_the_follow_up_rule():
+    assert "must never say that no referral, action or follow-up is needed" in SYSTEM_PROMPT

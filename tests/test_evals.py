@@ -180,6 +180,24 @@ def test_load_run_last_record_wins(tmp_path):
     assert eval_run.load_run(tmp_path / "run.jsonl")[CASES[0].case_id]["judge_error"] == "RateLimitError"
 
 
+def test_human_labels_only_compared_with_their_own_run(tmp_path, monkeypatch):
+    # Labels exported from run A must not be compared with run B's judge: the reports differ
+    labels = tmp_path / "labels.csv"
+    labels.write_text("case_id,faithfulness,uncertainty_language,actionability,plain_language\n"
+                      f"{CASES[0].case_id},5,5,5,5\n", encoding="utf-8")
+    run_a, run_b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    write_run(run_a, [make_record(CASES[0])])
+    write_run(run_b, [make_record(CASES[0])])
+    monkeypatch.setattr(eval_run, "HUMAN_LABELS_PATH", labels)
+    monkeypatch.setattr(eval_run, "read_labels", lambda: __import__("evals.human_labels").human_labels.read_labels(labels))
+    monkeypatch.setattr(eval_run, "labels_run", lambda: str(run_a))
+    assert eval_run.load_agreement(run_a)["labelled_reports"] == 1
+    other = eval_run.load_agreement(run_b)
+    assert other == {"other_run": str(run_a)}
+    md = eval_run.build_summary(eval_run.load_run(run_b), CASES, dataset_hash(CASES), run_b, None, other)["markdown"]
+    assert "not this run, so no agreement is computed here" in md
+
+
 def test_committed_baseline_replays_cleanly():
     if not eval_run.BASELINE_PATH.exists():
         pytest.skip("no committed baseline yet")

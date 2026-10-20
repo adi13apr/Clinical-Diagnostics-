@@ -5,12 +5,15 @@ for a human to fill in using evals/rubric.md. Judge scores and true labels are l
 the rating is blind. agreement() then compares the filled-in scores with the judge.
 """
 import csv
+import json
 import random
 from pathlib import Path
 
 from evals.schema import CRITERIA
 
 HUMAN_LABELS_PATH = Path(__file__).resolve().parent / "human_labels.csv"
+# Which run the sheet's reports came from: human scores only mean something against that run's judge
+HUMAN_LABELS_META_PATH = Path(__file__).resolve().parent / "human_labels.meta.json"
 N_LABELS = 15
 SEED = 7
 CONTEXT_COLUMNS = ["case_id", "classifier_result", "classifier_probabilities", "gradcam_summary",
@@ -81,8 +84,8 @@ def _row(record):
     }
 
 
-def export_human_labels(records, cases_by_id, path=HUMAN_LABELS_PATH):
-    """Write the blank labelling sheet. Refuses to overwrite a sheet that already has scores."""
+def export_human_labels(records, cases_by_id, path=HUMAN_LABELS_PATH, run=None, meta_path=HUMAN_LABELS_META_PATH):
+    """Write the blank labelling sheet (and which run it came from). Refuses to overwrite a sheet with scores."""
     path = Path(path)
     if path.exists() and _has_scores(read_labels(path)):
         raise LabelsAlreadyFilled(f"{path} already contains human scores; not overwriting.")
@@ -91,7 +94,15 @@ def export_human_labels(records, cases_by_id, path=HUMAN_LABELS_PATH):
         writer = csv.DictWriter(f, fieldnames=CONTEXT_COLUMNS + SCORE_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+    if run is not None:
+        Path(meta_path).write_text(json.dumps({"run": run}, indent=2) + "\n", encoding="utf-8")
     return rows
+
+
+def labels_run(meta_path=HUMAN_LABELS_META_PATH):
+    """Repo-relative path of the run the human labels were exported from, or None if unknown."""
+    meta_path = Path(meta_path)
+    return json.loads(meta_path.read_text(encoding="utf-8"))["run"] if meta_path.exists() else None
 
 
 def agreement(label_rows, records_by_id):

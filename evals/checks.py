@@ -1,10 +1,9 @@
 """Deterministic report checks (no network). Each returns True (pass), False (fail) or None (not applicable)."""
 import json
-import re
 
 from pydantic import ValidationError
 
-from agent.agent import asserts_confirmed_diagnosis, parse_report
+from agent.agent import asserts_confirmed_diagnosis, dismisses_abnormal_result, parse_report
 from agent.schema import Report, count_sentences
 
 # Length limits for what a clinician or patient reads on screen / in the PDF
@@ -12,13 +11,6 @@ MAX_SUMMARY_CHARS = 600
 MAX_RECOMMENDATION_CHARS = 500
 MAX_LIMITATION_CHARS = 300
 MAX_LIMITATIONS = 5
-
-
-# "No (immediate) referral/action/follow-up is required/needed" in the recommendation
-# (any hyphen/dash in "follow-up", and one optional word such as "imaging" before the noun)
-DISMISSIVE_NEXT_STEP = re.compile(
-    r"\bno\s+(immediate\s+)?(\w+\s+)?(referral|action|follow[\s\-‐-―]?up|further\s+(action|evaluation))\b"
-    r"[^.]{0,40}?\b(is\s+|are\s+)?(required|needed|necessary)\b", re.IGNORECASE)
 
 
 def _all_text(report):
@@ -89,10 +81,11 @@ def check_abnormal_result_not_dismissed(record):
     Added after human review flagged c32 ("No immediate referral is required" for 99.99% Pneumonia)
     and the LLM judge scored it 5/5. Normal predictions are exempt: the reviewer accepted "no
     immediate action is required" there when paired with advice to see a clinician for symptoms.
+    The agent's guard enforces the same rule (agent.agent.dismisses_abnormal_result).
     """
     if record["classifier"]["predicted_class"] == "Normal":
         return None
-    return not DISMISSIVE_NEXT_STEP.search(record["report"]["recommendation"])
+    return not dismisses_abnormal_result(record["classifier"]["predicted_class"], record["report"]["recommendation"])
 
 
 CHECKS = {

@@ -40,6 +40,14 @@ NOT_NEGATIONS = re.compile(r"\b(no|without|beyond)\s+(a\s+)?(doubt|question)\b|\
 CLAUSE_BREAK = re.compile(r"[.;:!?,]|\bbut\b|\bhowever\b")
 NEGATION_WINDOW_WORDS = 4
 
+# "No (immediate) referral/action/follow-up is required/needed": never acceptable for a Pneumonia/TB
+# prediction (human review flagged c32; the LLM judge did not). Tolerates any hyphen in "follow-up"
+# and one extra word ("no immediate imaging follow-up is required").
+DISMISSIVE_NEXT_STEP = re.compile(
+    r"\bno\s+(immediate\s+)?(\w+\s+)?(referral|action|follow[\s\-‐-―]?up|further\s+(action|evaluation))\b"
+    r"[^.]{0,40}?\b(is\s+|are\s+)?(required|needed|necessary)\b", re.IGNORECASE)
+CLINICIAN_FOLLOW_UP = "Arrange clinician follow-up for this result."
+
 SYSTEM_PROMPT = f"""You write short, plain-language reports about an AI chest X-ray classifier's result.
 
 Rules:
@@ -53,7 +61,8 @@ Rules:
 4. Use only get_condition_info's text for medical background. Do not add facts from elsewhere.
    Never say or imply the diagnosis is confirmed. The classifier is a screening aid, not a diagnosis.
 5. If status is "refer", the recommendation must begin with "{REFER_MESSAGE.capitalize()}." and say
-   that clinician review is needed.
+   that clinician review is needed. If predicted_class is Pneumonia or Tuberculosis, the recommendation
+   must advise clinician follow-up and must never say that no referral, action or follow-up is needed.
 6. summary: 2-3 plain-language sentences for a non-specialist. recommendation: next step for the
    reader. limitations: short bullet strings taken from get_condition_info (what_this_result_means
    and model_limitations); don't invent others.
@@ -474,7 +483,15 @@ def check_grounding(report, truth):
         problems.append("the report must never say the diagnosis is confirmed")
     if truth["status"] == STATUS_REFER and "clinician review" not in report.recommendation.lower():
         problems.append("status is 'refer', so the recommendation must say clinician review is recommended")
+    if dismisses_abnormal_result(truth["predicted_class"], report.recommendation):
+        problems.append(f"predicted_class is {truth['predicted_class']}, so the recommendation must not say "
+                        "no referral, action or follow-up is needed; advise clinician follow-up")
     return problems
+
+
+def dismisses_abnormal_result(predicted_class, recommendation):
+    """True if a Pneumonia/TB recommendation says no referral/action/follow-up is needed (Normal is exempt)."""
+    return predicted_class != "Normal" and bool(DISMISSIVE_NEXT_STEP.search(recommendation))
 
 
 def parse_report(text, truth):
@@ -520,6 +537,8 @@ def fallback_report(tools):
         recommendation = f"{REFER_MESSAGE.capitalize()}. {info['typical_next_steps']}"
     else:
         recommendation = f"{info['typical_next_steps']} A clinician should review the image before acting on this result."
+    if cls != "Normal":
+        recommendation += f" {CLINICIAN_FOLLOW_UP}"  # Pneumonia/TB always get explicit clinician follow-up
 
     report = Report(
         predicted_class=cls,
