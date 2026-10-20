@@ -10,6 +10,7 @@ send that token, so Supabase row-level security only ever returns the caller's o
 """
 import asyncio
 import io
+import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -43,11 +44,23 @@ REPORT_WORKERS = 4                  # report threads mostly wait on the LLM; kep
 TRACE_READ_LIMIT = 5000             # spans read for /analytics
 
 bearer = HTTPBearer(auto_error=False, description="Supabase access token of the signed-in user")
+log = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """Show the API's own INFO/WARNING/ERROR lines under uvicorn, which only configures its own loggers.
+
+    Left alone when something (pytest, a host) already configured the root logger.
+    """
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s:     %(name)s: %(message)s")
+        logging.getLogger("api").setLevel(logging.INFO)
 
 
 def create_app(settings=None, model_service=None, verifier=None, db_factory=None, llm_factory=None,
                report_cache=REPORT_CACHE, uploads=None):
     """Build the app. Tests inject fakes; by default everything comes from Settings.from_env()."""
+    configure_logging()
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
@@ -56,6 +69,14 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
             from services.model_handler import ModelService
             service = await asyncio.to_thread(ModelService, settings.model_path)
             app.state.model = SerializedModel(service)
+        verifier = app.state.verifier
+        if verifier is None:
+            log.warning("Auth is not configured: set SUPABASE_URL and SUPABASE_KEY. Every request but /health gets 503.")
+        else:
+            log.info("Verifying Supabase tokens issued by %s (URL from %s)", getattr(verifier, "issuer", "?"),
+                     settings.supabase_url_source or "settings")
+            if settings.check_keys_on_startup and hasattr(verifier, "check_keys"):
+                await asyncio.to_thread(verifier.check_keys)
         yield
         app.state.report_pool.shutdown(wait=False, cancel_futures=True)
 
