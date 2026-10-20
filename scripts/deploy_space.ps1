@@ -137,8 +137,11 @@ Write-Host "LFS files: $($LfsFiles -join ', ')"
 # --- 5. Local Docker test ------------------------------------------------------------------
 if ($DockerTest) {
     Step "Building the Docker image from the snapshot (first build downloads PyTorch, ~5-10 min)"
-    Quiet { docker info --format "{{.ServerVersion}}" } | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Docker isn't running: start Docker Desktop and wait until it says 'Engine running'" }
+    # `docker info` exits 0 even when the engine answers 500, so require a server version
+    $Engine = Quiet { docker version --format "{{.Server.Version}}" }
+    if ($LASTEXITCODE -ne 0 -or -not "$Engine".Trim()) {
+        throw "Docker's engine isn't running: start (or restart) Docker Desktop and wait until it says 'Engine running'"
+    }
     Native "docker build" { docker build -t clinical-api:local $Work }
 
     $Container = "clinical-api-test"
