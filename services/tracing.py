@@ -214,9 +214,19 @@ class SupabaseTraceStore:
         } for s in spans]
         self.client.table("traces").insert(rows).execute()
 
-    def read(self, limit=5000):
-        res = (self.client.table("traces").select("*")
-               .order("started_at", desc=True).limit(limit).execute())
+    def read(self, limit=5000, user_id=None):
+        query = self.client.table("traces").select("*")
+        if user_id is not None:
+            query = query.eq("user_id", user_id)  # RLS already does this; kept as a second check
+        res = query.order("started_at", desc=True).limit(limit).execute()
+        return [dict(r, start=r.get("started_at")) for r in res.data]
+
+    def read_trace(self, trace_id, user_id=None):
+        """All spans of one trace, oldest first."""
+        query = self.client.table("traces").select("*").eq("trace_id", trace_id)
+        if user_id is not None:
+            query = query.eq("user_id", user_id)
+        res = query.order("started_at").execute()
         return [dict(r, start=r.get("started_at")) for r in res.data]
 
 

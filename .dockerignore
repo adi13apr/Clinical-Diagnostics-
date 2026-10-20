@@ -1,0 +1,20 @@
+# Never ship secrets into the image
+.streamlit/
+.env
+*.toml.bak
+
+.git/
+.github/
+venv/
+__pycache__/
+*.pyc
+data/
+traces/
+notebooks/
+evals/
+tests/
+docs/
+splits/
+scripts/
+ui/
+app.py

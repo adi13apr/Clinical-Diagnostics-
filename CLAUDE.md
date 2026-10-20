@@ -12,8 +12,10 @@ A Streamlit app ("Clinical Diagnostic Portal") where a logged-in radiologist upl
 python -m venv venv
 venv\Scripts\activate              # Windows; macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt    # app only (what Streamlit Cloud installs)
-pip install -r requirements-dev.txt  # + pytest
+pip install -r requirements-dev.txt  # + API deps + pytest
 streamlit run app.py
+uvicorn api.main:create_app --factory --port 8000   # FastAPI backend; docs at /docs
+docker build -t clinical-api .     # API image for a Hugging Face Docker Space (port 7860)
 pytest                             # no Supabase, dataset or GPU needed
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
@@ -48,6 +50,14 @@ Database setup: run the files in `sql/` in order, in the Supabase SQL Editor, **
 
 ```
 app.py                      Entry point: builds services, routes login vs dashboard via st.session_state.user
+api/                        FastAPI backend for the React UI (see "API"); reuses services/ and agent/
+  main.py                   create_app(...) factory: endpoints, CORS, upload checks, blocking work in threads
+  auth.py                   SupabaseJWTVerifier (JWKS / HS256 secret / ask Supabase), user_db_factory (PostgREST as the user)
+  state.py                  UploadStore (in-memory uploads by trace_id, per owner) + SerializedModel (one model call at a time)
+  schemas.py                Pydantic request/response models
+  settings.py               Settings.from_env(): env vars, else .streamlit/secrets.toml [supabase]
+Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
+requirements-api.txt        requirements.txt + fastapi, uvicorn, python-multipart, PyJWT[crypto]
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
   model_handler.py          CLAHETransform, StudentEfficientNet, ModelService (load + calibrated predict + heatmap)
   calibration.py            Temperature loading, apply_temperature, triage, ECE. No Streamlit import.
@@ -299,6 +309,26 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 1. `show_analytics(data_service, email)` → `diagnosis_history`. It shows metrics, pie, histogram, daily bars, a per-diagnosis table, and recent rows. A failed query raises and stops the page.
 2. `show_prediction_analytics(prediction_service)` → `select * from prediction_daily_summary order by day desc`. It renders a stacked bar chart per day by label, plus the summary table (`refer_count` shown as "Referred"). A query error becomes `st.warning`.
 
+## API (`api/`)
+
+- **Run:** `uvicorn api.main:create_app --factory`. The factory takes injectable `model_service`, `verifier`, `db_factory`, `llm_factory`, `report_cache` and `uploads`; tests pass fakes, production builds them from `Settings`. The checkpoint is loaded in the lifespan (only when no `model_service` was injected), so importing `api.main` loads nothing.
+- **Endpoints:** `POST /predict`, `GET /gradcam/{trace_id}`, `POST /report/{trace_id}`, `GET /history`, `GET /analytics`, `GET /traces/{trace_id}`, and `GET /health` (the only one without auth). `trace_id` path params are `uuid.UUID` (422 if malformed).
+- **Auth:** `current_user` reads the bearer token and calls `SupabaseJWTVerifier.verify` in a thread (it may fetch JWKS or call Supabase).
+  - ES256/RS256 are checked locally against `{url}/auth/v1/.well-known/jwks.json` (cached by `PyJWKClient`).
+  - HS256 is checked with `SUPABASE_JWT_SECRET` if set; otherwise `GET /auth/v1/user` is called.
+  - Required claims: `aud == "authenticated"`, `iss == {url}/auth/v1`, `exp`, `sub`. `AuthError` → 401, `AuthUnavailable` → 503.
+- **Own data only:** `user_db` builds a `SyncPostgrestClient` per request with `Authorization: Bearer <user token>` (same `.table()` API the services take), so RLS applies. Queries also filter `user_id` (`PredictionService.get_history`, `SupabaseTraceStore.read/read_trace`). The view `prediction_daily_summary` relies on RLS alone (`security_invoker`).
+  - **Never fall back to local `traces/` JSONL in the API.** It holds every user's spans. `/analytics` returns `pipeline: null` plus a warning instead; `/traces` returns 404.
+  - `diagnosis_history` is not used by the API (anon client, unknown RLS). `/history` reads `predictions`, which has no patient names.
+- **Uploads:** content type must be `image/jpeg`/`image/png` **and** Pillow must decode JPEG/PNG (else 415); empty → 400; over `max_upload_bytes` → 413 (early from `Content-Length` in middleware, exact after reading); over 40M pixels → 413. CORS is added last so it's outermost (the early 413 still gets CORS headers).
+- **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG is cached on the entry. It is one process only, like `PendingOAuthStore`.
+- **Threads:** PyTorch, Grad-CAM, image decoding and Supabase calls run in `asyncio.to_thread`. Reports run `generate_report_for_image` (the same cache, guard and fallback as the app) on a separate 4-thread pool (`REPORT_WORKERS`), because one report can wait about 60 s on Groq's limit and must not starve the default pool. `tests/test_api.py::test_prediction_does_not_block_the_event_loop` fails if model work runs on the loop.
+- **SerializedModel:** wraps `ModelService` with one lock around `predict`, `generate_heatmap` and `compute_gradcam`. Grad-CAM hooks the shared network, so a concurrent forward pass would corrupt its activations. Always pass the wrapper (not the raw service) to `generate_report_for_image`, because its `get_gradcam` tool runs the model too.
+- **Tracing:** same span names as the dashboard. `/predict` makes the trace (`prediction` → `preprocess`/`classify`/`calibrate`, `log_prediction`), and `/gradcam` and `/report` add to the same `trace_id`. Sinks are local JSONL plus `SupabaseTraceStore(user db)`; sink errors become a response warning.
+- **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
+- **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
+- **Deploy (Hugging Face Docker Space):** set `SUPABASE_URL`, `SUPABASE_KEY`, optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY` and `MAX_UPLOAD_MB` as Space secrets. The Space README needs `sdk: docker` and `app_port: 7860`. The `.pth` (>10 MB) needs Git LFS on the Space repo.
+
 ## Conventions
 
 - **Services in `services/`, Streamlit pages in `ui/`.** `app.py` builds the services and passes them into `show_*` functions as arguments. A new service gets built in `app.py` and threaded through the `show_dashboard` / `show_diagnosis_page` signatures.
@@ -326,4 +356,6 @@ There are two kinds of client, both using the anon key from `st.secrets`:
 - `diagnosis_history` is accessed through the anon `DataService` client; its protection depends on RLS policies not in the repo.
 - History PDF downloads use made-up probabilities (0.33/0.33/0.34).
 - Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
+- API: uploads and the report cache live in one process's memory. A restart loses uploads (404 → predict again), and more than one replica would need shared storage. `REPORT_CACHE` is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).
+- API: the Docker image hasn't been built yet (Docker daemon unavailable when it was written).
 - `use_container_width` is deprecated in current Streamlit (warning says removal after 2025-12-31), and requirements are unpinned.

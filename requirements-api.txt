@@ -1,0 +1,6 @@
+# FastAPI backend (api/) on top of the app's requirements. Streamlit Cloud doesn't install this.
+-r requirements.txt
+fastapi
+uvicorn[standard]
+python-multipart
+PyJWT[crypto]
