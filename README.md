@@ -69,6 +69,27 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 - **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one). The eval flags it, but the guard doesn't block it yet.
 - **Unreviewed medical text:** the condition text in `agent/condition_info.json` is a draft that hasn't been reviewed by a clinician. The judge model is a Groq *Preview* model.
 
+## Why the eval runner is async (and why that isn't threads)
+
+Each eval case has two steps: the **report model** writes a report (about 58 s, almost all of it *waiting*, for the network and for Groq's 8,000-tokens-per-minute limit), then the **judge model** scores it (about 1 s, also waiting). The old runner did one thing at a time: report 1, judge 1, report 2, judge 2, and so on.
+
+The new runner uses Python's `asyncio`. While report 2 is being written, judge 1 is already being scored. Think of one cook who puts the pasta on to boil and chops the salad while the water heats: there's still only one cook, but no time is lost standing at the stove. In the code:
+
+- **One worker, two jobs.** One loop writes reports; one judge job scores whatever is ready. Whenever either is waiting for a reply or a rate-limit timer, the other runs.
+- **Not threads.** Nothing runs at the same instant. The work is waiting, not computing, so threads would add risk (two threads writing the same results file or sharing one rate-limit budget) without making it faster.
+- **Limits still hold.** Each model keeps its own token-aware budget. An `asyncio.Lock` makes waiters queue in order, an `asyncio.Semaphore` allows one request per model at a time, and every request has a timeout.
+- **Same results.** Tests with fake clients show the records are identical to the old runner's; only the order of lines in the run file can differ. Resume, stop and fallback behave as before. `--sync` still runs the old way.
+
+Simulated benchmark, 5 cases, fake clients with real timings scaled down ([`evals/results/benchmark_simulated.md`](evals/results/benchmark_simulated.md)):
+
+| Scenario | Old (sync) | New (async) | Speed-up |
+| --- | --- | --- | --- |
+| Real ratio: report ~58 s, judge ~1 s | 293 s | 291 s | **1.01×** |
+| Slow judge: 15 s | 363 s | 305 s | 1.19× |
+| Equal times (best case) | 576 s | 348 s | 1.65× |
+
+The honest result: with today's timings, async saves about 1%, because overlap can only hide the judge's time. The slow part is the report model waiting on its own token limit, and that can't overlap with itself. Async pays off when the judge is slow (a reasoning judge, or one hitting its own limits). The live benchmark is `python -m evals.benchmark --live`; it hasn't been run yet.
+
 ## Run it locally
 
 ```bash
@@ -102,7 +123,8 @@ Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
 | --- | --- |
 | Tests (no network, data or GPU) | `pytest` |
 | Re-score the committed eval run (what CI runs) | `python -m evals.run --replay` |
-| Live eval (needs `data/` and a key) | `python -m evals.run --live` |
+| Live eval (needs `data/` and a key) | `python -m evals.run --live` (async; add `--sync` for the old runner) |
+| Old vs new runner, simulated / live | `python -m evals.benchmark --simulated` / `--live` |
 | Re-fit calibration (needs the Kaggle datasets in `data/`) | `python scripts/calibrate.py` |
 
 `CLAUDE.md` describes the code layout and conventions in detail.
