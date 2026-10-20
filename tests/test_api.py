@@ -225,7 +225,8 @@ def test_health_needs_no_login(client):
 # ---- Auth ----
 
 TRACE = str(uuid.uuid4())
-PROTECTED = [("post", "/predict"), ("get", f"/gradcam/{TRACE}"), ("post", f"/report/{TRACE}"),
+PROTECTED = [("post", "/predict"), ("get", f"/gradcam/{TRACE}"), ("get", f"/gradcam/{TRACE}/map"),
+             ("post", f"/report/{TRACE}"),
              ("get", "/history"), ("get", "/analytics"), ("get", f"/traces/{TRACE}")]
 
 
@@ -383,6 +384,29 @@ def test_gradcam_is_private_to_the_uploader(client):
     assert client.get(f"/gradcam/{trace_id}", headers=auth(BOB)).status_code == 404
     assert client.get(f"/gradcam/{uuid.uuid4()}", headers=auth()).status_code == 404
     assert client.get("/gradcam/not-a-uuid", headers=auth()).status_code == 422
+
+
+def test_gradcam_map_returns_the_raw_map_once_per_upload(client, model_service, store):
+    trace_id = predict(client)["trace_id"]
+    calls = []
+    original = model_service.compute_gradcam
+    model_service.compute_gradcam = lambda *a, **k: calls.append(a[1]) or original(*a, **k)
+    for _ in range(2):
+        res = client.get(f"/gradcam/{trace_id}/map", headers=auth())
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["explained_class"] == "Normal" and calls == ["Normal"]
+        assert len(body["cam"]) == 7 and all(len(row) == 7 for row in body["cam"])
+        assert body["cam"][0][0] == 0.5
+        assert body["regions"]["focus"] == "diffuse" and len(body["regions"]["region_shares"]) == 6
+    spans = [s for s in store.tables["traces"] if s["trace_id"] == trace_id and s["name"] == "gradcam"]
+    assert len(spans) == 1 and spans[0]["attributes"]["output"] == "map"
+
+
+def test_gradcam_map_is_private_to_the_uploader(client):
+    trace_id = predict(client)["trace_id"]
+    assert client.get(f"/gradcam/{trace_id}/map", headers=auth(BOB)).status_code == 404
+    assert client.get(f"/gradcam/{trace_id}/map").status_code == 401
 
 
 # ---- /report ----

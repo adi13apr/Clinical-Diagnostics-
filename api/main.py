@@ -26,7 +26,7 @@ from PIL import Image, UnidentifiedImageError
 from agent.agent import REPORT_CACHE, build_llm_client, generate_report_for_image
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
 from api.schemas import (
-    AnalyticsResponse, DailyVolume, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
+    AnalyticsResponse, DailyVolume, GradcamMapResponse, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
     PipelineSummary, PredictResponse, ReportResponse, SpanOut, TraceResponse,
 )
 from api.settings import LOCALHOST_ORIGIN_REGEX, Settings
@@ -175,6 +175,17 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         return Response(upload.heatmap_png, media_type="image/png",
                         headers={"Cache-Control": "private, max-age=3600"})
 
+    @app.get("/gradcam/{trace_id}/map", response_model=GradcamMapResponse)
+    async def gradcam_map(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+        """The raw map, so a client can draw its own overlay (e.g. with an opacity slider)."""
+        upload = find_upload(request, trace_id, user)
+        if upload.cam_map is None:
+            tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
+            upload.cam_map = await asyncio.to_thread(compute_cam_map, model, upload, tracer)
+        cam, regions = upload.cam_map
+        return GradcamMapResponse(trace_id=str(trace_id), explained_class=upload.prediction["diagnosis"],
+                                  cam=cam, regions=regions)
+
     @app.post("/report/{trace_id}", response_model=ReportResponse)
     async def report(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
         upload = find_upload(request, trace_id, user)
@@ -290,6 +301,13 @@ def render_heatmap(model, upload, tracer):
     buf = io.BytesIO()
     figure.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def compute_cam_map(model, upload, tracer):
+    from services.heatmap_handler import summarize_cam_regions
+    cam = model.compute_gradcam(upload.image(), upload.prediction["diagnosis"], tracer=tracer)
+    finish_trace(tracer)
+    return [[round(float(v), 4) for v in row] for row in cam], summarize_cam_regions(cam)
 
 
 def write_report(model, upload, llm_factory, cache, tracer):

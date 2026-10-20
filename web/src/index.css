@@ -1,0 +1,167 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/inter";
+
+/* Dark mode is a class on <html>, set by ThemeProvider (and an inline script in index.html to avoid a flash) */
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Calm blue/teal palette. Text pairs meet WCAG AA (4.5:1) on their surfaces.
+ * Class colours (Normal / Pneumonia / Tuberculosis) were checked with a colour-blindness validator
+ * in both modes; the light ones are under 3:1 contrast, so charts always ship a legend and a table view.
+ */
+:root {
+  --radius: 0.75rem;
+
+  --background: #f5f8fb;
+  --foreground: #0f1c2e;
+  --card: #ffffff;
+  --card-foreground: #0f1c2e;
+  --popover: #ffffff;
+  --popover-foreground: #0f1c2e;
+  --primary: #0e6e8c;
+  --primary-foreground: #ffffff;
+  --secondary: #e8f1f6;
+  --secondary-foreground: #12324a;
+  --muted: #eef3f7;
+  --muted-foreground: #556476;
+  --accent: #e3f4f4;
+  --accent-foreground: #0b4f5c;
+  --destructive: #c4323b;
+  --border: #dbe4ec;
+  --input: #cfdbe5;
+  --ring: #0e8aa8;
+
+  /* Triage status: always shown with an icon and a label, never colour alone */
+  --success: #0f7a55;
+  --success-soft: #e3f5ed;
+  --warning: #8a5300;
+  --warning-soft: #fff4dc;
+  --warning-border: #f2cf86;
+  /* Gauge fills: graphics, so >= 3:1 against the card */
+  --gauge-confident: #10966a;
+  --gauge-refer: #c27c00;
+
+  /* Charts */
+  --chart-normal: #1baf7a;
+  --chart-pneumonia: #eda100;
+  --chart-tuberculosis: #d63f72;
+  --chart-series: #2a78d6;
+  --chart-grid: #e4eaf0;
+  --chart-axis: #c4cfda;
+  --chart-ink: #556476;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0f1c2e;
+  --sidebar-border: #dbe4ec;
+}
+
+.dark {
+  --background: #0b121c;
+  --foreground: #e6edf5;
+  --card: #141c28;
+  --card-foreground: #e6edf5;
+  --popover: #182231;
+  --popover-foreground: #e6edf5;
+  --primary: #4cc3d9;
+  --primary-foreground: #04222b;
+  --secondary: #1d2a3a;
+  --secondary-foreground: #d7e3ef;
+  --muted: #1a2533;
+  --muted-foreground: #9aabbd;
+  --accent: #16303a;
+  --accent-foreground: #bfeaf2;
+  --destructive: #f06b72;
+  --border: #243245;
+  --input: #2b3b50;
+  --ring: #4cc3d9;
+
+  --success: #4fd1a1;
+  --success-soft: #0f2e25;
+  --warning: #f5b84a;
+  --warning-soft: #33260c;
+  --warning-border: #6b4d12;
+  --gauge-confident: #3cc48f;
+  --gauge-refer: #f0b03c;
+
+  --chart-normal: #199e70;
+  --chart-pneumonia: #c98500;
+  --chart-tuberculosis: #d55181;
+  --chart-series: #3987e5;
+  --chart-grid: #222e3e;
+  --chart-axis: #34445a;
+  --chart-ink: #9aabbd;
+
+  --sidebar: #101823;
+  --sidebar-foreground: #e6edf5;
+  --sidebar-border: #243245;
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-warning-border: var(--warning-border);
+  --color-chart-normal: var(--chart-normal);
+  --color-chart-pneumonia: var(--chart-pneumonia);
+  --color-chart-tuberculosis: var(--chart-tuberculosis);
+  --color-chart-series: var(--chart-series);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  /* Numbers that line up in columns */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

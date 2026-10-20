@@ -129,7 +129,7 @@ Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
 
 `CLAUDE.md` describes the code layout and conventions in detail.
 
-## API (backend for the React UI, in progress)
+## API (backend for the React UI)
 
 `api/` is a FastAPI server built on the same services as the Streamlit app: same model, calibration, report agent (cache, guard, fallback), tracing and Supabase tables. The Streamlit app is unchanged.
 
@@ -137,6 +137,7 @@ Run `sql/001`–`004` in the Supabase SQL Editor before deploying.
 | --- | --- |
 | `POST /predict` | Upload a JPEG/PNG (max 10 MB). Returns class, calibrated probabilities, `confident`/`refer`, and a `trace_id` |
 | `GET /gradcam/{trace_id}` | Grad-CAM figure (PNG) for that upload |
+| `GET /gradcam/{trace_id}/map` | The raw 7×7 Grad-CAM map plus a region summary (JSON), so a client can draw its own overlay |
 | `POST /report/{trace_id}` | AI report, with the same guard and template fallback as the app |
 | `GET /history` | Your past predictions: `limit`, `offset`, `label`, `status`, `date_from`, `date_to` |
 | `GET /analytics` | Daily volume, referral rate, average latency per pipeline step |
@@ -163,6 +164,20 @@ Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment var
 | `MAX_UPLOAD_MB` | Default 10 |
 
 **Hugging Face Spaces:** create a Docker Space and push this repo to it. The Space's `README.md` needs `sdk: docker` and `app_port: 7860` in its front matter. Set the variables above as Space secrets. The checkpoint is over 10 MB, so the Space repo has to store `*.pth` with Git LFS.
+
+## React UI (`web/`)
+
+A browser front end for the API, in plain JavaScript: Vite, React, Tailwind, shadcn/ui, Framer Motion, Recharts, TanStack Query, React Router and supabase-js. Details are in [`web/README.md`](web/README.md).
+
+- **Diagnose:** drag-and-drop upload, a result card with an animated confidence gauge, a Confident/Refer banner, a Grad-CAM overlay with an opacity slider, the AI report, and a PDF you download.
+- **History, Analytics, Traces:** a searchable and filterable table, charts (each with a table view), and a step-by-step timeline of one prediction.
+- **Design:** calm blue/teal, light and dark, works on phone, tablet and desktop, keyboard accessible.
+- **Privacy:** the PDF is built in the browser, so the optional patient name never reaches the server.
+
+```bash
+cd web && cp .env.example .env.local   # set VITE_API_URL, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
+npm install && npm run dev             # http://localhost:5173 (needs the API running)
+```
 
 ## License
 
