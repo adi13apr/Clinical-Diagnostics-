@@ -34,11 +34,17 @@ The raw model was strongly **under**-confident: its probabilities never reached 
 
 ### Report agent eval
 
-36 test cases, made up of every model error, every refer case, and 6 correct ones ([`evals/results/2026-10-18.md`](evals/results/2026-10-18.md)):
+36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-20.md`](evals/results/2026-10-20.md).
 
-- **Deterministic checks: 100% on all 9.** These are: class, probability and status match the classifier; refer cases recommend clinician review; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run. CI replays this run on every push and fails if any rate drops.
+- **Deterministic checks: 11 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
+  - The 12th check, that the dataset caveat is quoted from the tool, fails on 1 of 36 (`c07`): the model skipped the condition-info tool and invented its own limitations.
+  - CI replays this run on every push and fails if any rate drops.
 - All 36 reports were written by the LLM: no template fallbacks and no guard rejections.
-- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.78–4.94 out of 5 on faithfulness, uncertainty language, actionability and plain language. **The judge is not validated:** the 15-report human scoring sheet (`evals/human_labels.csv`) hasn't been filled in yet, and the scores sit near the ceiling.
+- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.58–4.97 out of 5 on faithfulness, uncertainty language, actionability and plain language.
+- **Judge vs human:** I scored 15 reports blind (from the 18 Oct run) with the same rubric. They agree on 82% of scores exactly and 97% within one point, but both of us rated almost everything 5, so that number is flattering.
+  - The one report I marked down (`c32`: "No immediate referral is required" for a 99.99% Pneumonia result) got 5/5 from the judge on faithfulness and actionability.
+- **Judge sensitivity:** given 5 deliberately bad reports (wrong class, missing referral, TB "no follow-up needed", overconfident wording, invented symptom), the judge scored the broken part 1/5 in **all 5** ([`evals/judge_sensitivity.md`](evals/judge_sensitivity.md)). The guard blocks 3 of them.
+- **Overall: the judge catches blatant errors but misses subtle ones** (`c32`, and `c07`'s invented limitations). So every problem a human finds becomes a deterministic check, and where possible a guard rule.
 
 ### Failure case: confidently wrong
 
@@ -48,16 +54,19 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 
 **13 of the 24 errors are confident** (not referred). For example, a Normal X-ray is called Pneumonia at 99.97%. The report for such a case faithfully says "very high confidence", and the eval scores it 5/5, because the eval checks the report against the classifier, not the truth. No report-level check can catch these.
 
-### Two things the evals caught
+### Things the evals caught
 
 - **Guard false positive.** Gemini wrote "a screening aid, *not* a confirmed diagnosis", and the guard rejected it as a diagnosis claim. The guard now ignores negated mentions in the same clause. That exact output is a regression test (`tests/fixtures/`).
-- **Ungrounded caveat.** In the pilot, the judge marked down a report for saying the model was evaluated on "two public datasets". The fact was true, but it came from the agent's instructions rather than any tool output. It was moved into a tool, so it's now grounded; all 36 reports cite it.
+- **Ungrounded caveat.** In the pilot, the judge marked down a report for saying the model was evaluated on "two public datasets". The fact was true, but it came from the agent's instructions rather than any tool output. It was moved into a tool, so it's now grounded.
+- **Dismissed follow-up (found by human review, missed by the judge).** `c32` said "No immediate referral is required" for a 99.99% Pneumonia result. The guard now rejects any Pneumonia/TB report that says no referral, action or follow-up is needed, and the template always recommends clinician follow-up. In the latest run, `c32` reads "Clinician follow-up is advised…".
+- **My own regression (found by the judge, missed by the guard).** The first prompt wording for that rule made 5 of 8 confident Pneumonia/TB reports open with "Refer: uncertain…", calling 99.99% results uncertain. The judge scored them 1–2. The prompt was fixed and the guard now rejects it; that run is kept as evidence (`evals/runs/20261020T071107Z`).
 
 ### Known limits
 
 - **Source confound:** each disease comes from a different dataset (pneumonia: pediatric JPEGs; TB: adult PNGs; Normal: both). The model may partly learn the source. Normal recall is 100% on images from the TB dataset but 95.1% on images from the pneumonia dataset, and every metric above is in-distribution.
 - **Slow reports:** about 58 s each on Groq's free tier, mostly waiting to stay under the 8k tokens/min limit (4 sequential LLM calls per report).
 - **Grad-CAM** is coarse (a 3×2 grid, not a lung segmentation) and usually diffuse.
+- **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one). The eval flags it, but the guard doesn't block it yet.
 - **Unreviewed medical text:** the condition text in `agent/condition_info.json` is a draft that hasn't been reviewed by a clinician. The judge model is a Groq *Preview* model.
 
 ## Run it locally

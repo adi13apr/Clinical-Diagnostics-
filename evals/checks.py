@@ -3,7 +3,7 @@ import json
 
 from pydantic import ValidationError
 
-from agent.agent import asserts_confirmed_diagnosis, parse_report
+from agent.agent import asserts_confirmed_diagnosis, dismisses_abnormal_result, labels_confident_as_refer, parse_report
 from agent.schema import Report, count_sentences
 
 # Length limits for what a clinician or patient reads on screen / in the PDF
@@ -75,6 +75,43 @@ def check_guard_replay_consistent(record):
     return True
 
 
+def check_abnormal_result_not_dismissed(record):
+    """A Pneumonia/TB prediction must not tell the reader no referral or action is needed.
+
+    Added after human review flagged c32 ("No immediate referral is required" for 99.99% Pneumonia)
+    and the LLM judge scored it 5/5. Normal predictions are exempt: the reviewer accepted "no
+    immediate action is required" there when paired with advice to see a clinician for symptoms.
+    The agent's guard enforces the same rule (agent.agent.dismisses_abnormal_result).
+    """
+    if record["classifier"]["predicted_class"] == "Normal":
+        return None
+    return not dismisses_abnormal_result(record["classifier"]["predicted_class"], record["report"]["recommendation"])
+
+
+def _norm(text):
+    return " ".join(text.replace("‐", "-").replace("‑", "-").replace("‒", "-")
+                    .replace("–", "-").replace("—", "-").split()).lower()
+
+
+def check_dataset_caveat_present(record):
+    """The dataset/source-confound caveat from get_condition_info appears verbatim in the limitations.
+
+    Added after 20261020T075220Z: c07 skipped get_condition_info and invented its own limitations,
+    dropping the caveat; the judge scored its faithfulness 5.
+    """
+    caveats = ((record.get("tool_outputs") or {}).get("condition_info") or {}).get("model_limitations")
+    if not caveats:
+        return None
+    return any(_norm(caveats[0]) in _norm(item) for item in record["report"]["limitations"])
+
+
+def check_confident_not_called_uncertain(record):
+    """A confident result must not use the refer sentence ("Refer: uncertain…"). Same rule as the guard."""
+    if record["classifier"]["status"] == "refer":
+        return None
+    return not labels_confident_as_refer(Report.model_construct(**record["report"]))
+
+
 CHECKS = {
     "schema_valid": check_schema_valid,
     "class_matches_classifier": check_class_matches,
@@ -85,6 +122,9 @@ CHECKS = {
     "limitations_present": check_limitations_present,
     "length_limits": check_length_limits,
     "guard_replay_consistent": check_guard_replay_consistent,
+    "abnormal_result_not_dismissed": check_abnormal_result_not_dismissed,
+    "confident_not_called_uncertain": check_confident_not_called_uncertain,
+    "dataset_caveat_present": check_dataset_caveat_present,
 }
 
 

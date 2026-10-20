@@ -27,6 +27,6 @@
     "overview": "Tuberculosis (TB) is a bacterial infection, usually affecting the lungs, caused by Mycobacterium tuberculosis. It is curable and preventable.",
     "typical_xray_findings": "Opacities, nodules or cavities, often in the upper parts of the lungs, sometimes with enlarged lymph nodes or fluid around the lung.",
     "what_this_result_means": "The classifier found patterns similar to the tuberculosis images it was trained on. A chest X-ray can suggest TB but cannot confirm it.",
-    "typical_next_steps": "TB is confirmed with microbiological tests (for example sputum testing) ordered by a clinician, following local TB guidelines."
+    "typical_next_steps": "A chest X-ray cannot confirm TB. A clinician can order microbiological tests (for example sputum testing) to confirm or rule it out, following local TB guidelines."
   }
 }

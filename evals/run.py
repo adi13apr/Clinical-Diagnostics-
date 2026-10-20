@@ -18,7 +18,7 @@ from pathlib import Path
 from evals.checks import CHECKS, pass_rates
 from evals.dataset import CASES_PATH, dataset_hash, load_cases
 from evals.human_labels import (
-    HUMAN_LABELS_PATH, N_LABELS, LabelsAlreadyFilled, agreement, export_human_labels, read_labels,
+    HUMAN_LABELS_PATH, N_LABELS, LabelsAlreadyFilled, agreement, export_human_labels, labels_run, read_labels,
 )
 from evals.schema import CRITERIA, RECORD_VERSION
 
@@ -104,6 +104,7 @@ def run_case(case, service, llm, roots):
         "fallback_reason": result.reason,
         "fallback_error_kind": result.error_kind,
         "steps": result.steps,
+        "tool_calls": result.tool_calls,  # which tools the model actually called (c07 skipped one)
         "rejected": result.rejected,
         "agent_usage": {
             "llm_calls": len(llm_calls),
@@ -207,8 +208,12 @@ def load_baseline():
 
 
 def load_agreement(run_path):
+    """Judge-vs-human agreement for this run, {"other_run": ...} if the labels came from another run, or None."""
     if not HUMAN_LABELS_PATH.exists():
         return None
+    source = labels_run()
+    if source is not None and (REPO / source).resolve() != Path(run_path).resolve():
+        return {"other_run": source}  # different reports: comparing would be meaningless
     return agreement(read_labels(), load_run(run_path))
 
 
@@ -298,7 +303,11 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
               f"output tokens, {fmt(mean([u['report_latency_ms'] / 1000 for u in usage]))} s"]
 
     lines += ["", "## Judge vs human", ""]
-    if not agreement_result or not agreement_result["labelled_reports"]:
+    if agreement_result and "other_run" in agreement_result:
+        lines.append(f"The human scores in `{relative(HUMAN_LABELS_PATH)}` are for reports from "
+                     f"`{agreement_result['other_run']}`, not this run, so no agreement is computed here "
+                     "(see that run's results).")
+    elif not agreement_result or not agreement_result["labelled_reports"]:
         lines.append(f"No human scores yet: fill in `{relative(HUMAN_LABELS_PATH)}` "
                      "(python -m evals.run --export-human-labels creates it).")
     else:
@@ -357,7 +366,7 @@ def export_labels(args):
         raise SystemExit(f"{relative(run_path)} has {len(records)} reports; need at least {N_LABELS} to export "
                          "the labelling sheet. Finish the live run first (--live --resume).")
     try:
-        rows = export_human_labels(records, {c.case_id: c for c in cases})
+        rows = export_human_labels(records, {c.case_id: c for c in cases}, run=relative(run_path))
     except LabelsAlreadyFilled as e:
         raise SystemExit(str(e))
     print(f"Wrote {len(rows)} reports to {relative(HUMAN_LABELS_PATH)} from {relative(run_path)}. "
@@ -366,8 +375,11 @@ def export_labels(args):
 
 
 def show_agreement(args):
-    run_path = Path(args.run) if args.run else latest_run()
+    # Default to the run the labels were exported from: other runs have different reports
+    source = labels_run()
+    run_path = Path(args.run) if args.run else (REPO / source if source else latest_run())
     a = agreement(read_labels(), load_run(run_path))
+    a["run"] = relative(run_path)
     print(json.dumps(a, indent=2))
     return 0
 

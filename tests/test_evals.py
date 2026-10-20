@@ -112,6 +112,40 @@ def test_negated_claim_passes_and_guard_replay_detects_changes():
     assert run_checks(accepted_now)["guard_replay_consistent"] is False
 
 
+ABNORMAL_CASE = next(c for c in CASES if c.snapshot.predicted_class != "Normal")
+NORMAL_CASE = next(c for c in CASES if c.snapshot.predicted_class == "Normal")
+
+
+@pytest.mark.parametrize("recommendation", [
+    "No immediate referral is required, but a clinician should review the image.",   # c32, verbatim start
+    "No immediate follow‑up is required.",                                      # non-breaking hyphen
+    "No immediate imaging follow-up is required based on this result.",
+    "No further action is needed.",
+])
+def test_abnormal_result_must_not_be_dismissed(recommendation):
+    assert run_checks(make_record(ABNORMAL_CASE, recommendation=recommendation))["abnormal_result_not_dismissed"] is False
+    # Normal predictions are exempt (the human reviewer accepted this wording there)
+    assert run_checks(make_record(NORMAL_CASE, recommendation=recommendation))["abnormal_result_not_dismissed"] is None
+
+
+def test_abnormal_result_with_a_real_next_step_passes():
+    ok = make_record(ABNORMAL_CASE, recommendation="Proceed with clinical evaluation and appropriate tests.")
+    assert run_checks(ok)["abnormal_result_not_dismissed"] is True
+
+
+def test_dataset_caveat_must_be_quoted_from_the_tool():
+    caveat = ("The model was trained and evaluated on two public datasets in which each disease came from a "
+              "different source, so performance may be lower.")
+    record = make_record(CONFIDENT_CASE, limitations=[caveat.replace("-", "‑")])  # unicode hyphens are fine
+    record["tool_outputs"]["condition_info"]["model_limitations"] = [caveat, "Grad-CAM is approximate."]
+    assert run_checks(record)["dataset_caveat_present"] is True
+    # c07 in 20261020T075220Z: invented limitations, no caveat
+    record["report"]["limitations"] = ["Model limitations: may be affected by image quality and positioning."]
+    assert run_checks(record)["dataset_caveat_present"] is False
+    del record["tool_outputs"]["condition_info"]["model_limitations"]
+    assert run_checks(record)["dataset_caveat_present"] is None
+
+
 def test_pass_rates_exclude_not_applicable():
     records = [make_record(REFER_CASE), make_record(CONFIDENT_CASE),
                make_record(REFER_CASE, recommendation="Rest.")]
@@ -157,6 +191,24 @@ def test_load_run_last_record_wins(tmp_path):
     second = dict(first, judge=None, judge_error="RateLimitError")
     write_run(tmp_path / "run.jsonl", [first, second])
     assert eval_run.load_run(tmp_path / "run.jsonl")[CASES[0].case_id]["judge_error"] == "RateLimitError"
+
+
+def test_human_labels_only_compared_with_their_own_run(tmp_path, monkeypatch):
+    # Labels exported from run A must not be compared with run B's judge: the reports differ
+    labels = tmp_path / "labels.csv"
+    labels.write_text("case_id,faithfulness,uncertainty_language,actionability,plain_language\n"
+                      f"{CASES[0].case_id},5,5,5,5\n", encoding="utf-8")
+    run_a, run_b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    write_run(run_a, [make_record(CASES[0])])
+    write_run(run_b, [make_record(CASES[0])])
+    monkeypatch.setattr(eval_run, "HUMAN_LABELS_PATH", labels)
+    monkeypatch.setattr(eval_run, "read_labels", lambda: __import__("evals.human_labels").human_labels.read_labels(labels))
+    monkeypatch.setattr(eval_run, "labels_run", lambda: str(run_a))
+    assert eval_run.load_agreement(run_a)["labelled_reports"] == 1
+    other = eval_run.load_agreement(run_b)
+    assert other == {"other_run": str(run_a)}
+    md = eval_run.build_summary(eval_run.load_run(run_b), CASES, dataset_hash(CASES), run_b, None, other)["markdown"]
+    assert "not this run, so no agreement is computed here" in md
 
 
 def test_committed_baseline_replays_cleanly():
