@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -44,15 +45,17 @@ def make_service(monkeypatch):
 
 # ---- Upload store / report cache backends (in memory, or Redis via fakeredis: no network) ----
 
+def set_fakeredis_time(monkeypatch, time_fn):
+    """fakeredis sets each database's time from time.time() in fakeredis._socket._base before every command."""
+    import fakeredis._socket._base as fake_socket
+    monkeypatch.setattr(fake_socket, "time", type("FakeTime", (), {"time": staticmethod(time_fn)}))
+
+
 @pytest.fixture
 def redis_clock(monkeypatch):
-    """One fake clock for fakeredis's key expiry and the stores, so tests move time instead of sleeping.
-
-    fakeredis sets each database's time from time.time() in fakeredis._socket._base before every command.
-    """
-    import fakeredis._socket._base as fake_socket
+    """One fake clock for fakeredis's key expiry and the stores, so tests move time instead of sleeping."""
     now = [1_000_000.0]
-    monkeypatch.setattr(fake_socket, "time", type("FakeTime", (), {"time": staticmethod(lambda: now[0])}))
+    set_fakeredis_time(monkeypatch, lambda: now[0])
     return now
 
 
@@ -90,4 +93,51 @@ def make_upload_store(backend, make_redis, redis_clock):
         if backend == "memory":
             return UploadStore(ttl_s, max_items, clock=clock)
         return RedisUploadStore(make_redis(), ttl_s, max_items, clock=clock)
+    return make
+
+
+# ---- LLM rate-limit budgets (in memory, or Redis via fakeredis) ----
+
+class FakeClock:
+    """Wall clock for budgets: sleep()/asleep() record the wait and move time forward instead of waiting."""
+
+    def __init__(self, now):
+        self.now, self.sleeps = now, []
+
+    def __call__(self):
+        return self.now
+
+    def today(self):
+        return datetime.fromtimestamp(self.now, timezone.utc).date()
+
+    def sleep(self, s):
+        self.sleeps.append(round(s, 2))
+        self.now += s
+
+    async def asleep(self, s):
+        self.sleep(s)
+
+
+@pytest.fixture
+def budget_clock(monkeypatch):
+    """Starts at 2026-10-18 12:00 UTC; fakeredis's key expiry follows it too."""
+    clock = FakeClock(datetime(2026, 10, 18, 12, tzinfo=timezone.utc).timestamp())
+    set_fakeredis_time(monkeypatch, clock)
+    return clock
+
+
+@pytest.fixture
+def make_budget(backend, make_redis, budget_clock):
+    """make(model="m", **limits) -> ModelBudget or RedisModelBudget on budget_clock.
+
+    Redis budgets for the same model share counters (each gets its own client, like a replica), so a
+    test that builds several unrelated budgets gives them different model names.
+    """
+    from agent.rate_limit import ModelBudget, RedisModelBudget
+
+    def make(model="m", **kwargs):
+        kwargs = {"clock": budget_clock, "sleep": budget_clock.sleep, "async_sleep": budget_clock.asleep, **kwargs}
+        if backend == "memory":
+            return ModelBudget(model, today=budget_clock.today, **kwargs)
+        return RedisModelBudget(make_redis(), model, **kwargs)
     return make

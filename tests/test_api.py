@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from agent.agent import REPORT_CACHE, MockLLMClient, RedisReportCache, ReportCache
+from agent.rate_limit import BUDGETS, ModelBudget, RedisModelBudget
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier
 from api.main import check_redis, create_app, daily_volume, shared_state
 from api.settings import Settings
@@ -733,17 +734,34 @@ def test_redis_down_is_503_not_a_crash(model_service, store, make_redis, redis_s
 
 def test_backend_comes_from_redis_url():
     memory = Settings(supabase_url=SUPABASE_URL)
-    uploads, cache, client = shared_state(memory)
-    assert type(uploads) is UploadStore and cache is REPORT_CACHE and client is None
+    uploads, cache, budgets, client = shared_state(memory)
+    assert type(uploads) is UploadStore and cache is REPORT_CACHE and budgets is BUDGETS and client is None
 
     redis_settings = Settings(supabase_url=SUPABASE_URL, redis_url="redis://:pw@redis.internal:6380/2")
-    uploads, cache, client = shared_state(redis_settings)  # redis-py connects lazily: no network here
+    uploads, cache, budgets, client = shared_state(redis_settings)  # redis-py connects lazily: no network here
     assert isinstance(uploads, RedisUploadStore) and isinstance(cache, RedisReportCache)
-    assert uploads.client is client and cache.client is client
+    assert uploads.client is client and cache.client is client and budgets.redis_client is client
 
     injected = UploadStore()  # empty, so falsy: must still be used
-    uploads, cache, client = shared_state(redis_settings, uploads=injected, report_cache=ReportCache())
-    assert uploads is injected and type(cache) is ReportCache and client is None
+    uploads, cache, budgets, client = shared_state(redis_settings, uploads=injected, report_cache=ReportCache())
+    assert uploads is injected and type(cache) is ReportCache
+    assert budgets.redis_client is client is not None  # rate limits are still shared
+
+
+def test_llm_budgets_are_shared_through_redis_only_with_redis_url(model_service, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+
+    def llm(settings):
+        app = create_app(settings, model_service=model_service, verifier=object(), db_factory=lambda token: None)
+        return app.state.llm_factory()
+
+    local = llm(Settings(supabase_url=SUPABASE_URL))
+    assert type(local.budget) is ModelBudget and local.budget is BUDGETS.get(local.model)
+    shared = llm(Settings(supabase_url=SUPABASE_URL, redis_url="redis://redis.internal:6380/0"))
+    assert isinstance(shared.budget, RedisModelBudget) and shared.model == local.model
+    assert (shared.budget.rpm, shared.budget.tpm, shared.budget.rpd) == (local.budget.rpm, local.budget.tpm,
+                                                                         local.budget.rpd)
 
 
 def test_redis_url_from_env_or_secrets(tmp_path):

@@ -13,7 +13,6 @@ from PIL import Image
 from agent.agent import (
     LLMTurn, MockLLMClient, OpenAICompatibleClient, ToolCall, agenerate_report, generate_report,
 )
-from agent.rate_limit import ModelBudget
 from agent.tools import ReportTools
 from evals import run as eval_run
 from evals.dataset import load_cases
@@ -289,47 +288,42 @@ async def test_judge_timeout_is_recorded_and_the_run_continues():
 
 # ---- rate limits ----
 
-class FakeTime:
-    def __init__(self):
-        self.now, self.sleeps = 0.0, []
-
-    def clock(self):
-        return self.now
-
-    async def asleep(self, s):
-        self.sleeps.append(round(s, 2))
-        self.now += s
-
+# Every budget test runs on both backends (in memory and in fake Redis); see make_budget in conftest.py.
 
 @pytest.mark.asyncio
-async def test_async_budget_respects_rpm_tpm_and_otpm():
-    t = FakeTime()
-    budget = ModelBudget("m", rpm=2, tpm=8000, otpm=1000, clock=t.clock, async_sleep=t.asleep)
+async def test_async_budget_respects_rpm_tpm_and_otpm(make_budget, budget_clock):
+    budget = make_budget("m", rpm=2, tpm=8000, otpm=1000)
     await budget.aacquire(100)
     await budget.aacquire(100)
     await budget.aacquire(100)                                       # 3rd request in a minute: waits
-    assert t.sleeps == [60.0]
-    t2 = FakeTime()
-    budget = ModelBudget("m", tpm=8000, otpm=1000, clock=t2.clock, async_sleep=t2.asleep)
+    assert budget_clock.sleeps == [60.0]
+    budget = make_budget("m2", tpm=8000, otpm=1000)
     await budget.aacquire(2000, 600)
-    t2.now = 10.0
+    budget_clock.now += 10
     await budget.aacquire(2000, 600)                                 # 600 + 600 output > 1000 OTPM: waits
-    assert t2.sleeps == [50.0]
+    assert budget_clock.sleeps == [60.0, 50.0]
 
 
 @pytest.mark.asyncio
-async def test_sync_and_async_share_one_budget():
-    t = FakeTime()
-    budget = ModelBudget("m", tpm=1000, clock=t.clock, async_sleep=t.asleep, sleep=lambda s: None)
+async def test_sync_and_async_share_one_budget(make_budget, budget_clock):
+    budget = make_budget(tpm=1000, sleep=lambda s: None)
     budget.acquire(800)                                              # the app (sync) used most of the minute
     await budget.aacquire(500)                                       # the async runner must wait for it
-    assert t.sleeps == [60.0]
+    assert budget_clock.sleeps == [60.0]
+
+
+@pytest.mark.asyncio
+async def test_async_record_corrects_the_reservation(make_budget):
+    budget = make_budget(tpm=8000)
+    reservation = await budget.aacquire(5000, 2000)
+    await budget.arecord(reservation, 1200, 200)
+    assert budget.used_last_minute() == (1, 1200) and budget.tokens_today == 1200
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2])
-async def test_semaphore_caps_requests_in_flight(limit):
-    budget = ModelBudget("m", max_concurrent=limit)
+async def test_semaphore_caps_requests_in_flight(limit, make_budget):
+    budget = make_budget(max_concurrent=limit)
     in_flight, peak = 0, 0
 
     async def request():
@@ -357,8 +351,8 @@ async def test_async_client_short_429_retries_with_async_sleep():
     assert sleeps == [3.0] and turn.rate_limit_retries == 1
 
 
-def test_budget_primitives_work_across_event_loops():
-    budget = ModelBudget("m", rpm=100)
+def test_budget_primitives_work_across_event_loops(make_budget):
+    budget = make_budget(rpm=100)
     asyncio.run(budget.aacquire(1))
     asyncio.run(budget.aacquire(1))                                  # a new loop gets fresh asyncio primitives
     assert budget.used_last_minute()[0] == 2
