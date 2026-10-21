@@ -30,6 +30,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Text piped to native commands (vercel env add) must not start with a UTF-8 BOM: an invisible
+# U+FEFF in VITE_API_URL breaks every API call, and in a header value it makes fetch() throw
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $Repo = Split-Path -Parent $PSScriptRoot
 $Image = "clinical-api:local"
 $Container = "clinical-api"
