@@ -1,6 +1,5 @@
 """Groq / OpenAI-compatible provider, token-aware budgets, config selection, grounded caveat."""
 import json
-from datetime import date
 from types import SimpleNamespace
 
 import httpx
@@ -13,7 +12,7 @@ from agent.agent import (
     classify_llm_error, describe_llm_error, fallback_report, generate_report,
 )
 from agent.llm_config import load_llm_config, provider_settings
-from agent.rate_limit import DailyCapReached, ModelBudget
+from agent.rate_limit import DailyCapReached, RedisModelBudget
 from agent.tools import TOOL_DECLARATIONS, ReportTools
 from evals.judge import JUDGE_JSON_SCHEMA, OpenAICompatibleJudge, build_judge
 from evals.schema import CRITERIA
@@ -191,64 +190,48 @@ def test_final_turn_forbids_tool_calls(tools):
     assert mock.tools_allowed == [True, True, True, False]
 
 
-# ---- Token-aware budget ----
+# ---- Token-aware budget (every test runs on both backends: in memory and in fake Redis) ----
 
-class Clock:
-    def __init__(self):
-        self.now, self.sleeps = 0.0, []
-
-    def __call__(self):
-        return self.now
-
-    def sleep(self, s):
-        self.sleeps.append(round(s, 2))
-        self.now += s
-
-
-def test_budget_waits_for_token_window():
-    clock = Clock()
-    budget = ModelBudget("m", rpm=30, tpm=8000, clock=clock, sleep=clock.sleep)
+def test_budget_waits_for_token_window(make_budget, budget_clock):
+    budget = make_budget(rpm=30, tpm=8000)
     first = budget.acquire(5000)
     budget.record(first, 6000)          # real usage was higher than estimated
-    clock.now = 10.0
+    budget_clock.now += 10
     budget.acquire(2500)                # 6000 + 2500 > 8000 -> wait until the first request leaves the window
-    assert clock.sleeps == [50.0]
+    assert budget_clock.sleeps == [50.0]
     assert budget.used_last_minute() == (1, 2500)
 
 
-def test_budget_respects_requests_per_minute():
-    clock = Clock()
-    budget = ModelBudget("m", rpm=2, tpm=None, clock=clock, sleep=clock.sleep)
+def test_budget_respects_requests_per_minute(make_budget, budget_clock):
+    budget = make_budget(rpm=2, tpm=None)
     for _ in range(3):
         budget.acquire(10)
-    assert clock.sleeps == [60.0]
+    assert budget_clock.sleeps == [60.0]
 
 
-def test_budget_daily_caps_and_rollover():
-    clock, day = Clock(), [date(2026, 10, 18)]
-    budget = ModelBudget("m", rpd=2, tpd=None, clock=clock, sleep=clock.sleep, today=lambda: day[0])
+def test_budget_daily_caps_and_rollover(make_budget, budget_clock):
+    budget = make_budget(rpd=2, tpd=None)
     budget.acquire(1)
-    clock.now = 61
+    budget_clock.now += 61
     budget.acquire(1)
     with pytest.raises(DailyCapReached, match="request"):
         budget.acquire(1)
-    day[0] = date(2026, 10, 19)         # new day resets the counters
+    budget_clock.now += 86400           # new (UTC) day resets the counters
     budget.acquire(1)
-    tokens = ModelBudget("m", tpd=1000, clock=clock, sleep=clock.sleep)
+    tokens = make_budget("m2", tpd=1000)
     with pytest.raises(DailyCapReached, match="token"):
         tokens.acquire(1500)
 
 
-def test_budget_output_tokens_per_minute():
+def test_budget_output_tokens_per_minute(make_budget, budget_clock):
     """Groq checks max_completion_tokens against OTPM up front (qwen/qwen3.8-27b: 1000 on the free tier)."""
-    clock = Clock()
-    budget = ModelBudget("qwen/qwen3.8-27b", tpm=8000, otpm=1000, clock=clock, sleep=clock.sleep)
+    budget = make_budget("qwen/qwen3.8-27b", tpm=8000, otpm=1000)
     first = budget.acquire(2000, 600)
     budget.record(first, 1900, 210)       # actual output was far below the reservation
     budget.acquire(2000, 600)             # 210 + 600 <= 1000: no wait
-    clock.now = 5.0
+    budget_clock.now += 5
     budget.acquire(2000, 600)             # 810 + 600 > 1000: wait for the first request to leave the window
-    assert clock.sleeps == [55.0]
+    assert budget_clock.sleeps == [55.0]
 
 
 def test_otpm_429_is_parsed_and_comment_options_are_not_sent():
@@ -262,21 +245,29 @@ def test_otpm_429_is_parsed_and_comment_options_are_not_sent():
     assert load_llm_config()["limits"]["qwen/qwen3.8-27b"]["otpm"] == 1000
 
 
-def test_client_daily_cap_becomes_rate_limit_fallback(tools):
-    budget = ModelBudget("openai/gpt-oss-120b", rpd=0)
+def test_client_daily_cap_becomes_rate_limit_fallback(tools, make_budget):
+    budget = make_budget("openai/gpt-oss-120b", rpd=0)
     llm, chat = client_for([completion(content="{}")], budget=budget)
     result = generate_report(tools, llm)
     assert result.source == "fallback" and result.error_kind == "rate_limit" and chat.requests == []
     assert "daily quota" in result.reason
 
 
-def test_budget_records_actual_tokens():
-    clock = Clock()
-    budget = ModelBudget("openai/gpt-oss-120b", tpm=8000, clock=clock, sleep=clock.sleep)
+def test_budget_records_actual_tokens(make_budget):
+    budget = make_budget("openai/gpt-oss-120b", tpm=8000)
     llm, _ = client_for([completion(content="{}", prompt=1000, completion_tokens=200)], budget=budget,
                         options={"max_completion_tokens": 2000})
     llm.generate("sys", [{"role": "user", "text": "hi"}], [])
     assert budget.used_last_minute() == (1, 1200) and budget.tokens_today == 1200
+
+
+def test_unreachable_shared_budget_falls_back_to_the_template(tools, make_redis, redis_server):
+    """With REDIS_URL, a Redis outage means no LLM call (its limits can't be checked), not a failed report."""
+    budget = RedisModelBudget(make_redis(), "openai/gpt-oss-120b", rpm=30)
+    llm, chat = client_for([completion(content="{}")], budget=budget)
+    redis_server.connected = False
+    result = generate_report(tools, llm)
+    assert result.source == "fallback" and result.error_kind == "infrastructure" and chat.requests == []
 
 
 # ---- Config ----

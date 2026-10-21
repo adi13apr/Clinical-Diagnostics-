@@ -154,7 +154,7 @@ Run `sql/001`–`005` in the Supabase SQL Editor before deploying.
 
 - **Login:** every endpoint except `/health` needs `Authorization: Bearer <Supabase access token>`. The server checks the token, then queries Supabase *as that user*, so row-level security returns only their own rows.
 - **Uploads stay in memory.** They're never written to disk, and `/gradcam` and `/report` can use them for an hour. After a restart, call `/predict` again.
-- **Several replicas:** set `REDIS_URL` and the uploads, Grad-CAM results and LLM report cache are shared through Redis (same 1-hour expiry; reports 24 hours), so any replica can serve any request. Run Redis **without persistence** (`--save "" --appendonly no`), otherwise the X-rays end up on Redis's disk. Without `REDIS_URL`, everything stays in the process as before. The Streamlit app never uses Redis.
+- **Several replicas:** set `REDIS_URL` and the uploads, Grad-CAM results and LLM report cache are shared through Redis (same 1-hour expiry; reports 24 hours), so any replica can serve any request. The LLM rate limits (requests and tokens per minute, daily caps) are shared the same way, so replicas together stay within one Groq quota. Run Redis **without persistence** (`--save "" --appendonly no`), otherwise the X-rays end up on Redis's disk. Without `REDIS_URL`, everything stays in the process as before. The Streamlit app never uses Redis.
 - **History** comes from the `predictions` log, so it has no patient names.
 
 ```bash
@@ -171,7 +171,7 @@ Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment var
 | `FRONTEND_URL` | Deployed React app's origin(s), comma-separated. `localhost` on any port is always allowed |
 | `GROQ_API_KEY` | Optional. Without it, reports use the template |
 | `MAX_UPLOAD_MB` | Default 10 |
-| `REDIS_URL` | Optional, e.g. `rediss://:password@host:6380/0`. Shares uploads and the report cache between replicas (also read from `[redis] url` in `secrets.toml`) |
+| `REDIS_URL` | Optional, e.g. `rediss://:password@host:6380/0`. Shares uploads, the report cache and LLM rate limits between replicas (also read from `[redis] url` in `secrets.toml`) |
 
 Hosting options for the API are in [Deployment](#deployment).
 

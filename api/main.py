@@ -15,6 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from functools import partial
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
@@ -25,6 +26,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, UnidentifiedImageError
 
 from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client, generate_report_for_image
+from agent.rate_limit import BUDGETS, BudgetRegistry
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
 from api.schemas import (
     AnalyticsResponse, DailyVolume, GradcamMapResponse, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
@@ -63,12 +65,13 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
                report_cache=None, uploads=None):
     """Build the app. Tests inject fakes; by default everything comes from Settings.from_env().
 
-    Uploads and the report cache live in Redis when settings.redis_url is set (shared by every replica),
-    else in this process's memory (REPORT_CACHE is the one the Streamlit app uses too).
+    Uploads, the report cache and the LLM rate-limit budgets live in Redis when settings.redis_url is
+    set (shared by every replica), else in this process's memory (REPORT_CACHE and BUDGETS are the ones
+    the Streamlit app uses too).
     """
     configure_logging()
     settings = settings or Settings.from_env()
-    uploads, report_cache, redis_client = shared_state(settings, uploads, report_cache)
+    uploads, report_cache, budgets, redis_client = shared_state(settings, uploads, report_cache)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -85,7 +88,8 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
             if settings.check_keys_on_startup and hasattr(verifier, "check_keys"):
                 await asyncio.to_thread(verifier.check_keys)
         if redis_client is None:
-            log.info("Uploads and the report cache are kept in this process's memory (REDIS_URL not set)")
+            log.info("Uploads, the report cache and LLM rate limits are kept in this process's memory "
+                     "(REDIS_URL not set)")
         else:
             await asyncio.to_thread(check_redis, redis_client)
         yield
@@ -100,7 +104,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         if settings.supabase_url else None)
     app.state.db_factory = db_factory or (
         user_db_factory(settings.supabase_url, settings.supabase_key) if settings.supabase_url else None)
-    app.state.llm_factory = llm_factory or build_llm_client
+    app.state.llm_factory = llm_factory or partial(build_llm_client, budgets=budgets)
     app.state.report_cache = report_cache
     app.state.uploads = uploads
     app.state.report_pool = ThreadPoolExecutor(REPORT_WORKERS, thread_name_prefix="report")
@@ -284,23 +288,27 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
 # ---- Helpers (plain functions; the blocking ones run in worker threads) ----
 
 def shared_state(settings, uploads=None, report_cache=None):
-    """(uploads, report_cache, redis client or None). Injected stores win; else Redis if REDIS_URL is set."""
-    client = None
-    if settings.redis_url and (uploads is None or report_cache is None):
-        client = connect_redis(settings.redis_url)
+    """(uploads, report_cache, budgets, redis client or None). Injected stores win; else Redis if REDIS_URL is set.
+
+    budgets is the BudgetRegistry for LLM clients: in Redis, every replica shares each model's
+    requests/tokens per minute and daily caps instead of each assuming it has the whole quota.
+    """
+    client = connect_redis(settings.redis_url) if settings.redis_url else None
     if uploads is None:
         uploads = (RedisUploadStore(client, settings.upload_ttl_s, settings.upload_max_items) if client
                    else UploadStore(settings.upload_ttl_s, settings.upload_max_items))
     if report_cache is None:
         report_cache = RedisReportCache(client, on_error=log_cache_error) if client else REPORT_CACHE
-    return uploads, report_cache, client
+    budgets = BudgetRegistry(client) if client else BUDGETS
+    return uploads, report_cache, budgets, client
 
 
 def check_redis(client):
     """One PING at startup. A failure is logged, not fatal: requests get 503 until Redis is back."""
     try:
         client.ping()
-        log.info("Uploads and the report cache are shared through Redis at %s", redis_location(client))
+        log.info("Uploads, the report cache and LLM rate limits are shared through Redis at %s",
+                 redis_location(client))
         return True
     except Exception as e:
         log.error("Redis at %s is unreachable (%s: %s); uploads will answer 503 until it is back",

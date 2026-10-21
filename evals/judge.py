@@ -72,9 +72,7 @@ class OpenAICompatibleJudge:
         return RateLimitError(delay, *openai_quota_info(error), provider=self.provider,
                               resets="the provider's daily window")
 
-    def _parse(self, response, reservation):
-        if self.budget is not None and response.usage is not None:
-            self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+    def _parse(self, response):
         return JudgeResult.model_validate_json(response.choices[0].message.content), openai_usage(response.usage)
 
     def judge(self, tool_outputs, report):
@@ -98,7 +96,9 @@ class OpenAICompatibleJudge:
                     self.sleep(delay)
                     continue
                 raise self._rate_limit_error(e, delay) from e
-        return self._parse(response, reservation)
+        if self.budget is not None and response.usage is not None:
+            self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+        return self._parse(response)
 
     async def ajudge(self, tool_outputs, report):
         import openai
@@ -124,7 +124,9 @@ class OpenAICompatibleJudge:
                     await self.async_sleep(delay)
                     continue
                 raise self._rate_limit_error(e, delay) from e
-        return self._parse(response, reservation)
+        if self.budget is not None and response.usage is not None:
+            await self.budget.arecord(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+        return self._parse(response)
 
     def _async(self):
         if self._async_client is None:

@@ -2,5 +2,5 @@
 pytest
 pypdf
 pytest-asyncio
-fakeredis
+fakeredis[lua]          # Lua scripting (lupa) for the Redis rate-limit budget tests
 httpx

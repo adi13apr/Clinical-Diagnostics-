@@ -23,7 +23,7 @@ from typing import Any, List, Optional
 from pydantic import ValidationError
 
 from agent.llm_config import load_llm_config, provider_settings, request_options
-from agent.rate_limit import DailyCapReached, budget_for, estimate_tokens
+from agent.rate_limit import BUDGETS, DailyCapReached, estimate_tokens
 from agent.schema import DISCLAIMER, Report
 from agent.tools import TOOL_DECLARATIONS, ReportTools
 from services.calibration import REFER_MESSAGE, STATUS_REFER
@@ -333,7 +333,9 @@ class OpenAICompatibleClient(LLMClient):
                     retries += 1
                     continue
                 raise self._rate_limit_error(e, delay) from e
-        return self._parse(response, retries, reservation)
+        if self.budget is not None and response.usage is not None:
+            self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+        return self._parse(response, retries)
 
     async def agenerate(self, system, messages, tools, tools_allowed=True):
         import openai
@@ -355,7 +357,9 @@ class OpenAICompatibleClient(LLMClient):
                     retries += 1
                     continue
                 raise self._rate_limit_error(e, delay) from e
-        return self._parse(response, retries, reservation)
+        if self.budget is not None and response.usage is not None:
+            await self.budget.arecord(reservation, response.usage.total_tokens, response.usage.completion_tokens)
+        return self._parse(response, retries)
 
     def _async(self):
         if self._async_client is None:
@@ -363,10 +367,8 @@ class OpenAICompatibleClient(LLMClient):
             self._async_client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url, max_retries=0)
         return self._async_client
 
-    def _parse(self, response, retries, reservation):
+    def _parse(self, response, retries):
         usage = response.usage
-        if self.budget is not None and usage is not None:
-            self.budget.record(reservation, usage.total_tokens, usage.completion_tokens)
         choice = response.choices[0]
         message = choice.message
         calls = []
@@ -511,17 +513,19 @@ class ReportResult:
         return "Standard template report generated from the classifier's output."
 
 
-def build_llm_client(role="report", model=None, config=None):
+def build_llm_client(role="report", model=None, config=None, budgets=None):
     """Client for the configured provider (config/llm.json, env LLM_PROVIDER), or None without a key.
 
-    role picks report_model or judge_model; model overrides it. Each model gets its shared budget.
+    role picks report_model or judge_model; model overrides it. Each model gets its shared budget from
+    budgets (agent.rate_limit.BudgetRegistry): this process's in-memory BUDGETS by default, a Redis
+    registry in the API when REDIS_URL is set.
     """
     config = config or load_llm_config()
     name, settings = provider_settings(config)
     if not settings["api_key"]:
         return None
     model = model or settings[f"{role}_model"]
-    budget = budget_for(model, config["limits"].get(model, {}))
+    budget = (BUDGETS if budgets is None else budgets).get(model, config["limits"].get(model, {}))
     if settings["kind"] == "gemini":
         return GeminiClient(settings["api_key"], model, budget=budget)
     return OpenAICompatibleClient(settings["api_key"], model, settings["base_url"], budget=budget,
