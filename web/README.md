@@ -22,7 +22,7 @@ npm run dev                     # http://localhost:5173
 | --- | --- |
 | `VITE_API_URL` | Where the API runs, e.g. `http://localhost:8000` |
 | `VITE_SUPABASE_URL` | Supabase project URL |
-| `VITE_SUPABASE_ANON_KEY` | Supabase anon key (public by design; row-level security protects the data) |
+| `VITE_SUPABASE_ANON_KEY` | Supabase publishable key, `sb_publishable_...` (public by design; row-level security protects the data). Never the secret key |
 
 Other scripts: `npm run lint` (ESLint), `npm run build` (production build in `dist/`), `npm run preview` (serve that build).
 

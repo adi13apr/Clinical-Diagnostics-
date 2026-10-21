@@ -15,7 +15,10 @@ pip install -r requirements.txt    # app only (what Streamlit Cloud installs)
 pip install -r requirements-dev.txt  # + API deps + pytest
 streamlit run app.py
 uvicorn api.main:create_app --factory --port 8000   # FastAPI backend; docs at /docs
-docker build -t clinical-api .     # API image for a Hugging Face Docker Space (port 7860)
+docker build -t clinical-api .     # API image (port 7860); see "Deployment"
+.\scripts\serve_local_api.ps1      # PowerShell: API container + Cloudflare quick tunnel; updates Vercel if the URL changed
+.\scripts\deploy_space.ps1 -Space <user>/<space> -DockerTest   # clean snapshot, build, check /health (-Push deploys to HF)
+python scripts/smoke_test.py       # live API check; needs API_URL and SUPABASE_ACCESS_TOKEN
 pytest                             # no Supabase, dataset or GPU needed
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
@@ -23,6 +26,7 @@ python -m evals.run --live --resume  # continue the live eval (real model + LLM;
 python -m evals.benchmark --simulated  # old (sync) vs new (async) runner with fake-latency clients
 cd web && npm install && npm run dev   # React UI on :5173 (needs web/.env.local and the API)
 cd web && npm run lint && npm run build
+cd web && npx vercel deploy --prod   # React app to Vercel (project clinical-diagnostics)
 ```
 
 CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`. A second job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
@@ -97,6 +101,11 @@ config/
 scripts/
   calibrate.py              Fits the temperature on the notebook's val split, reports on its test split
   failure_case.py           Renders docs/failure_case_gradcam.png (Grad-CAM of a misclassified test image)
+  deploy_space.ps1          HF Docker Space deploy: history-free snapshot, Space README, *.pth in LFS, -DockerTest, -Push
+  serve_local_api.ps1       API on this PC: container + cloudflared quick tunnel + Vercel VITE_API_URL update
+  smoke_test.py             PASS/FAIL per endpoint against a deployed API (API_URL, SUPABASE_ACCESS_TOKEN)
+  smoke_xray.jpg            13 KB test-split X-ray for the smoke test (Kermany et al., CC BY 4.0)
+deploy/space/README.md      README for the HF Space only (front matter sdk: docker, app_port: 7860)
 docs/
   failure_case_gradcam.png  README figure: pneumonia X-ray called Normal (50.15%, referred), attention on borders
 splits/
@@ -333,7 +342,7 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **Tracing:** same span names as the dashboard. `/predict` makes the trace (`prediction` → `preprocess`/`classify`/`calibrate`, `log_prediction`), and `/gradcam` and `/report` add to the same `trace_id`. Sinks are local JSONL plus `SupabaseTraceStore(user db)`; sink errors become a response warning.
 - **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
 - **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
-- **Deploy (Hugging Face Docker Space):** set `SUPABASE_URL`, `SUPABASE_KEY`, optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY` and `MAX_UPLOAD_MB` as Space secrets. The Space README needs `sdk: docker` and `app_port: 7860`. The `.pth` (>10 MB) needs Git LFS on the Space repo.
+- **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `MAX_UPLOAD_MB`.
 
 ## Web UI (`web/`)
 
@@ -348,6 +357,24 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **Charts:** class colours are `--chart-normal/-pneumonia/-tuberculosis`, validated for colour-blind separation in both themes (TB is a raspberry red, because the red/amber pair failed in dark mode). Light Normal/Pneumonia are under 3:1 contrast, so every chart has a legend and a table view (`ChartCard`). Recharts gets colours through `useCssVars`, which watches the `<html>` class, because SVG attributes don't resolve `var()` reliably.
 - **Layout:** `AppShell` shows a bottom tab bar under `md`, an icon rail at `md`, and the full sidebar at `lg`. History, Analytics and Traces are lazy routes; the auth route has a `HydrateFallback`.
 - **Referral wording:** the banner and PDF use `referralReason()`, not the API's `referral_message` (a terse status string). When calibration is missing, everything is referred even above 0.9, and the text says so.
+
+## Deployment
+
+| Part | Host | Update |
+| --- | --- | --- |
+| Streamlit app | Streamlit Community Cloud, `main`, `app.py` | push to `main`. A module whose signature changed may stay cached after the pull (a `TypeError` from the old class): **Manage app → Reboot** |
+| React app | Vercel project `clinical-diagnostics` (account adi13apr, Hobby), https://clinical-diagnostics.vercel.app | `cd web; npx vercel deploy --prod` (deploys the local folder; not connected to Git) |
+| API | Docker `clinical-api` container on the owner's PC + `cloudflared` quick tunnel (`D:\tools\cloudflared`) | `.\scripts\serve_local_api.ps1` (`-Rebuild` for code changes) |
+| Supabase | migrations `sql/001`-`005` applied | new numbered SQL file, run before deploying dependent code |
+
+- **Why not a cloud API host:** the API peaks at ~660 MB RSS (436 MB after model load; measured in the image). Free 512 MB tiers (Render, Koyeb) are too small; HF Docker Spaces need PRO (2026); Leapcell's free tier is serverless only (multi-instance breaks the in-memory UploadStore) and its sign-up failed; Tailscale Funnel couldn't log in (its service only tried IPv6, which this network doesn't route). Cloud Run (card required) or HF PRO are the realistic upgrades; `deploy_space.ps1` is ready for HF.
+- **Keys:** all apps use the Supabase **publishable** key (`sb_publishable_...`). Legacy anon/service_role keys are disabled: a service_role key was committed in `744ea86` (public history) and was the app's `[supabase] key` until 2026-10-20. Never use the secret key in an app.
+- **Vercel env vars** (`VITE_API_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`) are baked in at build time. **Windows PowerShell can prepend a UTF-8 BOM when piping to a native command:** a BOM ended up inside all three values, `fetch()` refused the apikey header (non-Latin-1 character), and Google sign-in silently dropped back to /login (the PKCE code was never exchanged). Set values from Git Bash with `printf '%s' "$v" | npx vercel env add ...`, or set `$OutputEncoding = New-Object System.Text.UTF8Encoding $false` first (as `serve_local_api.ps1` does). To check a deploy, count `\ufeff` in the served JS: it must be 0.
+- `web/.vercelignore` keeps `.env*` out of uploads; `vercel link` also writes `VERCEL_OIDC_TOKEN` into `web/.env.local` (gitignored, not `VITE_`-prefixed, so never bundled).
+- **Supabase Redirect URLs:** Streamlit, `https://clinical-diagnostics.vercel.app/**` and the localhost URLs. The Site URL stays on Streamlit (the React app always passes `redirectTo`). Google OAuth needs no change: Google returns to Supabase's `/auth/v1/callback`, and Supabase forwards to the app.
+- **CORS:** the container gets `FRONTEND_URL=https://clinical-diagnostics.vercel.app`; other origins get 400 on preflight.
+- **PowerShell scripts** must run on Windows PowerShell 5.1: ASCII only, and native commands are judged by `$LASTEXITCODE` with `$ErrorActionPreference` relaxed around them (5.1 turns git/docker stderr into errors). `docker info` exits 0 even when the engine answers 500, so check `docker version --format "{{.Server.Version}}"`.
+- `auth.flow_state` (SQL Editor) shows each OAuth attempt: "code issued, never exchanged" means the browser didn't call `/token?grant_type=pkce`.
 
 ## Conventions
 
@@ -376,7 +403,7 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - History PDF downloads use made-up probabilities (0.33/0.33/0.34).
 - Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
 - API: uploads and the report cache live in one process's memory. A restart loses uploads (404 → predict again), and more than one replica would need shared storage. `REPORT_CACHE` is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).
-- API: the Docker image hasn't been built yet (Docker daemon unavailable when it was written).
+- API hosting: it runs on the owner's PC behind a Cloudflare quick tunnel, so the React app works only while that PC is on, and the tunnel URL changes on restart (`serve_local_api.ps1` re-points Vercel). Needs a real host (HF PRO, Cloud Run, ...) to be always on.
 - Web UI: History's search box filters only the loaded page (the API has no text search); class, triage and date filters are server-side.
-- Web UI: no automated frontend tests yet; CI runs lint and build only. It was checked by hand in Edge (light, dark, phone, tablet, keyboard) against the real model with faked login. It isn't deployed yet.
+- Web UI: no automated frontend tests yet; CI runs lint and build only. It was checked by hand in Edge (light, dark, phone, tablet, keyboard) against the real model with faked login, and deployed on Vercel (Google and email sign-in confirmed on a phone, 2026-10-21).
 - `use_container_width` is deprecated in current Streamlit (warning says removal after 2025-12-31), and requirements are unpinned.

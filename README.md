@@ -4,7 +4,15 @@ A Streamlit app that classifies chest X-rays as **Normal**, **Pneumonia** or **T
 
 > **Not a medical device.** This is a research/portfolio project. Its output is a screening aid, not a diagnosis.
 
-**Live demo:** [clinical-diagnosis.streamlit.app](https://clinical-diagnosis.streamlit.app/). The demo is deployed from `main`, so features added on a branch appear only after merging, setting the secrets, and running the SQL migrations.
+**Live:**
+
+| What | URL | Hosting |
+| --- | --- | --- |
+| Streamlit app | [clinical-diagnosis.streamlit.app](https://clinical-diagnosis.streamlit.app/) | Streamlit Community Cloud, deployed from `main` |
+| React app | [clinical-diagnostics.vercel.app](https://clinical-diagnostics.vercel.app/) | Vercel |
+| API (FastAPI) | `https://<random>.trycloudflare.com/docs` | The author's PC, behind a Cloudflare quick tunnel ([why](#deployment)) |
+
+The React app works only while that PC is on: the API isn't on a cloud host yet, and its tunnel URL changes when it restarts. The Streamlit app runs on its own and is always available. See [Deployment](#deployment).
 
 ## How it works
 
@@ -105,7 +113,7 @@ streamlit run app.py
 ```toml
 [supabase]
 url = "..."
-key = "..."        # anon key
+key = "..."        # publishable key (sb_publishable_...), never the secret/service_role key
 redirect_url = "https://clinical-diagnosis.streamlit.app/"   # where Google sign-in returns (local: http://localhost:8501/)
 
 [groq]             # optional: without it, reports use the template
@@ -157,13 +165,13 @@ Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment var
 
 | Variable | Meaning |
 | --- | --- |
-| `SUPABASE_URL`, `SUPABASE_KEY` | Project URL and anon key (required) |
+| `SUPABASE_URL`, `SUPABASE_KEY` | Project URL and publishable key (required) |
 | `SUPABASE_JWT_SECRET` | Only for projects still on the legacy HS256 JWT secret. Without it, those tokens are checked by asking Supabase (one extra request each) |
 | `FRONTEND_URL` | Deployed React app's origin(s), comma-separated. `localhost` on any port is always allowed |
 | `GROQ_API_KEY` | Optional. Without it, reports use the template |
 | `MAX_UPLOAD_MB` | Default 10 |
 
-**Hugging Face Spaces:** create a Docker Space and push this repo to it. The Space's `README.md` needs `sdk: docker` and `app_port: 7860` in its front matter. Set the variables above as Space secrets. The checkpoint is over 10 MB, so the Space repo has to store `*.pth` with Git LFS.
+Hosting options for the API are in [Deployment](#deployment).
 
 ## React UI (`web/`)
 
@@ -178,6 +186,60 @@ A browser front end for the API, in plain JavaScript: Vite, React, Tailwind, sha
 cd web && cp .env.example .env.local   # set VITE_API_URL, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
 npm install && npm run dev             # http://localhost:5173 (needs the API running)
 ```
+
+## Deployment
+
+| Part | Where | How it updates |
+| --- | --- | --- |
+| Streamlit app | Streamlit Community Cloud | Push to `main`; it redeploys by itself. Secrets live in the app's **Settings → Secrets** (`[supabase] url, key, redirect_url`, `[groq] api_key`) |
+| React app (`web/`) | Vercel, project `clinical-diagnostics` | `cd web; npx vercel deploy --prod`. Settings are in `web/vercel.json`; env vars `VITE_API_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` are set in Vercel |
+| API (`api/`) | Docker on the author's PC + Cloudflare quick tunnel | `.\scripts\serve_local_api.ps1` (below) |
+| Database and auth | Supabase | Run new `sql/` files in the SQL Editor before deploying code that needs them |
+
+**Keys.** Every app uses Supabase's **publishable** key. It's public by design, and row-level security protects the data. Never put the secret or service_role key in an app: it skips row-level security. The legacy keys are disabled. A service_role key that was committed in the first commit has been rotated, so it no longer works.
+
+**Sign-in redirects.** Supabase → Authentication → URL Configuration → Redirect URLs holds `https://clinical-diagnosis.streamlit.app/**`, `https://clinical-diagnostics.vercel.app/**`, and the localhost URLs. The Site URL stays on the Streamlit app. The React app always passes its own address as `redirectTo`, so the Google OAuth client needs no change: Google returns to Supabase's callback, and Supabase forwards to the app.
+
+### The API host
+
+The API needs about 700 MB of memory (436 MB after loading the model, about 660 MB at peak with Grad-CAM). That rules out the 512 MB free tiers (Render, Koyeb), and Hugging Face Docker Spaces now need a PRO plan. For now it runs on a PC:
+
+```powershell
+# After a reboot or an API change (Docker Desktop must be running; Vercel CLI logged in)
+.\scripts\serve_local_api.ps1            # add -Rebuild to rebuild the image from main first
+```
+
+The script:
+- starts the `clinical-api` container (localhost only, restarted by Docker Desktop);
+- restarts the tunnel and checks `/health` through it;
+- if the tunnel URL changed, updates `VITE_API_URL` on Vercel and redeploys the React app.
+
+**The free tunnel's URL changes every time it starts, and the API is offline whenever the PC sleeps.**
+
+**To move it to Hugging Face** (with PRO), build a clean snapshot and push it:
+
+```powershell
+.\scripts\deploy_space.ps1 -Space <hf-user>/clinical-diagnostics-api -DockerTest   # build + check /health locally
+.\scripts\deploy_space.ps1 -Space <hf-user>/clinical-diagnostics-api -Push         # deploy
+```
+
+The snapshot is needed because GitHub's history holds the 16 MB checkpoint as a plain file, and Hugging Face rejects that. It contains only what the image needs, with no history: it uses `deploy/space/README.md` (front matter `sdk: docker`, `app_port: 7860`), and the checkpoint is stored in Git LFS. Set `SUPABASE_URL`, `SUPABASE_KEY` (publishable), `GROQ_API_KEY` and `FRONTEND_URL` as Space secrets, then point `VITE_API_URL` at `https://<hf-user>-clinical-diagnostics-api.hf.space`. A free Space sleeps when idle, so the first request after a pause is slow.
+
+### Checking a deployment
+
+```powershell
+$env:API_URL = "https://<api-host>"
+$env:SUPABASE_ACCESS_TOKEN = "<token>"      # see below
+python scripts/smoke_test.py               # PASS/FAIL for /health, /predict, Grad-CAM map, report, history, trace
+```
+
+To get the token, sign in to the React app on a computer, open the browser's developer console (F12), and run:
+
+```js
+copy(JSON.parse(localStorage.getItem(Object.keys(localStorage).find(k => k.endsWith("-auth-token")))).access_token)
+```
+
+That puts the token on the clipboard. In PowerShell, `$env:SUPABASE_ACCESS_TOKEN = Get-Clipboard` sets it. It expires after about an hour; never paste it anywhere public.
 
 ## License
 
