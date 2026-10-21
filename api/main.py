@@ -24,14 +24,16 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, UnidentifiedImageError
 
-from agent.agent import REPORT_CACHE, build_llm_client, generate_report_for_image
+from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client, generate_report_for_image
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
 from api.schemas import (
     AnalyticsResponse, DailyVolume, GradcamMapResponse, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
     PipelineSummary, PredictResponse, ReportResponse, SpanOut, TraceResponse,
 )
 from api.settings import LOCALHOST_ORIGIN_REGEX, Settings
-from api.state import SerializedModel, UploadStore
+from api.state import (
+    RedisUploadStore, SerializedModel, StoreUnavailable, UploadStore, connect_redis, redis_location,
+)
 from services.calibration import REFER_MESSAGE, REFER_THRESHOLD, STATUS_REFER
 from services.prediction_handler import PredictionService
 from services.tracing import SupabaseTraceStore, finish_trace, make_tracer, summarize_spans, trace_span
@@ -58,10 +60,15 @@ def configure_logging():
 
 
 def create_app(settings=None, model_service=None, verifier=None, db_factory=None, llm_factory=None,
-               report_cache=REPORT_CACHE, uploads=None):
-    """Build the app. Tests inject fakes; by default everything comes from Settings.from_env()."""
+               report_cache=None, uploads=None):
+    """Build the app. Tests inject fakes; by default everything comes from Settings.from_env().
+
+    Uploads and the report cache live in Redis when settings.redis_url is set (shared by every replica),
+    else in this process's memory (REPORT_CACHE is the one the Streamlit app uses too).
+    """
     configure_logging()
     settings = settings or Settings.from_env()
+    uploads, report_cache, redis_client = shared_state(settings, uploads, report_cache)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -77,6 +84,10 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
                      settings.supabase_url_source or "settings")
             if settings.check_keys_on_startup and hasattr(verifier, "check_keys"):
                 await asyncio.to_thread(verifier.check_keys)
+        if redis_client is None:
+            log.info("Uploads and the report cache are kept in this process's memory (REDIS_URL not set)")
+        else:
+            await asyncio.to_thread(check_redis, redis_client)
         yield
         app.state.report_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -91,7 +102,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         user_db_factory(settings.supabase_url, settings.supabase_key) if settings.supabase_url else None)
     app.state.llm_factory = llm_factory or build_llm_client
     app.state.report_cache = report_cache
-    app.state.uploads = uploads or UploadStore(settings.upload_ttl_s, settings.upload_max_items)
+    app.state.uploads = uploads
     app.state.report_pool = ThreadPoolExecutor(REPORT_WORKERS, thread_name_prefix="report")
 
     @app.middleware("http")
@@ -147,8 +158,8 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
     Db = Annotated[object, Depends(user_db)]
     Model = Annotated[object, Depends(model)]
 
-    def find_upload(request, trace_id, user):
-        upload = request.app.state.uploads.get(str(trace_id), user.id)
+    async def find_upload(request, trace_id, user):
+        upload = await use_uploads(request.app.state.uploads.get, str(trace_id), user.id)
         if upload is None:
             # Same answer for "never existed", "expired" and "someone else's"
             raise HTTPException(404, "Upload not found or expired; run /predict again")
@@ -177,7 +188,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         tracer = make_tracer(SupabaseTraceStore(db), trace_id=trace_id)
         result, inference_ms, warnings = await asyncio.to_thread(
             predict_and_log, model, PredictionService(db), image, tracer, trace_id)
-        request.app.state.uploads.put(trace_id, user.id, data, result)
+        await use_uploads(request.app.state.uploads.put, trace_id, user.id, data, result)
         return PredictResponse(
             trace_id=trace_id, predicted_class=result["diagnosis"], confidence=result["confidence"],
             probabilities=result["probabilities"], status=result["status"],
@@ -189,27 +200,29 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
     @app.get("/gradcam/{trace_id}", response_class=Response,
              responses={200: {"content": {"image/png": {}}, "description": "Grad-CAM figure (PNG)"}})
     async def gradcam(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
-        upload = find_upload(request, trace_id, user)
+        upload = await find_upload(request, trace_id, user)
         if upload.heatmap_png is None:
             tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
             upload.heatmap_png = await asyncio.to_thread(render_heatmap, model, upload, tracer)
+            await use_uploads(request.app.state.uploads.save_heatmap, str(trace_id), upload.heatmap_png)
         return Response(upload.heatmap_png, media_type="image/png",
                         headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/gradcam/{trace_id}/map", response_model=GradcamMapResponse)
     async def gradcam_map(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
         """The raw map, so a client can draw its own overlay (e.g. with an opacity slider)."""
-        upload = find_upload(request, trace_id, user)
+        upload = await find_upload(request, trace_id, user)
         if upload.cam_map is None:
             tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
             upload.cam_map = await asyncio.to_thread(compute_cam_map, model, upload, tracer)
+            await use_uploads(request.app.state.uploads.save_cam_map, str(trace_id), upload.cam_map)
         cam, regions = upload.cam_map
         return GradcamMapResponse(trace_id=str(trace_id), explained_class=upload.prediction["diagnosis"],
                                   cam=cam, regions=regions)
 
     @app.post("/report/{trace_id}", response_model=ReportResponse)
     async def report(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
-        upload = find_upload(request, trace_id, user)
+        upload = await find_upload(request, trace_id, user)
         state = request.app.state
         tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))  # same trace as the prediction
         loop = asyncio.get_running_loop()
@@ -269,6 +282,43 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
 
 
 # ---- Helpers (plain functions; the blocking ones run in worker threads) ----
+
+def shared_state(settings, uploads=None, report_cache=None):
+    """(uploads, report_cache, redis client or None). Injected stores win; else Redis if REDIS_URL is set."""
+    client = None
+    if settings.redis_url and (uploads is None or report_cache is None):
+        client = connect_redis(settings.redis_url)
+    if uploads is None:
+        uploads = (RedisUploadStore(client, settings.upload_ttl_s, settings.upload_max_items) if client
+                   else UploadStore(settings.upload_ttl_s, settings.upload_max_items))
+    if report_cache is None:
+        report_cache = RedisReportCache(client, on_error=log_cache_error) if client else REPORT_CACHE
+    return uploads, report_cache, client
+
+
+def check_redis(client):
+    """One PING at startup. A failure is logged, not fatal: requests get 503 until Redis is back."""
+    try:
+        client.ping()
+        log.info("Uploads and the report cache are shared through Redis at %s", redis_location(client))
+        return True
+    except Exception as e:
+        log.error("Redis at %s is unreachable (%s: %s); uploads will answer 503 until it is back",
+                  redis_location(client), type(e).__name__, e)
+        return False
+
+
+def log_cache_error(operation, error):
+    log.warning("Report cache %s failed (%s); treated as a miss", operation, type(error).__name__)
+
+
+async def use_uploads(method, *args):
+    """Call an upload store method off the event loop (Redis is network I/O); 503 if Redis is down."""
+    try:
+        return await asyncio.to_thread(method, *args)
+    except StoreUnavailable as e:
+        raise HTTPException(503, str(e))
+
 
 def too_large(max_bytes):
     return f"File too large (limit {max_bytes / 1024 / 1024:g} MB)"

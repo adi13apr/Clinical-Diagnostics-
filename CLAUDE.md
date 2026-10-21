@@ -60,11 +60,12 @@ app.py                      Entry point: builds services, routes login vs dashbo
 api/                        FastAPI backend for the React UI (see "API"); reuses services/ and agent/
   main.py                   create_app(...) factory: endpoints, CORS, upload checks, blocking work in threads
   auth.py                   SupabaseJWTVerifier (JWKS / HS256 secret / ask Supabase), user_db_factory (PostgREST as the user)
-  state.py                  UploadStore (in-memory uploads by trace_id, per owner) + SerializedModel (one model call at a time)
+  state.py                  UploadStore (in memory) / RedisUploadStore (shared via REDIS_URL): uploads by trace_id, per owner;
+                            SerializedModel (one model call at a time)
   schemas.py                Pydantic request/response models
   settings.py               Settings.from_env(): env vars, else .streamlit/secrets.toml [supabase]
 Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
-requirements-api.txt        requirements.txt + fastapi, uvicorn, python-multipart, PyJWT[crypto]
+requirements-api.txt        requirements.txt + fastapi, uvicorn, python-multipart, PyJWT[crypto], redis
 web/                        React UI (plain JSX) for the API; see "Web UI" and web/README.md
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
   model_handler.py          CLAHETransform, StudentEfficientNet, ModelService (load + calibrated predict + heatmap)
@@ -177,6 +178,9 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `rejected` holds the exact text of every LLM output the guard rejected; save real ones to `tests/fixtures/` as regression tests.
   - `reason` is short and user-facing. The raw provider error goes in `error_detail` and is never shown in the UI.
 - **Cache:** `REPORT_CACHE` is a process-wide, thread-safe LRU of 256 entries, keyed by (SHA-256 of the decoded pixels + mode + size, temperature, model name).
+  - The Streamlit app always uses it. The API uses `RedisReportCache` instead when `REDIS_URL` is set (same `get`/`put`, TTL 24 h, key `cdp:report:v1:{fingerprint}:{temperature!r}:{model}`).
+  - Redis values are JSON (`report_result_to_json`: every `ReportResult` field, the `Report` via `model_dump`), never pickle. Reading re-validates the `Report`; a value that doesn't parse, or any Redis error, is a miss reported to `on_error` (the API logs it). Bump `RedisReportCache.VERSION` when the format changes.
+  - `agent/agent.py` never imports `redis` (the client is passed in), so the Streamlit app needs no Redis package; `tests/test_shared_state.py` checks this.
   - Only `source == "llm"` results are cached. Fallbacks are free to rebuild, and caching one would block a later Gemini attempt.
   - Hits return `cached=True` with `steps=0`.
 - **Providers** (`config/llm.json`, `build_llm_client(role)`): `groq` (default) uses `OpenAICompatibleClient` (Chat Completions + tools, `openai` SDK with `max_retries=0`). `gemini` uses `GeminiClient`. `LLM_PROVIDER` overrides the config. Keys come from `st.secrets[section]["api_key"]` or the env var named in the config.
@@ -335,14 +339,19 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
   - **Never fall back to local `traces/` JSONL in the API.** It holds every user's spans. `/analytics` returns `pipeline: null` plus a warning instead; `/traces` returns 404.
   - `diagnosis_history` is not used by the API. `/history` reads `predictions`, which has no patient names.
 - **Uploads:** content type must be `image/jpeg`/`image/png` **and** Pillow must decode JPEG/PNG (else 415); empty → 400; over `max_upload_bytes` → 413 (early from `Content-Length` in middleware, exact after reading); over 40M pixels → 413. CORS is added last so it's outermost (the early 413 still gets CORS headers).
-- **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG (`heatmap_png`) and the raw map (`cam_map`: 7×7 values rounded to 4 dp, plus `summarize_cam_regions`) are cached on the entry.
-- **`/gradcam/{id}/map`** exists for the web UI's overlay and opacity slider: it returns the predicted class's map from `compute_gradcam` (one `gradcam` span with `output=map`). Clients must stretch it over the whole image, because the model saw the image resized to a square. It is one process only, like `PendingOAuthStore`.
+- **UploadStore:** the validated bytes plus the prediction, keyed by `trace_id`, owned by the uploader. It lives in memory only (never on disk, matching the privacy page), with TTL 1 h and at most 100 items. `get()` returns None for "unknown", "expired" and "another user's" alike, so all three are 404. The Grad-CAM PNG (`heatmap_png`) and the raw map (`cam_map`: 7×7 values rounded to 4 dp, plus `summarize_cam_regions`) are cached with the upload through `save_heatmap` / `save_cam_map`. **Never cache by setting attributes on the returned `Upload`**: with Redis it's a copy.
+- **Shared state (`REDIS_URL`, env or `[redis] url` in secrets.toml):** `shared_state()` in `api/main.py` picks `RedisUploadStore` + `RedisReportCache` (one client, `connect_redis`, 2 s connect / 5 s timeouts); without it, `UploadStore` + `REPORT_CACHE` as before. Stores injected into `create_app` always win.
+  - Keys: `cdp:upload:{trace_id}` (hash: `user_id`, `data` raw bytes, `prediction` JSON, `created`; `PEXPIRE` ttl in the same MULTI), `cdp:upload:{trace_id}:heatmap` (PNG bytes) and `:cam` (JSON `{cam, regions}`), both written with `PX` = the upload's remaining `PTTL`, so a late save can't revive an expired upload; `cdp:uploads` (sorted set trace_id → created) enforces `max_items` across replicas and gives `len()`.
+  - All store calls run in `asyncio.to_thread` (`use_uploads`). `redis.RedisError` becomes `StoreUnavailable` → **503**; there is no fallback to memory (it would give random 404s across replicas). Report-cache errors are only logged. Startup sends one `PING` and logs `host:port/db` (never the URL: it can hold a password); a failure doesn't stop the API.
+  - **Redis must run without persistence** (`save ""`, `appendonly no`), or the X-rays reach Redis's disk and the "never on disk" claim is false. Use `rediss://` with a password for a remote Redis.
+  - Tests use fakeredis (`tests/conftest.py`: `backend` param, `make_redis`, `make_upload_store`, `report_cache`; `redis_clock` moves fakeredis's expiry clock by patching `fakeredis._socket._base.time`). Every endpoint test runs on both backends.
+- **`/gradcam/{id}/map`** exists for the web UI's overlay and opacity slider: it returns the predicted class's map from `compute_gradcam` (one `gradcam` span with `output=map`). Clients must stretch it over the whole image, because the model saw the image resized to a square. Without `REDIS_URL` it is one process only, like `PendingOAuthStore`.
 - **Threads:** PyTorch, Grad-CAM, image decoding and Supabase calls run in `asyncio.to_thread`. Reports run `generate_report_for_image` (the same cache, guard and fallback as the app) on a separate 4-thread pool (`REPORT_WORKERS`), because one report can wait about 60 s on Groq's limit and must not starve the default pool. `tests/test_api.py::test_prediction_does_not_block_the_event_loop` fails if model work runs on the loop.
 - **SerializedModel:** wraps `ModelService` with one lock around `predict`, `generate_heatmap` and `compute_gradcam`. Grad-CAM hooks the shared network, so a concurrent forward pass would corrupt its activations. Always pass the wrapper (not the raw service) to `generate_report_for_image`, because its `get_gradcam` tool runs the model too.
 - **Tracing:** same span names as the dashboard. `/predict` makes the trace (`prediction` → `preprocess`/`classify`/`calibrate`, `log_prediction`), and `/gradcam` and `/report` add to the same `trace_id`. Sinks are local JSONL plus `SupabaseTraceStore(user db)`; sink errors become a response warning.
 - **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
 - **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
-- **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `MAX_UPLOAD_MB`.
+- **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `MAX_UPLOAD_MB`, `REDIS_URL` (needed for more than one replica).
 
 ## Web UI (`web/`)
 
@@ -402,7 +411,7 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - The batch tab still marks a row "Error" if the history save fails, even though the prediction and log succeeded.
 - History PDF downloads use made-up probabilities (0.33/0.33/0.34).
 - Google sign-in opens in a new browser tab (`st.link_button`), so the user is signed in there; the original tab stays on the login page.
-- API: uploads and the report cache live in one process's memory. A restart loses uploads (404 → predict again), and more than one replica would need shared storage. `REPORT_CACHE` is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).
+- API: without `REDIS_URL`, uploads and the report cache live in one process's memory, so a restart loses uploads (404 → predict again) and replicas can't share them. With Redis, a Redis restart does the same. The Redis path is tested with fakeredis and was checked by hand against a local Redis 7.4, but has not run in a deployment. The `max_items` cap can be off by one briefly when replicas write at once, and `/gradcam/{id}/map` reads the whole image from Redis even when the map is cached. The report cache is keyed by image, not user, so two users uploading the identical image share one LLM report (it contains no patient data).
 - API hosting: it runs on the owner's PC behind a Cloudflare quick tunnel, so the React app works only while that PC is on, and the tunnel URL changes on restart (`serve_local_api.ps1` re-points Vercel). Needs a real host (HF PRO, Cloud Run, ...) to be always on.
 - Web UI: History's search box filters only the loaded page (the API has no text search); class, triage and date filters are server-side.
 - Web UI: no automated frontend tests yet; CI runs lint and build only. It was checked by hand in Edge (light, dark, phone, tablet, keyboard) against the real model with faked login, and deployed on Vercel (Google and email sign-in confirmed on a phone, 2026-10-21).

@@ -11,7 +11,7 @@ from pypdf import PdfReader
 
 from agent.agent import (
     CLINICIAN_FOLLOW_UP, MAX_STEPS, SYSTEM_PROMPT, GeminiClient, LLMTurn, MockLLMClient, RateLimitError,
-    ReportCache, ToolCall, asserts_confirmed_diagnosis, check_grounding, fallback_report, generate_report,
+    ToolCall, asserts_confirmed_diagnosis, check_grounding, fallback_report, generate_report,
     generate_report_for_image, parse_report, retry_delay_seconds,
 )
 from agent.schema import DISCLAIMER, Report
@@ -473,12 +473,12 @@ def stub_gradcam(monkeypatch):
     monkeypatch.setattr(ReportTools, "get_gradcam", lambda self: GRADCAM)
 
 
-def test_repeat_request_uses_cache(make_service, calibration_file, stub_gradcam):
+def test_repeat_request_uses_cache(make_service, calibration_file, stub_gradcam, report_cache):
     service = make_service(CONFIDENT[0], calibration_file(CONFIDENT[1]))
     image = Image.new("L", (64, 64), 128)
     truth = ReportTools(service, image).run_classifier()
     llm = MockLLMClient([MockLLMClient.final(report_json(truth))])  # enough for ONE report
-    cache = ReportCache()
+    cache = report_cache
 
     first = generate_report_for_image(service, image, llm=llm, cache=cache)
     second = generate_report_for_image(service, image.copy(), llm=llm, cache=cache)  # same pixels, new object
@@ -486,8 +486,8 @@ def test_repeat_request_uses_cache(make_service, calibration_file, stub_gradcam)
     assert second.cached and second.report == first.report and len(llm.calls) == 1
 
 
-def test_cache_key_includes_temperature_and_image(make_service, calibration_file, stub_gradcam):
-    cache = ReportCache()
+def test_cache_key_includes_temperature_and_image(make_service, calibration_file, stub_gradcam, report_cache):
+    cache = report_cache
     for temperature, pixel in [(1.0, 128), (0.5, 128), (1.0, 129)]:  # base, new T, new image
         service = make_service(CONFIDENT[0], calibration_file(temperature))
         image = Image.new("L", (64, 64), pixel)
@@ -498,9 +498,9 @@ def test_cache_key_includes_temperature_and_image(make_service, calibration_file
     assert len(cache) == 3
 
 
-def test_fallback_reports_are_not_cached(make_service, calibration_file, stub_gradcam):
+def test_fallback_reports_are_not_cached(make_service, calibration_file, stub_gradcam, report_cache):
     service = make_service(CONFIDENT[0], calibration_file(CONFIDENT[1]))
-    cache = ReportCache()
+    cache = report_cache
 
     def rate_limited(messages):
         raise RateLimitError(30)

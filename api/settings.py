@@ -18,7 +18,8 @@ log = logging.getLogger(__name__)
 class Settings:
     def __init__(self, supabase_url=None, supabase_key=None, jwt_secret=None, frontend_urls=(),
                  max_upload_bytes=DEFAULT_MAX_UPLOAD_MB * 1024 * 1024, model_path=DEFAULT_MODEL_PATH,
-                 upload_ttl_s=3600, upload_max_items=100, supabase_url_source=None, check_keys_on_startup=False):
+                 upload_ttl_s=3600, upload_max_items=100, supabase_url_source=None, check_keys_on_startup=False,
+                 redis_url=None):
         self.supabase_url = supabase_url.rstrip("/") if supabase_url else None
         self.supabase_key = supabase_key            # anon key; RLS does the access control
         self.jwt_secret = jwt_secret                # only for legacy HS256 projects
@@ -29,14 +30,16 @@ class Settings:
         self.upload_max_items = upload_max_items
         self.supabase_url_source = supabase_url_source  # where the URL came from, for the startup log
         self.check_keys_on_startup = check_keys_on_startup  # fetch the JWKS once at startup (off in tests)
+        self.redis_url = redis_url or None          # set: uploads and the report cache live in Redis (shared)
 
     @classmethod
     def from_env(cls, environ=None, secrets_path=SECRETS_PATH):
         env = os.environ if environ is None else environ
-        supabase = {}
+        secrets = {}
         if Path(secrets_path).exists():
             with open(secrets_path, "rb") as f:
-                supabase = tomllib.load(f).get("supabase", {})
+                secrets = tomllib.load(f)
+        supabase = secrets.get("supabase", {})
 
         def get(env_name, secret_key):
             return env.get(env_name) or supabase.get(secret_key)
@@ -59,4 +62,5 @@ class Settings:
             frontend_urls=[u.strip() for u in frontend.split(",")],
             max_upload_bytes=float(env.get("MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * 1024 * 1024,
             model_path=env.get("MODEL_PATH") or DEFAULT_MODEL_PATH,
+            redis_url=env.get("REDIS_URL") or secrets.get("redis", {}).get("url"),
         )

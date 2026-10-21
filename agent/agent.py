@@ -501,7 +501,7 @@ class ReportResult:
     rejected: List[dict] = field(default_factory=list)  # exact LLM outputs the guard rejected, for audit/tests
     error_detail: Optional[str] = None  # full LLM error text (not shown to users)
     error_kind: Optional[str] = None    # classify_llm_error(): rate_limit / infrastructure / model
-    cached: bool = False                 # served from REPORT_CACHE, no LLM requests spent
+    cached: bool = False                 # served from the report cache, no LLM requests spent
 
     def source_line(self):
         """One line saying who wrote the report, for the UI and PDF (the fallback reason is UI-only)."""
@@ -835,6 +835,60 @@ class ReportCache:
 
 
 REPORT_CACHE = ReportCache()
+REDIS_REPORT_TTL_S = 24 * 3600
+
+
+def report_result_to_json(result):
+    """ReportResult as JSON text: every dataclass field, the Report via its Pydantic dump (no pickle)."""
+    data = {f.name: getattr(result, f.name) for f in dataclasses.fields(result)}
+    data["report"] = result.report.model_dump(mode="json")
+    return json.dumps(data)
+
+
+def report_result_from_json(text):
+    """Inverse of report_result_to_json; the Report is validated against the schema again."""
+    data = json.loads(text)
+    data["report"] = Report.model_validate(data["report"])
+    return ReportResult(**data)
+
+
+class RedisReportCache:
+    """ReportCache shared between API replicas through Redis: same get/put, entries expire after ttl_s.
+
+    Key: {prefix}report:v1:{image fingerprint}:{temperature}:{model}; value: report_result_to_json().
+    A value that no longer parses (old format, corrupt) is a miss, and so is a Redis error: the cache
+    only saves LLM requests, so the report is written anyway. on_error(operation, exc) hears about both.
+    """
+
+    VERSION = "v1"  # bump when the stored format changes
+
+    def __init__(self, client, ttl_s=REDIS_REPORT_TTL_S, prefix="cdp:", on_error=None):
+        self.client, self.ttl_s, self.prefix, self.on_error = client, ttl_s, prefix, on_error
+
+    def key(self, key):
+        fingerprint, temperature, model = key
+        return f"{self.prefix}report:{self.VERSION}:{fingerprint}:{float(temperature)!r}:{model}"
+
+    def get(self, key):
+        try:
+            raw = self.client.get(self.key(key))
+            return None if raw is None else report_result_from_json(raw)
+        except Exception as e:  # redis.RedisError, or a value that doesn't parse (agent/ doesn't import redis)
+            self._failed("get", e)
+            return None
+
+    def put(self, key, value):
+        try:
+            self.client.set(self.key(key), report_result_to_json(value), px=int(self.ttl_s * 1000))
+        except Exception as e:
+            self._failed("put", e)
+
+    def _failed(self, operation, error):
+        if self.on_error is not None:
+            self.on_error(operation, error)
+
+    def __len__(self):
+        return sum(1 for _ in self.client.scan_iter(match=f"{self.prefix}report:{self.VERSION}:*"))
 
 
 def image_fingerprint(image):

@@ -20,11 +20,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from agent.agent import MockLLMClient, ReportCache
+from agent.agent import REPORT_CACHE, MockLLMClient, RedisReportCache, ReportCache
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier
-from api.main import create_app, daily_volume
+from api.main import check_redis, create_app, daily_volume, shared_state
 from api.settings import Settings
-from api.state import SerializedModel, UploadStore
+from api.state import RedisUploadStore, SerializedModel, UploadStore, connect_redis, redis_location
 from services.calibration import REFER_MESSAGE
 from services.model_handler import ModelService
 from services.tracing import trace_span
@@ -195,13 +195,19 @@ def store():
 
 
 @pytest.fixture
-def make_client(model_service, store, tmp_path, monkeypatch):
+def make_client(model_service, store, tmp_path, monkeypatch, backend, make_redis):
+    """Every endpoint test runs twice: uploads and report cache in memory, and in (fake) Redis."""
     monkeypatch.setattr("services.tracing.TRACE_DIR", tmp_path / "traces")
 
     def make(llm=None, **settings):
         settings = Settings(supabase_url=SUPABASE_URL, supabase_key="anon", jwt_secret=SECRET, **settings)
+        if backend == "memory":
+            uploads, cache = UploadStore(settings.upload_ttl_s, settings.upload_max_items), ReportCache()
+        else:
+            uploads = RedisUploadStore(make_redis(), settings.upload_ttl_s, settings.upload_max_items)
+            cache = RedisReportCache(make_redis())
         app = create_app(settings, model_service=model_service, db_factory=store.factory,
-                         llm_factory=llm or (lambda: None), report_cache=ReportCache())
+                         llm_factory=llm or (lambda: None), report_cache=cache, uploads=uploads)
         return TestClient(app)
     return make
 
@@ -659,16 +665,106 @@ def test_cors(make_client, origin, allowed):
 
 # ---- State and settings ----
 
-def test_upload_store_expires_evicts_and_checks_owner():
-    now = [0.0]
-    uploads = UploadStore(ttl_s=10, max_items=2, clock=lambda: now[0])
+def test_upload_store_expires_evicts_and_checks_owner(make_upload_store, redis_clock):
+    uploads = make_upload_store(ttl_s=10, max_items=2)
     uploads.put("a", ALICE, b"1", {})
     assert uploads.get("a", ALICE) is not None and uploads.get("a", BOB) is None
     uploads.put("b", ALICE, b"2", {})
     uploads.put("c", ALICE, b"3", {})
     assert uploads.get("a", ALICE) is None and len(uploads) == 2  # oldest evicted
-    now[0] = 11
+    redis_clock[0] += 11
     assert uploads.get("b", ALICE) is None and len(uploads) == 0
+
+
+def redis_replicas(model_service, store, make_redis, llm_factory=lambda: None):
+    """Two apps (replicas) whose uploads and report cache share one fake Redis."""
+    def app():
+        settings = Settings(supabase_url=SUPABASE_URL, supabase_key="anon", jwt_secret=SECRET)
+        return TestClient(create_app(settings, model_service=model_service, db_factory=store.factory,
+                                     llm_factory=llm_factory, uploads=RedisUploadStore(make_redis()),
+                                     report_cache=RedisReportCache(make_redis())))
+    return app(), app()
+
+
+def test_replicas_share_uploads_gradcam_and_reports_through_redis(model_service, store, make_redis, tmp_path,
+                                                                 monkeypatch):
+    monkeypatch.setattr("services.tracing.TRACE_DIR", tmp_path)
+    llms = []
+
+    def llm_factory():
+        llms.append(MockLLMClient(report_script(truth)))
+        return llms[-1]
+
+    a, b = redis_replicas(model_service, store, make_redis, llm_factory)
+    truth = predict(a)
+    trace_id = truth["trace_id"]
+
+    assert b.get(f"/gradcam/{trace_id}", headers=auth()).status_code == 200
+    assert a.get(f"/gradcam/{trace_id}", headers=auth()).status_code == 200
+    assert model_service.heatmap_calls == 1  # A used the PNG that B rendered
+
+    calls = []
+    original = model_service.compute_gradcam
+    model_service.compute_gradcam = lambda *args, **kw: calls.append(args[1]) or original(*args, **kw)
+    first_map = a.get(f"/gradcam/{trace_id}/map", headers=auth()).json()
+    assert b.get(f"/gradcam/{trace_id}/map", headers=auth()).json() == first_map and calls == ["Normal"]
+
+    first = a.post(f"/report/{trace_id}", headers=auth()).json()
+    second = b.post(f"/report/{trace_id}", headers=auth()).json()
+    assert first["source"] == "llm" and not first["cached"]
+    assert second["cached"] and second["report"] == first["report"] and len(llms[1].calls) == 0
+
+    for client in (a, b):  # Bob can't reach Alice's upload on either replica
+        assert client.get(f"/gradcam/{trace_id}", headers=auth(BOB)).status_code == 404
+        assert client.get(f"/gradcam/{trace_id}/map", headers=auth(BOB)).status_code == 404
+        assert client.post(f"/report/{trace_id}", headers=auth(BOB)).status_code == 404
+
+
+def test_redis_down_is_503_not_a_crash(model_service, store, make_redis, redis_server, tmp_path, monkeypatch):
+    monkeypatch.setattr("services.tracing.TRACE_DIR", tmp_path)
+    a, _ = redis_replicas(model_service, store, make_redis)
+    trace_id = predict(a)["trace_id"]
+    redis_server.connected = False
+    res = a.post("/predict", files=upload(), headers=auth())
+    assert res.status_code == 503 and "Shared upload store unavailable" in res.json()["detail"]
+    assert a.get(f"/gradcam/{trace_id}", headers=auth()).status_code == 503
+    assert a.post(f"/report/{trace_id}", headers=auth()).status_code == 503
+
+
+def test_backend_comes_from_redis_url():
+    memory = Settings(supabase_url=SUPABASE_URL)
+    uploads, cache, client = shared_state(memory)
+    assert type(uploads) is UploadStore and cache is REPORT_CACHE and client is None
+
+    redis_settings = Settings(supabase_url=SUPABASE_URL, redis_url="redis://:pw@redis.internal:6380/2")
+    uploads, cache, client = shared_state(redis_settings)  # redis-py connects lazily: no network here
+    assert isinstance(uploads, RedisUploadStore) and isinstance(cache, RedisReportCache)
+    assert uploads.client is client and cache.client is client
+
+    injected = UploadStore()  # empty, so falsy: must still be used
+    uploads, cache, client = shared_state(redis_settings, uploads=injected, report_cache=ReportCache())
+    assert uploads is injected and type(cache) is ReportCache and client is None
+
+
+def test_redis_url_from_env_or_secrets(tmp_path):
+    secrets = tmp_path / "secrets.toml"
+    secrets.write_text('[supabase]\nurl = "https://s.supabase.co"\n[redis]\nurl = "redis://file:6379/0"\n',
+                       encoding="utf-8")
+    assert Settings.from_env({}, secrets).redis_url == "redis://file:6379/0"
+    assert Settings.from_env({"REDIS_URL": "rediss://env:6380/1"}, secrets).redis_url == "rediss://env:6380/1"
+    assert Settings.from_env({}, tmp_path / "none.toml").redis_url is None
+
+
+def test_redis_startup_check_logs_location_but_never_the_password(redis_server, caplog):
+    client = connect_redis("redis://:s3cret-pw@redis.internal:6380/2")
+    assert redis_location(client) == "redis.internal:6380/2"
+    import fakeredis
+    fake = fakeredis.FakeRedis(server=redis_server)
+    fake.connection_pool.connection_kwargs.update(host="redis.internal", password="s3cret-pw")
+    redis_server.connected = False
+    with caplog.at_level(logging.INFO, logger="api.main"):
+        assert check_redis(fake) is False
+    assert "unreachable" in caplog.text and "s3cret-pw" not in caplog.text
 
 
 def test_serialized_model_runs_one_call_at_a_time():

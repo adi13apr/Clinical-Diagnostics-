@@ -6,7 +6,7 @@ import pytest
 from google.genai import types
 from PIL import Image
 
-from agent.agent import GeminiClient, LLMTurn, MockLLMClient, ReportCache, generate_report, generate_report_for_image
+from agent.agent import GeminiClient, LLMTurn, MockLLMClient, generate_report, generate_report_for_image
 from agent.tools import ReportTools
 from services.prediction_handler import PredictionService
 from services.tracing import (
@@ -271,12 +271,12 @@ def test_llm_error_records_error_type(tools_and_truth):
     assert by_name(tracer, "fallback_used")[0].attributes["used"] is True
 
 
-def test_cache_hit_is_traced(make_service, calibration_file, monkeypatch):
+def test_cache_hit_is_traced(make_service, calibration_file, monkeypatch, report_cache):
     monkeypatch.setattr(ReportTools, "get_gradcam", lambda self: {"peak_region": None})
     service = make_service(CONFIDENT[0], calibration_file(CONFIDENT[1]))
     image = Image.new("L", (64, 64), 128)
     truth = ReportTools(service, image).run_classifier()
-    cache, llm = ReportCache(), MockLLMClient([MockLLMClient.final(valid_report(truth))])
+    cache, llm = report_cache, MockLLMClient([MockLLMClient.final(valid_report(truth))])
     generate_report_for_image(service, image, llm=llm, cache=cache)
     tracer = Tracer()
     generate_report_for_image(service, image, llm=llm, cache=cache, tracer=tracer)
