@@ -2,4 +2,5 @@
 pytest
 pypdf
 pytest-asyncio
+fakeredis
 httpx
