@@ -1,0 +1,6 @@
+# Never upload local env files or build output; Vercel builds from source with its own env vars
+.env
+.env.*
+node_modules
+dist
+.vercel
