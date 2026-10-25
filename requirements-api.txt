@@ -5,3 +5,4 @@ uvicorn[standard]
 python-multipart
 PyJWT[crypto]
 redis
+rq                      # report job queue (worker/report_worker.py); used only with REDIS_URL

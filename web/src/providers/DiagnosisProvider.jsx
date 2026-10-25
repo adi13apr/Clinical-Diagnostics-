@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useCreateReport, usePredict } from "@/hooks/queries";
+import { useCreateReport, usePredict, useReportJob } from "@/hooks/queries";
 import { DiagnosisContext, useAuth } from "@/providers/contexts";
 
 /**
  * Holds the Diagnose page's state above the router, so a result (or a report that takes a minute)
  * survives a visit to History and back. The image stays in this browser tab as an object URL.
+ *
+ * A report is a job: the POST returns it queued (polled here until done or failed), or already done when
+ * the server writes reports itself.
  */
 export function DiagnosisProvider({ children }) {
   const { user } = useAuth();
@@ -52,6 +55,27 @@ export function DiagnosisProvider({ children }) {
   const traceId = predictMutation.data?.trace_id;
   const generateReport = useCallback(() => traceId && runReport(traceId), [traceId, runReport]);
 
+  const started = reportMutation.data; // ReportJob from the POST
+  const pollId = started?.job_id && !started.result && started.status !== "failed" ? started.job_id : null;
+  const jobQuery = useReportJob(pollId);
+  const job = pollId ? (jobQuery.data ?? started) : started;
+  const reportStatus = reportMutation.isPending ? "submitting" : (job?.status ?? null);
+  const reportFailure = job?.status === "failed" ? job.error : null;
+  const reportError = useMemo(() => {
+    if (reportMutation.error) return reportMutation.error;
+    if (jobQuery.error) {
+      return jobQuery.error.status === 404
+        ? new Error("The report request expired on the server. Please try again.")
+        : jobQuery.error;
+    }
+    if (job?.status === "failed") return new Error(reportFailure || "The report could not be written.");
+    return null;
+  }, [reportMutation.error, jobQuery.error, job?.status, reportFailure]);
+  const report = job?.status === "done" ? job.result : null;
+  const waiting = reportStatus === "submitting" || reportStatus === "queued" || reportStatus === "running";
+  // "done" without a result: finished on the server, and the poll that fetches it is on its way
+  const reporting = !reportError && (waiting || (reportStatus === "done" && !report));
+
   const value = useMemo(
     () => ({
       file,
@@ -59,9 +83,11 @@ export function DiagnosisProvider({ children }) {
       prediction: predictMutation.data ?? null,
       predicting: predictMutation.isPending,
       predictError: predictMutation.error,
-      report: reportMutation.data ?? null,
-      reporting: reportMutation.isPending,
-      reportError: reportMutation.error,
+      report,
+      reporting,
+      reportStatus,
+      reportStartedAt: reportMutation.submittedAt || null,
+      reportError,
       opacity,
       setOpacity,
       patientName,
@@ -77,9 +103,11 @@ export function DiagnosisProvider({ children }) {
       predictMutation.data,
       predictMutation.isPending,
       predictMutation.error,
-      reportMutation.data,
-      reportMutation.isPending,
-      reportMutation.error,
+      report,
+      reporting,
+      reportStatus,
+      reportMutation.submittedAt,
+      reportError,
       opacity,
       patientName,
       analyze,

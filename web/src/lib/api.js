@@ -22,6 +22,8 @@ export const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000")
  * @property {number|null} temperature
  * @property {boolean} auth_configured
  * @property {boolean} llm_configured False: reports use the fixed template.
+ * @property {"inline"|"queue"} report_mode "queue": reports are written by worker processes (REDIS_URL set).
+ * @property {number|null} report_workers Workers listening for report jobs; null in inline mode.
  */
 
 /**
@@ -68,6 +70,18 @@ export const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000")
  * @property {string} source_line Who wrote the report, for display.
  * @property {string|null} reason Why the template was used (user-facing).
  * @property {boolean} cached
+ */
+
+/**
+ * @typedef {"queued" | "running" | "done" | "failed"} ReportJobStatus
+ *
+ * @typedef {object} ReportJob
+ * @property {string|null} job_id Poll getReportJob() with it. Null when the server wrote the report during
+ *   the request (no REDIS_URL): status is then "done" and result is already set.
+ * @property {string} trace_id
+ * @property {ReportJobStatus} status
+ * @property {ReportResult|null} result The report, when status is "done".
+ * @property {string|null} error Why the report failed (user-facing), when status is "failed".
  * @property {string[]} warnings
  */
 
@@ -233,14 +247,30 @@ export function getGradcamFigure(traceId, { signal } = {}) {
 }
 
 /**
- * Plain-language AI report for a prediction. Can take up to a minute on the LLM's free tier.
- * The server checks it against the classifier and falls back to a fixed template if needed.
+ * Start a plain-language AI report for a prediction. The server checks it against the classifier and falls
+ * back to a fixed template if needed.
+ *
+ * With a report worker (the server has REDIS_URL) this returns at once with a queued job: poll
+ * getReportJob() until it's "done" or "failed". Asking again while that job is queued or running returns
+ * the same job. Without a worker the server writes the report during the request (up to a minute on the
+ * LLM's free tier) and returns it as a finished job with no job_id.
  * @param {string} traceId From predict().
  * @param {{signal?: AbortSignal}} [options]
- * @returns {Promise<ReportResult>}
+ * @returns {Promise<ReportJob>}
  */
 export function createReport(traceId, { signal } = {}) {
   return request(`/report/${encodeURIComponent(traceId)}`, { method: "POST", signal });
+}
+
+/**
+ * Status of a report job, with the report once it's done. Only the user who started it can read it (404
+ * otherwise, and for expired jobs).
+ * @param {string} jobId From createReport().
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<ReportJob>}
+ */
+export function getReportJob(jobId, { signal } = {}) {
+  return request(`/report/jobs/${encodeURIComponent(jobId)}`, { signal });
 }
 
 /**

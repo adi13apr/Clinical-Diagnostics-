@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Download, FileText, Info, Loader2, RotateCw, Sparkles } from "lucide-react";
-import { useState } from "react";
+import { Check, Download, FileText, Info, Loader2, RotateCw, Sparkles, TriangleAlert } from "lucide-react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -61,13 +61,89 @@ function ReportBody({ result }) {
   );
 }
 
-function ReportSkeleton() {
+/** Whole seconds since `since` (ms timestamp), updated every second. Starts at 0 when mounted. */
+function useElapsedSeconds(since) {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    if (!since) return undefined;
+    const id = setInterval(() => setSeconds(Math.max(0, Math.floor((Date.now() - since) / 1000))), 1000);
+    return () => clearInterval(id);
+  }, [since]);
+  return seconds;
+}
+
+function formatElapsed(seconds) {
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+const STEPS = [
+  { key: "queued", label: "Queued" },
+  { key: "running", label: "Writing" },
+  { key: "done", label: "Checked" },
+];
+
+/** Queued -> Writing -> Checked, for reports written by a worker. */
+function JobSteps({ status }) {
+  const current = STEPS.findIndex((step) => step.key === (status === "done" ? "done" : status));
   return (
-    <div className="space-y-4" role="status" aria-label="Writing the report">
-      <p className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-        Writing the report. On the free LLM tier this can take up to a minute; you can visit other pages meanwhile.
-      </p>
+    <ol className="flex items-center gap-2 text-xs" aria-label="Report progress">
+      {STEPS.map((step, i) => {
+        const state = i < current ? "complete" : i === current ? "current" : "upcoming";
+        return (
+          <li key={step.key} className="flex items-center gap-2" aria-current={state === "current" ? "step" : undefined}>
+            {i > 0 && <span className="h-px w-5 bg-border" aria-hidden="true" />}
+            <span
+              className={
+                state === "upcoming"
+                  ? "flex items-center gap-1 text-muted-foreground"
+                  : "flex items-center gap-1 font-medium text-foreground"
+              }
+            >
+              {state === "complete" ? (
+                <Check className="size-3.5 text-primary" aria-hidden="true" />
+              ) : state === "current" ? (
+                <Loader2 className="size-3.5 animate-spin text-primary" aria-hidden="true" />
+              ) : (
+                <span className="size-1.5 rounded-full bg-muted-foreground/50" aria-hidden="true" />
+              )}
+              {step.label}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function progressText(status, inline, workers) {
+  if (status === "queued") {
+    return workers === 0
+      ? "Waiting for a report worker. None is running on the server right now; the request waits up to 10 minutes."
+      : "Waiting for a report worker.";
+  }
+  if (status === "submitting" && !inline) return "Sending the request.";
+  return "Writing the report.";
+}
+
+function ReportProgress({ status, startedAt, inline, workers }) {
+  const elapsed = useElapsedSeconds(startedAt);
+  const queued = status === "queued" || status === "running" || status === "done";
+  return (
+    <div className="space-y-4">
+      {queued && <JobSteps status={status} />}
+      <div className="flex items-start justify-between gap-3 text-sm text-muted-foreground">
+        <p className="flex items-start gap-2" role="status">
+          <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin" aria-hidden="true" />
+          <span>
+            {progressText(status, inline, workers)} On the free LLM tier this can take up to a minute; you can visit
+            other pages meanwhile.
+          </span>
+        </p>
+        {/* Outside the live region, so screen readers aren't told every second */}
+        <span className="shrink-0 tabular-nums" aria-label={`${elapsed} seconds elapsed`}>
+          {formatElapsed(elapsed)}
+        </span>
+      </div>
       <Skeleton className="h-4 w-11/12" />
       <Skeleton className="h-4 w-10/12" />
       <Skeleton className="h-16 w-full rounded-xl" />
@@ -79,8 +155,19 @@ function ReportSkeleton() {
 
 /** AI report (generated on request) and the PDF download, which works with or without it. */
 export function ReportPanel() {
-  const { prediction, report, reporting, reportError, generateReport, previewUrl, opacity, patientName, setPatientName } =
-    useDiagnosis();
+  const {
+    prediction,
+    report,
+    reporting,
+    reportStatus,
+    reportStartedAt,
+    reportError,
+    generateReport,
+    previewUrl,
+    opacity,
+    patientName,
+    setPatientName,
+  } = useDiagnosis();
   const health = useHealth();
   const map = useGradcamMap(prediction?.trace_id);
   const [exporting, setExporting] = useState(false);
@@ -114,12 +201,25 @@ export function ReportPanel() {
       <CardContent className="space-y-6">
         <AnimatePresence mode="wait">
           {reporting ? (
-            <ReportSkeleton key="loading" />
+            <ReportProgress
+              key="loading"
+              status={reportStatus}
+              startedAt={reportStartedAt}
+              inline={health.data?.report_mode === "inline"}
+              workers={health.data?.report_workers}
+            />
           ) : report ? (
             <ReportBody key="report" result={report} />
           ) : reportError ? (
             <div key="error" role="alert" className="space-y-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm">
-              <p>Couldn&apos;t write the report: {reportError.message}</p>
+              <p className="flex items-center gap-2 font-medium">
+                <TriangleAlert className="size-4 shrink-0 text-destructive" aria-hidden="true" />
+                Couldn&apos;t write the report
+              </p>
+              <p>{reportError.message}</p>
+              <p className="text-xs text-muted-foreground">
+                The classifier&apos;s result above is unaffected, and the PDF works without the report.
+              </p>
               <Button size="sm" variant="outline" onClick={generateReport}>
                 <RotateCw aria-hidden="true" /> Try again
               </Button>

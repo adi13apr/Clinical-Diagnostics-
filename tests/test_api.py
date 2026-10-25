@@ -55,6 +55,7 @@ class FakeQuery:
     def __init__(self, db, table):
         self.db, self.table = db, table
         self.filters, self.insert_rows, self.order_by, self.window, self.counted = [], None, None, None, False
+        self.conflict = None
 
     def select(self, *columns, count=None):
         self.counted = count is not None
@@ -63,6 +64,11 @@ class FakeQuery:
     def insert(self, data):
         self.insert_rows = data if isinstance(data, list) else [data]
         return self
+
+    def upsert(self, data, on_conflict="", ignore_duplicates=False):
+        assert ignore_duplicates and on_conflict  # the only upsert the services send (ON CONFLICT DO NOTHING)
+        self.conflict = on_conflict.split(",")
+        return self.insert(data)
 
     def eq(self, column, value):
         self.filters.append(lambda r: r.get(column) == value)
@@ -93,7 +99,12 @@ class FakeQuery:
         if self.table in store.failing:
             raise RuntimeError(f"{self.table} unavailable")
         if self.insert_rows is not None:
-            rows = [store.insert(self.table, self.db.user_id, row) for row in self.insert_rows]
+            rows = []
+            for row in self.insert_rows:
+                key = self.conflict and tuple(row[c] for c in self.conflict)
+                if key and any(tuple(r[c] for c in self.conflict) == key for r in store.tables.get(self.table, [])):
+                    continue  # unique index (sql/006): an existing span is skipped
+                rows.append(store.insert(self.table, self.db.user_id, row))
             return SimpleNamespace(data=rows, count=None)
         if self.table == "prediction_daily_summary":
             rows = store.daily_summary(self.db.user_id)
@@ -229,14 +240,15 @@ def predict(client, data=BRIGHT, user=ALICE):
 def test_health_needs_no_login(client):
     body = client.get("/health").json()
     assert body == {"status": "ok", "model_loaded": True, "calibrated": True, "temperature": 0.5,
-                    "auth_configured": True, "llm_configured": False}
+                    "auth_configured": True, "llm_configured": False, "report_mode": "inline",
+                    "report_workers": None}
 
 
 # ---- Auth ----
 
 TRACE = str(uuid.uuid4())
 PROTECTED = [("post", "/predict"), ("get", f"/gradcam/{TRACE}"), ("get", f"/gradcam/{TRACE}/map"),
-             ("post", f"/report/{TRACE}"),
+             ("post", f"/report/{TRACE}"), ("get", f"/report/jobs/{TRACE}"),
              ("get", "/history"), ("get", "/analytics"), ("get", f"/traces/{TRACE}")]
 
 
@@ -533,8 +545,10 @@ def report_script(truth):
 def test_report_without_llm_key_uses_the_template(client):
     truth = predict(client, DARK)
     res = client.post(f"/report/{truth['trace_id']}", headers=auth())
-    assert res.status_code == 200
-    body = res.json()
+    assert res.status_code == 200  # no REDIS_URL: written during the request, no job to poll
+    job = res.json()
+    assert job["job_id"] is None and job["status"] == "done" and job["error"] is None
+    body = job["result"]
     assert body["source"] == "fallback" and body["reason"].startswith("No LLM configured")
     assert body["report"]["predicted_class"] == "Tuberculosis" and body["report"]["status"] == "refer"
     assert "clinician review" in body["report"]["recommendation"].lower()
@@ -549,10 +563,10 @@ def test_report_by_llm_is_guarded_cached_and_traced(make_client, store):
 
     client = make_client(llm=llm_factory)
     truth = predict(client)
-    first = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()
+    first = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()["result"]
     assert first["source"] == "llm" and first["cached"] is False and first["model"] == "mock"
     assert first["report"]["calibrated_probability"] == round(truth["confidence"], 4)
-    second = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()
+    second = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()["result"]
     assert second["cached"] is True and second["report"] == first["report"]
     assert len(llms[1].calls) == 0  # the cache hit spent no LLM calls
 
@@ -568,7 +582,7 @@ def test_report_guard_rejects_a_wrong_probability(make_client):
 
     client = make_client(llm=llm_factory)
     truth = predict(client)
-    body = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()
+    body = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()["result"]
     assert body["source"] == "fallback"  # same guard and fallback as the Streamlit app
     assert body["report"]["calibrated_probability"] == round(truth["confidence"], 4)
 
@@ -576,6 +590,10 @@ def test_report_guard_rejects_a_wrong_probability(make_client):
 def test_report_is_private_to_the_uploader(client):
     trace_id = predict(client)["trace_id"]
     assert client.post(f"/report/{trace_id}", headers=auth(BOB)).status_code == 404
+
+
+def test_without_redis_there_are_no_report_jobs_to_poll(client):
+    assert client.get(f"/report/jobs/{uuid.uuid4()}", headers=auth()).status_code == 404
 
 
 # ---- /history ----
@@ -710,8 +728,8 @@ def test_replicas_share_uploads_gradcam_and_reports_through_redis(model_service,
     first_map = a.get(f"/gradcam/{trace_id}/map", headers=auth()).json()
     assert b.get(f"/gradcam/{trace_id}/map", headers=auth()).json() == first_map and calls == ["Normal"]
 
-    first = a.post(f"/report/{trace_id}", headers=auth()).json()
-    second = b.post(f"/report/{trace_id}", headers=auth()).json()
+    first = a.post(f"/report/{trace_id}", headers=auth()).json()["result"]
+    second = b.post(f"/report/{trace_id}", headers=auth()).json()["result"]
     assert first["source"] == "llm" and not first["cached"]
     assert second["cached"] and second["report"] == first["report"] and len(llms[1].calls) == 0
 
