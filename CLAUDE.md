@@ -23,6 +23,8 @@ docker build -t clinical-api .     # API image (port 7860); see "Deployment"
 .\scripts\serve_local_api.ps1      # PowerShell: API container + Cloudflare quick tunnel; updates Vercel if the URL changed
 .\scripts\deploy_space.ps1 -Space <user>/<space> -DockerTest   # clean snapshot, build, check /health (-Push deploys to HF)
 python scripts/smoke_test.py       # live API check; needs API_URL and SUPABASE_ACCESS_TOKEN
+pip install -r requirements-mcp.txt   # MCP server (also pulled in by requirements-dev.txt)
+python mcp_server                  # MCP server over stdio (what clients run: venv python + the folder path)
 pytest                             # no Supabase, dataset or GPU needed
 $env:INTEGRATION_REDIS_URL="redis://127.0.0.1:6380/15"; pytest tests/test_integration_redis.py   # real Redis; FLUSHES that DB
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
@@ -34,7 +36,7 @@ cd web && npm run lint && npm run build
 cd web && npx vercel deploy --prod   # React app to Vercel (project clinical-diagnostics)
 ```
 
-CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`. The `integration` job runs `tests/test_integration_redis.py` against a `redis:7` service container (`INTEGRATION_REDIS_URL=redis://localhost:6379/15`; Groq and Supabase still faked). That module skips itself without the variable, so the unit job shows it as skipped. A third job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
+CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt` (which includes `requirements-mcp.txt`), then runs `pytest` (including `tests/test_mcp_server.py`) and `python -m evals.run --replay`. The `integration` job runs `tests/test_integration_redis.py` against a `redis:7` service container (`INTEGRATION_REDIS_URL=redis://localhost:6379/15`; Groq and Supabase still faked). That module skips itself without the variable, so the unit job shows it as skipped. A third job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
 
 The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 
@@ -72,6 +74,12 @@ api/                        FastAPI backend for the React UI (see "API"); reuses
   settings.py               Settings.from_env(): env vars, else .streamlit/secrets.toml [supabase]
   jobs.py                   ReportJobs (RQ queue: submit/get/flush_spans), RedisSpanBuffer, write_report (both modes)
 worker/report_worker.py     RQ job run_report_job + main(): loads the model once, SimpleWorker on queue "reports"
+mcp_server/                 MCP server (stdio, SDK mcp 2.x MCPServer); see "MCP server"
+  server.py                 create_server(...) factory, Clinic (lazy model, recent predictions), tools, resources, main()
+  paths.py                  MCP_ALLOWED_DIRS, resolve_image_path (UNC/device/ADS refused, containment after resolve)
+  schemas.py                Pydantic tool outputs (the SDK publishes them as outputSchema)
+  __main__.py               `python <repo>/mcp_server` from any cwd (swaps the package dir on sys.path for the repo)
+requirements-mcp.txt        requirements.txt + mcp>=2.3,<3
 Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
 docker-compose.yml          redis (no persistence, healthcheck) + api x2 + worker x N (same image) + nginx in front (queue mode)
 deploy/nginx/nginx.conf     Round-robin over the api replicas (Docker DNS, `resolve`); adds X-Upstream-Addr
@@ -81,6 +89,7 @@ web/                        React UI (plain JSX) for the API; see "Web UI" and w
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
   model_handler.py          CLAHETransform, StudentEfficientNet, ModelService (load + calibrated predict + heatmap)
   calibration.py            Temperature loading, apply_temperature, triage, ECE. No Streamlit import.
+  image_validation.py       JPEG/PNG + size + pixel checks (ImageRejected.kind); shared by api/ (→ 400/413/415) and mcp_server/
   tracing.py                Tracer/Span, fail-safe helpers, JSONL + Supabase sinks, nominal cost, summarize_spans
   heatmap_handler.py        GradCAM on the last conv block + HeatmapGenerator (3-panel figure) + summarize_cam_regions
   prediction_handler.py     PredictionService: insert into `predictions`, read `prediction_daily_summary`
@@ -384,6 +393,22 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
 - **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
 - **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `MAX_UPLOAD_MB`, `REDIS_URL` (needed for more than one replica; it also switches reports to the worker queue, so **run at least one worker** with it).
+
+## MCP server (`mcp_server/`)
+
+- **Design (chosen 2026-10-26, option (b)):** in-process on local files. No Supabase at all: no client, no key read (`test_the_server_never_touches_supabase` checks the source and `sys.modules`), so no RLS and nothing in History/Analytics. Option (a), calling the API with the user's Supabase token, was rejected: a stdio server would need a long-lived refresh token or password in a plain-text client config, and the API is only up while the owner's PC and tunnel are.
+- **SDK:** `mcp` 2.x. `FastMCP` was renamed `mcp.server.mcpserver.MCPServer`; `mcp.server.fastmcp` only raises an error. Tests use `mcp.Client(server)` (in memory) and `Client(StdioServerParameters(...))`.
+- **Tools** (`create_server` in `server.py`): `classify_xray`, `gradcam_summary`, `generate_report`, `get_trace`, `eval_summary`. Tool bodies are blocking and run in `anyio.to_thread` via `run_blocking`. The model behind `SerializedModel` (from `api/state.py`) is loaded on the first call, so `initialize`/`tools/list` need no torch work.
+  - Output fields reuse `ReportTools.run_classifier()` (4 dp) and `GRADCAM_CAVEAT`, so they match what the report agent sees.
+  - `generate_report` calls `generate_report_for_image` (process-wide `REPORT_CACHE`, guard, retry, template). It maps `source` "fallback" → **"template"**, and never returns `error_detail`.
+  - **One trace per prediction:** each `classify_xray` is a new trace, remembered by `image_fingerprint` (LRU 100, no pixels or paths). `gradcam_summary`/`generate_report` on the same image add to it, classifying first if the image is new.
+  - `get_trace` reads only `MCP_TRACE_DIR` (default `traces/mcp/`), **never** the app's shared `traces/*.jsonl`.
+  - `eval_summary` accepts only `latest` or `^\d{8}T\d{6}Z$` that exists in `evals/runs/`, and refuses a dataset-hash mismatch.
+- **Resources:** `clinical://condition-info`, `clinical://condition-info/{condition}` (both carry `review_status`: DRAFT), `clinical://evals/latest`.
+- **Errors:** expected problems raise `ToolError` with one plain sentence; the SDK prefixes "Error executing tool X: ". Anything else is logged (stderr, with traceback) and returned as "Internal error (TypeName)".
+- **stdout:** the SDK points fd 1 at stderr while it serves stdio, so stray prints from torch/Streamlit can't corrupt the protocol (the stdio test would fail if they did).
+- **Keys and cwd:** MCP clients start the server in any cwd, where `st.secrets` wouldn't find the repo's file. So `load_llm_key()` copies only the provider section's `api_key` from `<repo>/.streamlit/secrets.toml` into the env (the env wins). Relative image paths resolve against the first allowed directory, never the cwd. Register the server as `<venv python> <repo>\mcp_server`, not `-m`.
+- **No HTTP transport yet** (README TODO): it would need auth, since anyone reaching the port could read the allowed folders.
 
 ## Web UI (`web/`)
 

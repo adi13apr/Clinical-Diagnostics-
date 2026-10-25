@@ -27,7 +27,6 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from PIL import Image, UnidentifiedImageError
 
 from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client
 from agent.rate_limit import BUDGETS, BudgetRegistry
@@ -42,12 +41,13 @@ from api.state import (
     RedisUploadStore, SerializedModel, StoreUnavailable, UploadStore, connect_redis, redis_location,
 )
 from services.calibration import REFER_MESSAGE, REFER_THRESHOLD, STATUS_REFER
+from services import image_validation
+from services.image_validation import ImageRejected, too_large
 from services.prediction_handler import PredictionService
 from services.tracing import SupabaseTraceStore, finish_trace, make_tracer, summarize_spans, trace_span
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
-ALLOWED_FORMATS = {"JPEG", "PNG"}   # what Pillow finds in the bytes, whatever the client claimed
-MAX_IMAGE_PIXELS = 40_000_000       # decompression-bomb guard (a 6000 x 6000 scan is 36M)
+REJECTED_STATUS = {image_validation.NOT_AN_IMAGE: 415, image_validation.TOO_LARGE: 413, image_validation.EMPTY: 400}
 MULTIPART_OVERHEAD = 64 * 1024      # Content-Length allowance for multipart headers and boundaries
 REPORT_WORKERS = 4                  # report threads mostly wait on the LLM; kept off the default pool
 TRACE_READ_LIMIT = 5000             # spans read for /analytics
@@ -374,34 +374,24 @@ async def use_store(method, *args):
         raise HTTPException(503, str(e))
 
 
-def too_large(max_bytes):
-    return f"File too large (limit {max_bytes / 1024 / 1024:g} MB)"
-
-
 async def read_upload(file, max_bytes):
     """The upload's bytes, after the type and size checks (415 / 413)."""
     if (file.content_type or "").lower() not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(415, "Only JPEG and PNG images are accepted")
     data = await file.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise HTTPException(413, too_large(max_bytes))
-    if not data:
-        raise HTTPException(400, "Empty file")
+    try:
+        image_validation.check_size(data, max_bytes)
+    except ImageRejected as e:
+        raise HTTPException(REJECTED_STATUS[e.kind], str(e))
     return data
 
 
 def decode_image(data):
     """Pillow image from validated bytes; 415 if it isn't really a JPEG/PNG, 413 if absurdly large."""
     try:
-        image = Image.open(io.BytesIO(data))
-        if image.format not in ALLOWED_FORMATS:
-            raise HTTPException(415, "Only JPEG and PNG images are accepted")
-        if image.size[0] * image.size[1] > MAX_IMAGE_PIXELS:
-            raise HTTPException(413, "Image has too many pixels")
-        image.load()
-    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
-        raise HTTPException(415, "The file is not a readable JPEG or PNG image")
-    return image
+        return image_validation.decode_image(data)
+    except ImageRejected as e:
+        raise HTTPException(REJECTED_STATUS[e.kind], str(e))
 
 
 def predict_and_log(model, prediction_service, image, tracer, trace_id):
