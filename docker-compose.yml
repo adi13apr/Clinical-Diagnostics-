@@ -1,9 +1,12 @@
-# API + report worker + Redis on one machine (queue mode):
+# API replicas behind nginx + report workers + Redis on one machine (queue mode):
 #
-#   docker compose up --build                     # API on http://127.0.0.1:7860
-#   docker compose up --build --scale worker=2    # two report workers
+#   Copy-Item .env.example .env                     # then fill it in (gitignored; never commit it)
+#   docker compose up --build -d                    # redis, 2 x api, 1 worker, nginx on http://127.0.0.1:${API_PORT}
+#   docker compose up -d --scale worker=3 --no-recreate    # more report workers (api stays at 2)
+#   python scripts/multi_replica_demo.py            # proves shared state and the shared Groq budget
+#   docker compose down
 #
-# Settings come from the shell or a .env file next to this file (gitignored; never commit it):
+# Settings come from the shell or .env next to this file:
 #   SUPABASE_URL, SUPABASE_KEY (publishable key, NEVER the secret/service_role key), FRONTEND_URL, GROQ_API_KEY
 # The worker needs no Supabase settings: the API writes the report's trace as the user (api/jobs.py).
 # Without REDIS_URL the API writes reports itself; `docker run` of the image alone still works that way.
@@ -12,28 +15,61 @@ services:
     image: redis:7-alpine
     # No RDB/AOF: uploaded X-rays must stay in memory only
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # Localhost only, for scripts/multi_replica_demo.py (reads the rate-limit counters and RQ jobs).
+    # 6380, not 6379, so it doesn't clash with a Redis already running on this PC.
+    ports: ["127.0.0.1:${REDIS_PORT:-6380}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   api:
     build: .
     image: clinical-api:compose
-    # Localhost only (put a tunnel or reverse proxy in front); API_PORT=7861 runs next to serve_local_api.ps1
-    ports: ["127.0.0.1:${API_PORT:-7860}:7860"]
+    # No ports: replicas can't share a host port. nginx is the only way in.
+    deploy:
+      replicas: ${API_REPLICAS:-2}
     environment:
       REDIS_URL: redis://redis:6379/0
       SUPABASE_URL: ${SUPABASE_URL:?set SUPABASE_URL}
       SUPABASE_KEY: ${SUPABASE_KEY:?set SUPABASE_KEY}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
       FRONTEND_URL: ${FRONTEND_URL:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
-    depends_on: [redis]
+      SERVED_BY_HEADER: "1"   # X-Served-By: <container hostname> on every response
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 5
+      start_period: 60s   # model load
+    depends_on:
+      redis: {condition: service_healthy}
     restart: unless-stopped
 
   worker:
     build: .
     image: clinical-api:compose
     command: ["python", "-m", "worker.report_worker"]
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
     environment:
       REDIS_URL: redis://redis:6379/0
       GROQ_API_KEY: ${GROQ_API_KEY:-}
-    depends_on: [redis]
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.28-alpine
+    # Round-robin over every api replica (deploy/nginx/nginx.conf); the one port the API is reached on.
+    # Localhost only (put a tunnel or reverse proxy in front); serve_local_api.ps1 already uses 7860,
+    # so .env.example sets API_PORT=7861.
+    ports: ["127.0.0.1:${API_PORT:-7860}:80"]
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api: {condition: service_healthy}
     restart: unless-stopped

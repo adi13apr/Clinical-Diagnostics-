@@ -15,13 +15,16 @@ pip install -r requirements.txt    # app only (what Streamlit Cloud installs)
 pip install -r requirements-dev.txt  # + API deps + pytest
 streamlit run app.py
 uvicorn api.main:create_app --factory --port 8000   # FastAPI backend; docs at /docs
-docker compose up --build          # API + report worker + Redis (queue mode); needs SUPABASE_URL/KEY in the shell or .env
+docker compose up --build -d       # nginx + 2 API replicas + report worker + Redis (queue mode); settings from .env (see .env.example)
+docker compose up -d --scale worker=3 --no-recreate   # more report workers (api stays at API_REPLICAS, default 2)
+python scripts/multi_replica_demo.py --jobs 3   # against the running stack: shared state + shared Groq budget; writes demo_results/
 python -m worker.report_worker     # report worker (Linux/Docker only); needs REDIS_URL
 docker build -t clinical-api .     # API image (port 7860); see "Deployment"
 .\scripts\serve_local_api.ps1      # PowerShell: API container + Cloudflare quick tunnel; updates Vercel if the URL changed
 .\scripts\deploy_space.ps1 -Space <user>/<space> -DockerTest   # clean snapshot, build, check /health (-Push deploys to HF)
 python scripts/smoke_test.py       # live API check; needs API_URL and SUPABASE_ACCESS_TOKEN
 pytest                             # no Supabase, dataset or GPU needed
+$env:INTEGRATION_REDIS_URL="redis://127.0.0.1:6380/15"; pytest tests/test_integration_redis.py   # real Redis; FLUSHES that DB
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
 python -m evals.run --live --resume  # continue the live eval (real model + LLM; needs data/ and a key)
@@ -31,7 +34,7 @@ cd web && npm run lint && npm run build
 cd web && npx vercel deploy --prod   # React app to Vercel (project clinical-diagnostics)
 ```
 
-CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`. A second job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
+CI (`.github/workflows/ci.yml`, on push and PR) installs CPU torch and `requirements-dev.txt`, then runs `pytest` and `python -m evals.run --replay`. The `integration` job runs `tests/test_integration_redis.py` against a `redis:7` service container (`INTEGRATION_REDIS_URL=redis://localhost:6379/15`; Groq and Supabase still faked). That module skips itself without the variable, so the unit job shows it as skipped. A third job (`web`, Node 24) runs `npm ci`, `npm run lint` and `npm run build` in `web/`.
 
 The app needs `.streamlit/secrets.toml` (gitignored; never commit it):
 
@@ -70,7 +73,9 @@ api/                        FastAPI backend for the React UI (see "API"); reuses
   jobs.py                   ReportJobs (RQ queue: submit/get/flush_spans), RedisSpanBuffer, write_report (both modes)
 worker/report_worker.py     RQ job run_report_job + main(): loads the model once, SimpleWorker on queue "reports"
 Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
-docker-compose.yml          redis (no persistence) + api + worker from the same image (queue mode)
+docker-compose.yml          redis (no persistence, healthcheck) + api x2 + worker x N (same image) + nginx in front (queue mode)
+deploy/nginx/nginx.conf     Round-robin over the api replicas (Docker DNS, `resolve`); adds X-Upstream-Addr
+.env.example                Placeholders for .env (gitignored): Supabase, Groq, ports, replica counts, demo login
 requirements-api.txt        requirements.txt + fastapi, uvicorn, python-multipart, PyJWT[crypto], redis, rq
 web/                        React UI (plain JSX) for the API; see "Web UI" and web/README.md
 services/                   Non-UI logic. Each module exposes one class (calibration.py: functions).
@@ -113,6 +118,7 @@ scripts/
   deploy_space.ps1          HF Docker Space deploy: history-free snapshot, Space README, *.pth in LFS, -DockerTest, -Push
   serve_local_api.ps1       API on this PC: container + cloudflared quick tunnel + Vercel VITE_API_URL update
   smoke_test.py             PASS/FAIL per endpoint against a deployed API (API_URL, SUPABASE_ACCESS_TOKEN)
+  multi_replica_demo.py     Against the Compose stack: load balancing, shared uploads/jobs, shared Groq budget
   smoke_xray.jpg            13 KB test-split X-ray for the smoke test (Kermany et al., CC BY 4.0)
 deploy/space/README.md      README for the HF Space only (front matter sdk: docker, app_port: 7860)
 docs/
@@ -401,8 +407,8 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 | Streamlit app | Streamlit Community Cloud, `main`, `app.py` | push to `main`. A module whose signature changed may stay cached after the pull (a `TypeError` from the old class): **Manage app → Reboot** |
 | React app | Vercel project `clinical-diagnostics` (account adi13apr, Hobby), https://clinical-diagnostics.vercel.app | `cd web; npx vercel deploy --prod` (deploys the local folder; not connected to Git) |
 | API | Docker `clinical-api` container on the owner's PC + `cloudflared` quick tunnel (`D:\tools\cloudflared`) | `.\scripts\serve_local_api.ps1` (`-Rebuild` for code changes) |
-| Supabase | migrations `sql/001`-`005` applied; **`006` pending**: run it before merging (Streamlit redeploys on push to `main`) | new numbered SQL file, run before deploying dependent code |
-| Report worker | not deployed; `docker compose up` runs API + worker + Redis on one machine | `serve_local_api.ps1` still runs the single container in inline mode |
+| Supabase | migrations `sql/001`-`006` applied (006 confirmed 2026-10-26: the compose demo's worker spans were upserted and read back through `/traces`) | new numbered SQL file, run before deploying dependent code |
+| Report worker | not deployed; `docker compose up` runs nginx + 2 API replicas + workers + Redis on one machine | `serve_local_api.ps1` still runs the single container in inline mode |
 
 - **Why not a cloud API host:** the API peaks at ~660 MB RSS (436 MB after model load; measured in the image). Free 512 MB tiers (Render, Koyeb) are too small; HF Docker Spaces need PRO (2026); Leapcell's free tier is serverless only (multi-instance breaks the in-memory UploadStore) and its sign-up failed; Tailscale Funnel couldn't log in (its service only tried IPv6, which this network doesn't route). Cloud Run (card required) or HF PRO are the realistic upgrades; `deploy_space.ps1` is ready for HF.
 - **Keys:** all apps use the Supabase **publishable** key (`sb_publishable_...`). Legacy anon/service_role keys are disabled: a service_role key was committed in `744ea86` (public history) and was the app's `[supabase] key` until 2026-10-20. Never use the secret key in an app.
@@ -412,6 +418,17 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **CORS:** the container gets `FRONTEND_URL=https://clinical-diagnostics.vercel.app`; other origins get 400 on preflight.
 - **PowerShell scripts** must run on Windows PowerShell 5.1: ASCII only, and native commands are judged by `$LASTEXITCODE` with `$ErrorActionPreference` relaxed around them (5.1 turns git/docker stderr into errors). `docker info` exits 0 even when the engine answers 500, so check `docker version --format "{{.Server.Version}}"`.
 - `auth.flow_state` (SQL Editor) shows each OAuth attempt: "code issued, never exchanged" means the browser didn't call `/token?grant_type=pkce`.
+
+## Compose stack (multiple replicas)
+
+- **Services:** `redis` (healthcheck; published on `127.0.0.1:${REDIS_PORT:-6380}` for the demo, 6380 so it doesn't clash with a local Redis), `api` (`deploy.replicas: ${API_REPLICAS:-2}`, no host port, healthcheck on `/health` with a 60 s start period), `worker` (`${WORKER_REPLICAS:-1}`, `--scale worker=N`), `nginx` (`nginx:1.28-alpine`, the only published API port, `127.0.0.1:${API_PORT:-7860}`; `.env.example` sets 7861 because `serve_local_api.ps1` uses 7860).
+- **nginx:** `upstream { zone; server api:7860 resolve; }` with Docker's resolver `127.0.0.11 valid=10s`, so scaling `api` is picked up without restarting nginx. Round-robin (the default). `client_max_body_size 11m`, `proxy_read_timeout 300s`, and `X-Upstream-Addr` (replica IP) on every response.
+- **X-Served-By:** `SERVED_BY_HEADER=1` → `Settings.served_by = socket.gethostname()` (the container ID) → a middleware in `create_app` sets the header on every response. Off by default, so the tunnel-served API doesn't expose hostnames. Not added to CORS `expose_headers` (the browser doesn't need it).
+- **Demo (`scripts/multi_replica_demo.py`):** auth from `SUPABASE_ACCESS_TOKEN`, else `DEMO_EMAIL`/`DEMO_PASSWORD` via Supabase's password grant (env first, then `.env`; never printed). It checks: (A) `/health` answered by ≥ 2 replicas; (B) predict on replica A → Grad-CAM map/PNG from another replica, `POST /report` on two replicas → same `job_id`, written by a worker (worker hostname from `rq:job:{id}` → `rq:worker:{name}`); (C) N concurrent reports on pixel-distinct images (random per run, so the 24 h report cache can't answer), while a thread samples `cdp:rate:{model}:requests|tokens` every 0.25 s. Then: peak requests and tokens in any 60 s window vs `config/llm.json`, the `llm_call` spans from `/traces` (tokens, `rate_limit_retries`, `RateLimitError`), and "written by the LLM" with fallback reasons. A check that couldn't run is **SKIP**, never PASS (e.g. this run reserved nothing, or `/traces` unreadable: it needs real Supabase and `sql/006`). Raw numbers go to `demo_results/<UTC>.json` (gitignored); **README numbers come only from those files of a real run.**
+- **Verified on 2026-10-25** with a throwaway project (`-p cdp-verify`, fake Supabase URL, HS256 test secret, so `/traces` was 500 and that check SKIPped): strict alternation between 2 replicas, every shared-state check passed, jobs spread over 3 workers. One run with real Groq: 14 calls, peak 5,483 tokens / 5 requests in 60 s (limit 8,000 / 30), `rate_limit_retries` 0 on every call; **2 of 3 concurrent reports fell back** (`JobTimeoutException`): see Known issues.
+- **Real run, 2026-10-25 21:37 UTC** (`demo_results/20261025T213758Z.json`, real Supabase via a dedicated demo account (`DEMO_EMAIL`/`DEMO_PASSWORD` in the gitignored `.env` only), real Groq; the README's "What we measured" quotes it): 14 PASS, 1 FAIL. 15 calls over 3 workers, peak 5 requests / 5,478 tokens in 60 s, Redis and trace totals both 18,742 tokens, 0 rate-limit retries; 2 of 3 concurrent reports by the LLM, 1 `JobTimeoutException` fallback. An earlier run (`20261025T205804Z`) was cut by Windows Modern Standby (about 35 min): 2 jobs ended `failed` "worker stopped". Run the demo under `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)` (PowerShell `Add-Type` kernel32) so the PC can't sleep mid-run.
+- **Docker Desktop DNS:** in one run every Groq call failed with `APIConnectionError` (`getaddrinfo` EAI_NODATA inside the Compose network; the host resolved fine). Cold-name probes failed 0–8% of lookups with or without `dns_opt: [single-request]` or explicit `dns:` servers, so no setting is in the compose file. The demo shows such failures as fallbacks with the reason.
+- **Docker Desktop pauses:** if the PC sleeps (Modern Standby; check Kernel-Power events 506/507), the VM freezes (no container logs at all), in-flight requests time out, and running jobs come back `failed` (abandoned). That isn't an app bug.
 
 ## Conventions
 
@@ -444,4 +461,5 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - API hosting: it runs on the owner's PC behind a Cloudflare quick tunnel, so the React app works only while that PC is on, and the tunnel URL changes on restart (`serve_local_api.ps1` re-points Vercel). Needs a real host (HF PRO, Cloud Run, ...) to be always on.
 - Web UI: History's search box filters only the loaded page (the API has no text search); class, triage and date filters are server-side.
 - Web UI: no automated frontend tests yet; CI runs lint and build only. It was checked by hand in Edge (light, dark, phone, tablet, keyboard) against the real model with faked login, and deployed on Vercel (Google and email sign-in confirmed on a phone, 2026-10-21).
+- Shared Groq budget under concurrency: each call reserves `prompt chars / 3.5 + max_completion_tokens` (about 3k tokens for gpt-oss) before running, while real calls use about 1.0–1.75k. Only about 2.5 calls fit in 8k tokens/min, so concurrent jobs wait about 60 s per call in the budget, and RQ's `JOB_TIMEOUT_S` (180 s) includes that wait. With 3 workers, 2 of 3 (verification run) and 1 of 3 (real run) concurrent reports timed out and fell back to the template (2026-10-25). Options (not decided): a longer job timeout, a smaller `max_completion_tokens`, or a tighter estimate. Groq returned no 429s.
 - `use_container_width` is deprecated in current Streamlit (warning says removal after 2025-12-31), and requirements are unpinned.

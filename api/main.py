@@ -134,6 +134,13 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
                 return JSONResponse({"detail": too_large(settings.max_upload_bytes)}, status_code=413)
         return await call_next(request)
 
+    if settings.served_by:
+        @app.middleware("http")
+        async def served_by(request, call_next):
+            response = await call_next(request)
+            response.headers["X-Served-By"] = settings.served_by
+            return response
+
     # Added last so it's outermost: every response, including the early 413, gets CORS headers
     app.add_middleware(
         CORSMiddleware,
