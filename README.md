@@ -19,7 +19,7 @@ The React app works only while that PC is on: the API isn't on a cloud host yet,
 1. **Classifier:** an EfficientNet-B0 "student", distilled from DenseNet121 and Swin-T teachers (`notebooks/sta-project-ca2693.ipynb`). Input is 224×224 with CLAHE contrast enhancement.
 2. **Calibration and triage:** raw probabilities are rescaled with a single temperature fitted on the validation split. If the top calibrated probability is below **0.9**, the result is marked **refer: uncertain, clinician review recommended**.
 3. **Grad-CAM:** computed on the last convolutional layer, summarised as the most influential zone of the image.
-4. **Report agent:** an LLM (Groq `openai/gpt-oss-120b` by default) gathers facts through three tools: classifier output, Grad-CAM summary, and vetted condition text.
+4. **Report agent:** an LLM (Groq `openai/gpt-oss-120b` by default) gathers facts through three tools: classifier output, Grad-CAM summary, and the project's fixed condition text (a draft that a clinician hasn't reviewed yet; see [Known limits](#known-limits)).
    - A guard rejects any report whose class, probability or status differs from the classifier, or that claims a confirmed diagnosis.
    - After one retry, a fixed template report is used instead.
    - The LLM never sees the image or patient details, and can't change the prediction.
@@ -238,6 +238,72 @@ A browser front end for the API, in plain JavaScript: Vite, React, Tailwind, sha
 cd web && cp .env.example .env.local   # set VITE_API_URL, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
 npm install && npm run dev             # http://localhost:5173 (needs the API running)
 ```
+
+## MCP server (`mcp_server/`)
+
+The classifier, Grad-CAM and the report agent are also available as an [MCP](https://modelcontextprotocol.io) server, so an MCP client (Claude Code, Claude Desktop, MCP Inspector) can call them as tools. It uses the official Python SDK (`mcp` 2.x, where FastMCP is now called `MCPServer`) over **stdio**.
+
+It runs **in-process on local image files**: it loads the same model, calibration and report agent (cache, guard, one retry, template fallback) as the app. It never connects to Supabase and reads no Supabase key, so its predictions don't appear in the web app's History or Analytics. Its traces go to `traces/mcp/*.jsonl` only (gitignored); they hold class, probability, latency and tokens, but no pixels and no file paths. As in the app, the LLM sees only tool outputs.
+
+| Tool | Returns |
+| --- | --- |
+| `classify_xray(image_path)` | Class, calibrated probabilities (4 dp), `confident`/`refer`, threshold, `trace_id` |
+| `gradcam_summary(image_path)` | Most influential zone (3×2 grid), share per zone, focal/diffuse, border share, the raw 7×7 map |
+| `generate_report(image_path)` | The guarded report, `source` (`llm` or `template`), who wrote it, fallback reason, `cached` |
+| `get_trace(trace_id)` | Every step of one prediction (latency, tokens, guard verdicts), from this server's traces only |
+| `eval_summary(run_id="latest")` | A committed eval run: check pass rates vs the CI baseline, LLM vs template counts, judge means |
+
+Resources: `clinical://condition-info` and `clinical://condition-info/{Normal|Pneumonia|Tuberculosis}` (the condition text the agent uses; **draft, not yet reviewed by a clinician**, which the resource says too), and `clinical://evals/latest` (the newest `evals/results/*.md`).
+
+**Limits on what it opens.** Only `.jpg`/`.jpeg`/`.png` files inside `MCP_ALLOWED_DIRS` (default `<repo>/data`) are opened. Relative paths count from the first allowed folder. Symlinks and `..` are resolved before the check. The bytes must really be JPEG/PNG, within the API's limits (10 MB or `MAX_UPLOAD_MB`, 40M pixels). Network and device paths (`\\server\share`, `\\?\…`) are refused before the filesystem is touched. Errors are one plain sentence; unexpected ones show only the exception type, and details go to the server's log (stderr).
+
+| Variable | Meaning |
+| --- | --- |
+| `MCP_ALLOWED_DIRS` | Folders the tools may read, separated by `;` on Windows (`:` elsewhere). Default `<repo>/data` |
+| `GROQ_API_KEY` | Optional; otherwise `[groq] api_key` from the repo's `.streamlit/secrets.toml`. Without either, reports use the template |
+| `MAX_UPLOAD_MB` | Default 10 |
+| `MCP_TRACE_DIR` | Default `<repo>/traces/mcp` |
+
+```powershell
+pip install -r requirements-mcp.txt
+```
+
+**Claude Code.** Put the server name before `-e`, because `-e` takes several values. `local` scope keeps it in your own `~/.claude.json` for this project:
+
+```powershell
+claude mcp add clinical -s local -e MCP_ALLOWED_DIRS=C:\path\to\Clinical-Diagnostics-\data -- C:\path\to\Clinical-Diagnostics-\venv\Scripts\python.exe C:\path\to\Clinical-Diagnostics-\mcp_server
+claude mcp list        # "clinical: ... - Connected"
+```
+
+In headless mode (`claude -p`), Claude Code doesn't wait for MCP servers by default, and the first turn can start before this server is up (about 3–4 s, mostly importing the SDK). It then has no tools. Set `MCP_CONNECTION_NONBLOCKING=false` for such runs.
+
+Then ask, for example, "Classify `<file under data\>` and write a report". Run it with the folder path (as above), not `python -m mcp_server`: an MCP client starts the server in a directory of its own choosing, and `-m` only finds the package from the repo root.
+
+**Claude Desktop (Windows).** In `%APPDATA%\Claude\claude_desktop_config.json` (Settings → Developer → Edit Config), then restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "clinical": {
+      "command": "C:\\path\\to\\Clinical-Diagnostics-\\venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\Clinical-Diagnostics-\\mcp_server"],
+      "env": { "MCP_ALLOWED_DIRS": "C:\\path\\to\\Clinical-Diagnostics-\\data" }
+    }
+  }
+}
+```
+
+**MCP Inspector** (needs Node.js):
+
+```powershell
+npx @modelcontextprotocol/inspector -e MCP_ALLOWED_DIRS=C:\path\to\Clinical-Diagnostics-\data C:\path\to\Clinical-Diagnostics-\venv\Scripts\python.exe C:\path\to\Clinical-Diagnostics-\mcp_server
+```
+
+It opens a web UI where you can list and call the tools and read the resources. Add `--cli --method tools/list` to print the tool list in the terminal instead.
+
+The first tool call loads the model (a few seconds, about 440 MB of memory). Listing tools doesn't need it. `tests/test_mcp_server.py` checks every tool through the SDK's in-memory client with fake models and LLMs, plus one real stdio run with the real checkpoint. It's part of `pytest` and CI.
+
+> **TODO:** a streamable HTTP transport (for remote clients). It's left out on purpose for now: it would need authentication, because anything that can reach the port could read the allowed folders through the tools.
 
 ## Deployment
 

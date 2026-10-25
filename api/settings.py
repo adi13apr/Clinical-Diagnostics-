@@ -5,13 +5,14 @@ import socket
 import tomllib
 from pathlib import Path
 
+from services.image_validation import DEFAULT_MAX_UPLOAD_MB
+
 REPO = Path(__file__).resolve().parent.parent
 SECRETS_PATH = REPO / ".streamlit" / "secrets.toml"
 DEFAULT_MODEL_PATH = REPO / "best_student_model_aligned_final.pth"
 
 # Any port on localhost / 127.0.0.1 (Vite, CRA, ...). Starlette matches the whole origin.
 LOCALHOST_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
-DEFAULT_MAX_UPLOAD_MB = 10
 
 log = logging.getLogger(__name__)
 

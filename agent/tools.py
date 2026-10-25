@@ -8,6 +8,9 @@ from services.heatmap_handler import summarize_cam_regions
 CONDITION_INFO_PATH = Path(__file__).resolve().parent / "condition_info.json"
 CLASS_NAMES = ["Normal", "Pneumonia", "Tuberculosis"]
 DECIMALS = 4  # probabilities are rounded so the report can copy them exactly
+GRADCAM_CAVEAT = ("Zones are a coarse 3x2 grid over the whole image, not a lung segmentation, and "
+                  "assume a standard PA view. Grad-CAM shows what influenced the model, which "
+                  "may not be clinically relevant anatomy.")
 
 # Provider-neutral declarations (JSON Schema parameters)
 TOOL_DECLARATIONS = [
@@ -77,9 +80,7 @@ class ReportTools:
             self._gradcam = {
                 "explained_class": predicted,
                 **summarize_cam_regions(cam),
-                "caveat": ("Zones are a coarse 3x2 grid over the whole image, not a lung segmentation, and "
-                           "assume a standard PA view. Grad-CAM shows what influenced the model, which "
-                           "may not be clinically relevant anatomy."),
+                "caveat": GRADCAM_CAVEAT,
             }
         return self._gradcam
 
