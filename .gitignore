@@ -5,3 +5,4 @@ data/
 *.pyc
 traces/
 .env
+demo_results/

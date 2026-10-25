@@ -21,3 +21,5 @@ app.py
 web/
 deploy/
 *.zip
+.env.*
+demo_results/

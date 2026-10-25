@@ -161,7 +161,7 @@ Run `sql/001`–`005` in the Supabase SQL Editor before deploying.
   - **One container, no `REDIS_URL` (inline):** `POST /report` writes the report while the request waits and answers `200` with `status: "done"` and the report. Nothing else to run.
   - **With `REDIS_URL` (queue):** `POST /report` answers `202` straight away with a `job_id`, and a separate **report worker** process writes the report. The client polls `GET /report/jobs/{job_id}` (the web app does every 2 s). Asking again for the same prediction while its job is queued or running returns the same job; after a failure it starts a new one. API replicas never wait on the LLM, and workers scale on their own. Jobs keep only ids (no report text, image or token); finished jobs are kept 1 hour, failed ones 24 hours. If a worker dies mid-report, the job turns `failed` within about 4 minutes instead of staying "running".
   - The worker never connects to Supabase and holds no user token or service key. It keeps the report's trace in Redis, and the API saves it to Supabase *as the user* on the poll that sees the job finish (needs `sql/006_traces_unique_span.sql`, so repeated saves can't duplicate spans).
-  - Run the worker with the same image: `docker compose up --build` starts Redis, the API and one worker (`--scale worker=2` for two). RQ workers don't run on Windows, so use Docker there.
+  - Run the worker with the same image: `docker compose up --build` starts Redis, two API replicas behind nginx and one worker (`--scale worker=3` for three; see [Several replicas](#several-replicas-docker-compose)). RQ workers don't run on Windows, so use Docker there.
 
 ```bash
 pip install -r requirements-api.txt
@@ -180,6 +180,50 @@ Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment var
 | `REDIS_URL` | Optional, e.g. `rediss://:password@host:6380/0`. Shares uploads, the report cache and LLM rate limits between replicas, and queues reports for report workers, so **run at least one worker** when it's set (also read from `[redis] url` in `secrets.toml`) |
 
 Hosting options for the API are in [Deployment](#deployment).
+
+## Several replicas (Docker Compose)
+
+`docker-compose.yml` runs the API as separate services on one machine: Redis 7, two API replicas, report workers (scalable), and nginx as a round-robin load balancer on a single port. Every API response carries `X-Served-By` (the replica's container ID), and nginx adds `X-Upstream-Addr`.
+
+```powershell
+Copy-Item .env.example .env; notepad .env               # Supabase URL + publishable key, Groq key, demo login
+docker compose up --build -d                            # redis, 2 x api, 1 worker, nginx on 127.0.0.1:7861
+docker compose up -d --scale worker=3 --no-recreate     # 3 workers; api stays at 2
+python scripts/multi_replica_demo.py --jobs 3           # the measurements below
+docker compose logs -f api                              # or worker, nginx, redis
+docker compose down
+```
+
+`scripts/multi_replica_demo.py` drives the stack through nginx with a real Supabase login, reads Redis directly, and saves the raw numbers to `demo_results/`.
+
+### What we measured
+
+One run on 2026-10-25 (21:37 UTC): Windows 11, Docker Desktop, real Supabase and Groq (`openai/gpt-oss-120b`, limits 30 requests and 8,000 tokens per minute). Every number below comes from that run's output file.
+
+**Load balancing.** Six `/health` calls were answered by both replicas in strict alternation (A, B, A, B, A, B).
+
+**Shared state.**
+- The X-ray was predicted on replica A.
+- The first Grad-CAM map request went to replica B and got `200`: B found A's upload in Redis.
+- The Grad-CAM image took two requests (A, then B), both `200`.
+- `POST /report` on A queued a job. The same request on B returned **the same job id** (by then `running`), so no duplicate was queued.
+- One of the three worker containers wrote the report with the LLM. Six polls were spread over both replicas.
+
+**Shared Groq budget, 3 reports at once** (pixel-different images, so the report cache couldn't answer):
+
+| | Observed | Limit |
+| --- | --- | --- |
+| LLM calls (3 workers, 21:38:02 to 21:41:07 UTC) | 15 | |
+| Most requests in any 60 s | 5 | 30 |
+| Most tokens in any 60 s | 5,478 | 8,000 |
+| Tokens in total: Redis counters / trace spans | 18,742 / 18,742 | |
+| Groq rate-limit errors or retries (429) | 0 | |
+
+- Each worker took one job, and all three jobs ended within 182 s.
+- **Two reports were written by the LLM; one fell back to the template** (`JobTimeoutException`).
+- The cause: before each call the limiter reserves a prompt estimate plus `max_completion_tokens` (2,000), which is more than a call actually uses. So the third job's last call waited in the shared budget until RQ's 180 s job timeout. The budget was never exceeded, but that cost one report. A longer job timeout or a smaller reservation would fix it; neither has been changed yet.
+
+**A worker dying (unplanned).** In an earlier run the PC went into standby during this step, for about 35 minutes. After it woke, 2 of the 3 jobs were marked `failed` with "The report worker stopped before finishing", rather than staying "running". Its budget peaks (5 requests, 5,591 tokens in 60 s) were also within the limits.
 
 ## React UI (`web/`)
 

@@ -32,6 +32,41 @@ jobs:
       - name: Eval replay
         run: python -m evals.run --replay
 
+  # Uploads, report cache, rate-limit Lua scripts and RQ jobs against a real Redis server, with a
+  # real RQ worker. Groq and Supabase are still faked; tests/test_integration_redis.py skips itself
+  # without INTEGRATION_REDIS_URL, so the unit job above is unaffected.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      INTEGRATION_REDIS_URL: redis://localhost:6379/15   # flushed by the tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install CPU-only PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Integration tests (real Redis)
+        run: pytest -q -rs tests/test_integration_redis.py
+
   web:
     runs-on: ubuntu-latest
     timeout-minutes: 15

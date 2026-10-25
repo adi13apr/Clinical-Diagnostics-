@@ -1,6 +1,7 @@
 """API settings: environment variables first (Hugging Face Spaces), then .streamlit/secrets.toml (local dev)."""
 import logging
 import os
+import socket
 import tomllib
 from pathlib import Path
 
@@ -19,7 +20,7 @@ class Settings:
     def __init__(self, supabase_url=None, supabase_key=None, jwt_secret=None, frontend_urls=(),
                  max_upload_bytes=DEFAULT_MAX_UPLOAD_MB * 1024 * 1024, model_path=DEFAULT_MODEL_PATH,
                  upload_ttl_s=3600, upload_max_items=100, supabase_url_source=None, check_keys_on_startup=False,
-                 redis_url=None):
+                 redis_url=None, served_by=None):
         self.supabase_url = supabase_url.rstrip("/") if supabase_url else None
         self.supabase_key = supabase_key            # anon key; RLS does the access control
         self.jwt_secret = jwt_secret                # only for legacy HS256 projects
@@ -31,6 +32,7 @@ class Settings:
         self.supabase_url_source = supabase_url_source  # where the URL came from, for the startup log
         self.check_keys_on_startup = check_keys_on_startup  # fetch the JWKS once at startup (off in tests)
         self.redis_url = redis_url or None          # set: uploads and the report cache live in Redis (shared)
+        self.served_by = served_by or None          # set: every response names this replica (X-Served-By)
 
     @classmethod
     def from_env(cls, environ=None, secrets_path=SECRETS_PATH):
@@ -63,4 +65,7 @@ class Settings:
             max_upload_bytes=float(env.get("MAX_UPLOAD_MB", DEFAULT_MAX_UPLOAD_MB)) * 1024 * 1024,
             model_path=env.get("MODEL_PATH") or DEFAULT_MODEL_PATH,
             redis_url=env.get("REDIS_URL") or secrets.get("redis", {}).get("url"),
+            # Opt-in (docker-compose.yml): the container's hostname, so a client behind the load
+            # balancer can see which replica answered. Off by default, so public hosts don't show it.
+            served_by=socket.gethostname() if env.get("SERVED_BY_HEADER", "").lower() in ("1", "true") else None,
         )
