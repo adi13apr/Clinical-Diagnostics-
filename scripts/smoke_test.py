@@ -4,7 +4,8 @@
     $env:SUPABASE_ACCESS_TOKEN = "<access token from the signed-in web app>"
     python scripts/smoke_test.py
 
-Steps: /health, POST /predict, /gradcam/{id}/map, POST /report/{id}, /history, /traces/{id}.
+Steps: /health, POST /predict, /gradcam/{id}/map, POST /report/{id} (then GET /report/jobs/{job_id}
+until done when the API queues reports for a worker), /history, /traces/{id}.
 The token is sent only to API_URL and never printed. Exit code 1 if any step fails.
 
 Test image: scripts/smoke_xray.jpg, a downsized test-split X-ray from Kermany et al.,
@@ -21,6 +22,7 @@ import httpx
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "smoke_xray.jpg"
 WAKE_TIMEOUT_S = 300     # a sleeping free Space takes a minute or two to start
 REPORT_TIMEOUT_S = 240   # a report can wait ~60 s on Groq's token limit
+REPORT_POLL_S = 2
 
 
 class Smoke:
@@ -98,11 +100,24 @@ def main():
 
     def report():
         r = smoke.client.post(f"/report/{state['trace_id']}", timeout=REPORT_TIMEOUT_S)
-        rep = check(r, "/report")
+        if r.status_code not in (200, 202):
+            raise AssertionError(f"/report: HTTP {r.status_code} {r.text[:200]}")
+        job = r.json()
+        deadline = time.monotonic() + REPORT_TIMEOUT_S
+        while job["status"] in ("queued", "running") or (job["status"] == "done" and job["result"] is None):
+            if time.monotonic() > deadline:
+                raise AssertionError(f"job {job['job_id']} still {job['status']} after {REPORT_TIMEOUT_S} s "
+                                     "(is a report worker running?)")
+            time.sleep(REPORT_POLL_S)
+            job = check(smoke.client.get(f"/report/jobs/{job['job_id']}"), "/report/jobs")
+        if job["status"] == "failed":
+            raise AssertionError(f"report job failed: {job['error']}")
+        rep = job["result"]
         if rep["report"]["predicted_class"] != state["predicted_class"]:
             raise AssertionError("report class differs from the prediction")
         why = f" ({rep['reason']})" if rep["reason"] else ""
-        return f"source={rep['source']}, model={rep['model']}, cached={rep['cached']}{why}"
+        mode = f"job {job['job_id'][:8]}" if job["job_id"] else "inline"
+        return f"{mode}, source={rep['source']}, model={rep['model']}, cached={rep['cached']}{why}"
 
     def history():
         h = check(smoke.client.get("/history", params={"limit": 20}), "/history")

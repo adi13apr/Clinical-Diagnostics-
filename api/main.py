@@ -7,6 +7,10 @@ the Streamlit app is unchanged. Run locally with:
 
 Every endpoint except /health needs `Authorization: Bearer <Supabase access token>`. Database calls
 send that token, so Supabase row-level security only ever returns the caller's own rows.
+
+Reports: without REDIS_URL, POST /report writes the report during the request (about 60 s, in its own
+thread pool). With REDIS_URL, it queues a job for worker/report_worker.py and answers 202 at once; the
+client polls GET /report/jobs/{job_id} (see api/jobs.py).
 """
 import asyncio
 import io
@@ -25,12 +29,13 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, UnidentifiedImageError
 
-from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client, generate_report_for_image
+from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client
 from agent.rate_limit import BUDGETS, BudgetRegistry
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
+from api.jobs import ReportJobs, write_report
 from api.schemas import (
     AnalyticsResponse, DailyVolume, GradcamMapResponse, HealthResponse, HistoryItem, HistoryPage, HistoryQuery,
-    PipelineSummary, PredictResponse, ReportResponse, SpanOut, TraceResponse,
+    PipelineSummary, PredictResponse, ReportJobResponse, ReportResponse, SpanOut, TraceResponse,
 )
 from api.settings import LOCALHOST_ORIGIN_REGEX, Settings
 from api.state import (
@@ -62,16 +67,19 @@ def configure_logging():
 
 
 def create_app(settings=None, model_service=None, verifier=None, db_factory=None, llm_factory=None,
-               report_cache=None, uploads=None):
+               report_cache=None, uploads=None, report_jobs=None):
     """Build the app. Tests inject fakes; by default everything comes from Settings.from_env().
 
     Uploads, the report cache and the LLM rate-limit budgets live in Redis when settings.redis_url is
     set (shared by every replica), else in this process's memory (REPORT_CACHE and BUDGETS are the ones
-    the Streamlit app uses too).
+    the Streamlit app uses too). With Redis, reports are also queued for worker processes (report_jobs);
+    without it, the API writes them itself.
     """
     configure_logging()
     settings = settings or Settings.from_env()
     uploads, report_cache, budgets, redis_client = shared_state(settings, uploads, report_cache)
+    if report_jobs is None and redis_client is not None:
+        report_jobs = ReportJobs(redis_client)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -92,6 +100,13 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
                      "(REDIS_URL not set)")
         else:
             await asyncio.to_thread(check_redis, redis_client)
+        if report_jobs is None:
+            log.info("Reports are written by this API process (no REDIS_URL, so no report worker)")
+        else:
+            workers = await asyncio.to_thread(report_jobs.worker_count)
+            log.log(logging.WARNING if not workers else logging.INFO,
+                    "Reports are queued for report workers; %s listening now%s", workers,
+                    "" if workers else ". Start one: python -m worker.report_worker (jobs wait up to 10 min)")
         yield
         app.state.report_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -107,6 +122,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
     app.state.llm_factory = llm_factory or partial(build_llm_client, budgets=budgets)
     app.state.report_cache = report_cache
     app.state.uploads = uploads
+    app.state.report_jobs = report_jobs
     app.state.report_pool = ThreadPoolExecutor(REPORT_WORKERS, thread_name_prefix="report")
 
     @app.middleware("http")
@@ -163,7 +179,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
     Model = Annotated[object, Depends(model)]
 
     async def find_upload(request, trace_id, user):
-        upload = await use_uploads(request.app.state.uploads.get, str(trace_id), user.id)
+        upload = await use_store(request.app.state.uploads.get, str(trace_id), user.id)
         if upload is None:
             # Same answer for "never existed", "expired" and "someone else's"
             raise HTTPException(404, "Upload not found or expired; run /predict again")
@@ -177,11 +193,14 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         if not hasattr(state, "llm_configured"):
             state.llm_configured = state.llm_factory() is not None  # keys don't change while running
         loaded = state.model is not None
+        jobs = state.report_jobs
         return HealthResponse(
             status="ok", model_loaded=loaded,
             calibrated=bool(loaded and state.model.calibrated),
             temperature=state.model.temperature if loaded else None,
-            auth_configured=state.verifier is not None, llm_configured=state.llm_configured)
+            auth_configured=state.verifier is not None, llm_configured=state.llm_configured,
+            report_mode="inline" if jobs is None else "queue",
+            report_workers=None if jobs is None else await asyncio.to_thread(jobs.worker_count))
 
     @app.post("/predict", response_model=PredictResponse)
     async def predict(request: Request, user: User, db: Db, model: Model,
@@ -192,7 +211,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         tracer = make_tracer(SupabaseTraceStore(db), trace_id=trace_id)
         result, inference_ms, warnings = await asyncio.to_thread(
             predict_and_log, model, PredictionService(db), image, tracer, trace_id)
-        await use_uploads(request.app.state.uploads.put, trace_id, user.id, data, result)
+        await use_store(request.app.state.uploads.put, trace_id, user.id, data, result)
         return PredictResponse(
             trace_id=trace_id, predicted_class=result["diagnosis"], confidence=result["confidence"],
             probabilities=result["probabilities"], status=result["status"],
@@ -208,7 +227,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         if upload.heatmap_png is None:
             tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
             upload.heatmap_png = await asyncio.to_thread(render_heatmap, model, upload, tracer)
-            await use_uploads(request.app.state.uploads.save_heatmap, str(trace_id), upload.heatmap_png)
+            await use_store(request.app.state.uploads.save_heatmap, str(trace_id), upload.heatmap_png)
         return Response(upload.heatmap_png, media_type="image/png",
                         headers={"Cache-Control": "private, max-age=3600"})
 
@@ -219,24 +238,44 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         if upload.cam_map is None:
             tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))
             upload.cam_map = await asyncio.to_thread(compute_cam_map, model, upload, tracer)
-            await use_uploads(request.app.state.uploads.save_cam_map, str(trace_id), upload.cam_map)
+            await use_store(request.app.state.uploads.save_cam_map, str(trace_id), upload.cam_map)
         cam, regions = upload.cam_map
         return GradcamMapResponse(trace_id=str(trace_id), explained_class=upload.prediction["diagnosis"],
                                   cam=cam, regions=regions)
 
-    @app.post("/report/{trace_id}", response_model=ReportResponse)
-    async def report(request: Request, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+    @app.post("/report/{trace_id}", response_model=ReportJobResponse, status_code=202, responses={
+        200: {"model": ReportJobResponse, "description": "Without REDIS_URL: written during the request, status 'done'"}})
+    async def report(request: Request, response: Response, trace_id: uuid.UUID, user: User, db: Db, model: Model):
+        """Start a report. With REDIS_URL: 202 and a job to poll; asking again while that job is queued or
+        running returns the same job. Without: the finished report (200)."""
         upload = await find_upload(request, trace_id, user)
         state = request.app.state
+        if state.report_jobs is not None:
+            job_id, status = await use_store(state.report_jobs.submit, str(trace_id), user.id)
+            return ReportJobResponse(job_id=job_id, trace_id=str(trace_id), status=status)
         tracer = make_tracer(SupabaseTraceStore(db), trace_id=str(trace_id))  # same trace as the prediction
         loop = asyncio.get_running_loop()
         # Up to ~60 s, mostly waiting on the LLM's rate limit: its own pool, so it can't starve predictions
         result = await loop.run_in_executor(
             state.report_pool, write_report, model, upload, state.llm_factory, state.report_cache, tracer)
-        return ReportResponse(
-            trace_id=str(trace_id), report=result.report, source=result.source, model=result.model,
-            source_line=result.source_line(), reason=result.reason, cached=result.cached,
-            warnings=trace_warnings(tracer))
+        response.status_code = 200
+        return ReportJobResponse(job_id=None, trace_id=str(trace_id), status="done",
+                                 result=report_response(str(trace_id), result), warnings=trace_warnings(tracer))
+
+    @app.get("/report/jobs/{job_id}", response_model=ReportJobResponse)
+    async def report_job(request: Request, job_id: uuid.UUID, user: User, db: Db):
+        """Status of a report job; the report once it's done. 404 for unknown, expired or other users' jobs."""
+        jobs = request.app.state.report_jobs
+        view = await use_store(jobs.get, str(job_id), user.id) if jobs is not None else None
+        if view is None:
+            raise HTTPException(404, "Report job not found or expired; ask for the report again")
+        warnings = []
+        if view.status in ("done", "failed"):
+            # Only now, and only for the owner: the worker's spans go to Supabase with this user's token
+            warnings = await use_store(jobs.flush_spans, view.job_id, SupabaseTraceStore(db))
+        return ReportJobResponse(
+            job_id=view.job_id, trace_id=view.trace_id, status=view.status, error=view.error, warnings=warnings,
+            result=report_response(view.trace_id, view.result) if view.result is not None else None)
 
     @app.get("/history", response_model=HistoryPage)
     async def history(user: User, db: Db, query: Annotated[HistoryQuery, Query()]):
@@ -320,8 +359,8 @@ def log_cache_error(operation, error):
     log.warning("Report cache %s failed (%s); treated as a miss", operation, type(error).__name__)
 
 
-async def use_uploads(method, *args):
-    """Call an upload store method off the event loop (Redis is network I/O); 503 if Redis is down."""
+async def use_store(method, *args):
+    """Call an upload store or report job method off the event loop (Redis is network I/O); 503 if Redis is down."""
     try:
         return await asyncio.to_thread(method, *args)
     except StoreUnavailable as e:
@@ -389,11 +428,9 @@ def compute_cam_map(model, upload, tracer):
     return [[round(float(v), 4) for v in row] for row in cam], summarize_cam_regions(cam)
 
 
-def write_report(model, upload, llm_factory, cache, tracer):
-    result = generate_report_for_image(model, upload.image(), prediction=upload.prediction,
-                                       llm=llm_factory(), cache=cache, tracer=tracer)
-    finish_trace(tracer)
-    return result
+def report_response(trace_id, result):
+    return ReportResponse(trace_id=trace_id, report=result.report, source=result.source, model=result.model,
+                          source_line=result.source_line(), reason=result.reason, cached=result.cached)
 
 
 def trace_warnings(tracer):

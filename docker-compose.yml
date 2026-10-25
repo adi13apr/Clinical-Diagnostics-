@@ -1,0 +1,39 @@
+# API + report worker + Redis on one machine (queue mode):
+#
+#   docker compose up --build                     # API on http://127.0.0.1:7860
+#   docker compose up --build --scale worker=2    # two report workers
+#
+# Settings come from the shell or a .env file next to this file (gitignored; never commit it):
+#   SUPABASE_URL, SUPABASE_KEY (publishable key, NEVER the secret/service_role key), FRONTEND_URL, GROQ_API_KEY
+# The worker needs no Supabase settings: the API writes the report's trace as the user (api/jobs.py).
+# Without REDIS_URL the API writes reports itself; `docker run` of the image alone still works that way.
+services:
+  redis:
+    image: redis:7-alpine
+    # No RDB/AOF: uploaded X-rays must stay in memory only
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: clinical-api:compose
+    # Localhost only (put a tunnel or reverse proxy in front); API_PORT=7861 runs next to serve_local_api.ps1
+    ports: ["127.0.0.1:${API_PORT:-7860}:7860"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_URL: ${SUPABASE_URL:?set SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY:?set SUPABASE_KEY}
+      FRONTEND_URL: ${FRONTEND_URL:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    depends_on: [redis]
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: clinical-api:compose
+    command: ["python", "-m", "worker.report_worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    depends_on: [redis]
+    restart: unless-stopped

@@ -146,7 +146,8 @@ Run `sql/001`–`005` in the Supabase SQL Editor before deploying.
 | `POST /predict` | Upload a JPEG/PNG (max 10 MB). Returns class, calibrated probabilities, `confident`/`refer`, and a `trace_id` |
 | `GET /gradcam/{trace_id}` | Grad-CAM figure (PNG) for that upload |
 | `GET /gradcam/{trace_id}/map` | The raw 7×7 Grad-CAM map plus a region summary (JSON), so a client can draw its own overlay |
-| `POST /report/{trace_id}` | AI report, with the same guard and template fallback as the app |
+| `POST /report/{trace_id}` | Start an AI report (same guard and template fallback as the app). Returns a job; see "Reports" below |
+| `GET /report/jobs/{job_id}` | Status of a report job (`queued`, `running`, `done`, `failed`) and the report once it's done. Only its owner can read it |
 | `GET /history` | Your past predictions: `limit`, `offset`, `label`, `status`, `date_from`, `date_to` |
 | `GET /analytics` | Daily volume, referral rate, average latency per pipeline step |
 | `GET /traces/{trace_id}` | Every step of one prediction, for the trace viewer |
@@ -156,6 +157,11 @@ Run `sql/001`–`005` in the Supabase SQL Editor before deploying.
 - **Uploads stay in memory.** They're never written to disk, and `/gradcam` and `/report` can use them for an hour. After a restart, call `/predict` again.
 - **Several replicas:** set `REDIS_URL` and the uploads, Grad-CAM results and LLM report cache are shared through Redis (same 1-hour expiry; reports 24 hours), so any replica can serve any request. The LLM rate limits (requests and tokens per minute, daily caps) are shared the same way, so replicas together stay within one Groq quota. Run Redis **without persistence** (`--save "" --appendonly no`), otherwise the X-rays end up on Redis's disk. Without `REDIS_URL`, everything stays in the process as before. The Streamlit app never uses Redis.
 - **History** comes from the `predictions` log, so it has no patient names.
+- **Reports.** A report takes about a minute on Groq's free tier, so there are two ways to run them:
+  - **One container, no `REDIS_URL` (inline):** `POST /report` writes the report while the request waits and answers `200` with `status: "done"` and the report. Nothing else to run.
+  - **With `REDIS_URL` (queue):** `POST /report` answers `202` straight away with a `job_id`, and a separate **report worker** process writes the report. The client polls `GET /report/jobs/{job_id}` (the web app does every 2 s). Asking again for the same prediction while its job is queued or running returns the same job; after a failure it starts a new one. API replicas never wait on the LLM, and workers scale on their own. Jobs keep only ids (no report text, image or token); finished jobs are kept 1 hour, failed ones 24 hours. If a worker dies mid-report, the job turns `failed` within about 4 minutes instead of staying "running".
+  - The worker never connects to Supabase and holds no user token or service key. It keeps the report's trace in Redis, and the API saves it to Supabase *as the user* on the poll that sees the job finish (needs `sql/006_traces_unique_span.sql`, so repeated saves can't duplicate spans).
+  - Run the worker with the same image: `docker compose up --build` starts Redis, the API and one worker (`--scale worker=2` for two). RQ workers don't run on Windows, so use Docker there.
 
 ```bash
 pip install -r requirements-api.txt
@@ -171,7 +177,7 @@ Locally it reads `.streamlit/secrets.toml`. On a server, it uses environment var
 | `FRONTEND_URL` | Deployed React app's origin(s), comma-separated. `localhost` on any port is always allowed |
 | `GROQ_API_KEY` | Optional. Without it, reports use the template |
 | `MAX_UPLOAD_MB` | Default 10 |
-| `REDIS_URL` | Optional, e.g. `rediss://:password@host:6380/0`. Shares uploads, the report cache and LLM rate limits between replicas (also read from `[redis] url` in `secrets.toml`) |
+| `REDIS_URL` | Optional, e.g. `rediss://:password@host:6380/0`. Shares uploads, the report cache and LLM rate limits between replicas, and queues reports for report workers, so **run at least one worker** when it's set (also read from `[redis] url` in `secrets.toml`) |
 
 Hosting options for the API are in [Deployment](#deployment).
 

@@ -1,5 +1,6 @@
 # FastAPI backend (api/) as a Hugging Face Docker Space. Spaces send traffic to port 7860.
 # Local: docker build -t clinical-api . && docker run -p 7860:7860 -e SUPABASE_URL=... -e SUPABASE_KEY=... clinical-api
+# Report worker (queue mode, needs REDIS_URL): same image, command python -m worker.report_worker; see docker-compose.yml
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

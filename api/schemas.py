@@ -1,6 +1,6 @@
 """Request and response models (Pydantic). Probabilities and confidences are 0-1."""
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -14,6 +14,9 @@ class HealthResponse(BaseModel):
     temperature: Optional[float]
     auth_configured: bool
     llm_configured: bool = Field(description="False: reports use the fixed template")
+    report_mode: Literal["inline", "queue"] = Field(description="'queue' with REDIS_URL: reports are written "
+                                                                "by worker processes; 'inline': by the API")
+    report_workers: Optional[int] = Field(description="Workers listening for report jobs (queue mode only)")
 
 
 class PredictResponse(BaseModel):
@@ -47,6 +50,16 @@ class ReportResponse(BaseModel):
     source_line: str = Field(description="Who wrote the report, for display")
     reason: Optional[str] = Field(description="Why the template was used (user-facing)")
     cached: bool
+
+
+class ReportJobResponse(BaseModel):
+    job_id: Optional[str] = Field(description="Poll GET /report/jobs/{job_id} until status is 'done' or "
+                                              "'failed'. None without REDIS_URL: the report was written "
+                                              "during the request and is already in result")
+    trace_id: str
+    status: Literal["queued", "running", "done", "failed"]
+    result: Optional[ReportResponse] = Field(None, description="The report, when status is 'done'")
+    error: Optional[str] = Field(None, description="Why the report failed (user-facing), when status is 'failed'")
     warnings: List[str] = Field(default_factory=list)
 
 

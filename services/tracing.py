@@ -206,13 +206,17 @@ class SupabaseTraceStore:
         self.client = client
 
     def write(self, spans):
+        """Insert spans, skipping any already stored (same trace_id and span_id), so a retry is harmless.
+
+        ON CONFLICT DO NOTHING needs the unique index from sql/006_traces_unique_span.sql.
+        """
         rows = [{
             "trace_id": s["trace_id"], "span_id": s["span_id"], "parent_span_id": s["parent_span_id"],
             "name": s["name"], "started_at": s["start"], "latency_ms": s["latency_ms"], "status": s["status"],
             "error_type": s["error_type"], "error": s["error"],
             "attributes": json.loads(json.dumps(s["attributes"], default=str)),
         } for s in spans]
-        self.client.table("traces").insert(rows).execute()
+        self.client.table("traces").upsert(rows, on_conflict="trace_id,span_id", ignore_duplicates=True).execute()
 
     def read(self, limit=5000, user_id=None):
         query = self.client.table("traces").select("*")

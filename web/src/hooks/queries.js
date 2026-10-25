@@ -1,6 +1,15 @@
 /** TanStack Query hooks over lib/api.js. Keys include the user id so accounts never share cache. */
 import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
-import { createReport, getAnalytics, getGradcamMap, getHealth, getHistory, getTrace, predict } from "@/lib/api";
+import {
+  createReport,
+  getAnalytics,
+  getGradcamMap,
+  getHealth,
+  getHistory,
+  getReportJob,
+  getTrace,
+  predict,
+} from "@/lib/api";
 import { useAuth } from "@/providers/contexts";
 
 export function useHealth() {
@@ -22,8 +31,32 @@ export function useGradcamMap(traceId) {
   });
 }
 
+export const REPORT_POLL_MS = 2000;
+
+/** Starts a report: resolves to a ReportJob (queued, or already done when the server has no worker). */
 export function useCreateReport() {
   return useMutation({ mutationFn: (traceId) => createReport(traceId) });
+}
+
+const finished = (job) => job?.status === "done" || job?.status === "failed";
+
+/**
+ * Polls a report job every 2 s until it's done or failed. Keeps polling in a background tab, because the
+ * server stores the report's trace when a poll sees the job finish.
+ * @param {string|null} jobId Null disables the query.
+ */
+export function useReportJob(jobId) {
+  const { user } = useAuth();
+  return useQuery({
+    queryKey: ["report-job", user?.id, jobId],
+    queryFn: ({ signal }) => getReportJob(jobId, { signal }),
+    enabled: Boolean(jobId),
+    refetchInterval: (query) => (finished(query.state.data) || query.state.error ? false : REPORT_POLL_MS),
+    refetchIntervalInBackground: true,
+    staleTime: (query) => (finished(query.state.data) ? Infinity : 0),
+    // A 404 (expired or unknown job) won't change on retry; network blips and 503s might
+    retry: (count, error) => error?.status !== 404 && error?.status !== 401 && count < 3,
+  });
 }
 
 export function useHistory(filters) {
