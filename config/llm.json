@@ -1,6 +1,8 @@
 {
   "_note": "LLM provider and limits. 'provider' can be overridden with env LLM_PROVIDER. Limits are per model and enforced client-side by agent/rate_limit.py.",
   "provider": "groq",
+  "report_pipeline": "single",
+  "_report_pipeline_note": "'single' (the tool-calling report agent, the baseline) or 'multi' (evidence agent -> writer -> verifier, run by agent/multi_agent.py). Env REPORT_PIPELINE overrides it. Multi needs an OpenAI-compatible provider; with gemini it runs as single (recorded in the trace and the result).",
   "providers": {
     "groq": {
       "kind": "openai_compatible",
@@ -8,7 +10,10 @@
       "secret_section": "groq",
       "env_key": "GROQ_API_KEY",
       "report_model": "openai/gpt-oss-120b",
-      "judge_model": "qwen/qwen3.8-27b"
+      "judge_model": "qwen/qwen3.8-27b",
+      "evidence_model": "openai/gpt-oss-120b",
+      "writer_model": "openai/gpt-oss-120b",
+      "verifier_model": "openai/gpt-oss-20b"
     },
     "gemini": {
       "kind": "gemini",
@@ -25,6 +30,15 @@
       "tpm": 8000,
       "tpd": 200000,
       "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-18); rpm/tpd from console.groq.com/docs/rate-limits (not reported in headers)",
+      "otpm": null,
+      "max_concurrent": 1
+    },
+    "openai/gpt-oss-20b": {
+      "rpm": 30,
+      "rpd": 1000,
+      "tpm": 8000,
+      "tpd": 200000,
+      "source": "rpd/tpm from Groq x-ratelimit-limit-* headers on this account (2026-10-26); rpm/tpd from console.groq.com/docs/rate-limits (Developer plan table; same values as gpt-oss-120b, its own bucket)",
       "otpm": null,
       "max_concurrent": 1
     },
@@ -53,6 +67,12 @@
       "max_completion_tokens": 600,
       "_why_600": "The rate limiter reserves this per call, so it sets how many calls fit in tpm. Measured completion tokens (output + reasoning): 21-238 per call (median 27; 23 llm_call spans of the 2026-10-25 demo runs) and 266-400 per whole report (216 eval reports). 600 = 2.5x the largest call, 1.5x the largest report. A reply cut off here (finish_reason length) is retried once, then the template is used."
     },
+    "openai/gpt-oss-20b": {
+      "reasoning_effort": "low",
+      "include_reasoning": false,
+      "max_completion_tokens": 1000,
+      "_why": "The multi-agent pipeline's verifier: one finding per claim (about 8-12 claims, ~40 tokens each) plus low reasoning. A 2-claim test used 131 completion tokens (2026-10-26)."
+    },
     "qwen/qwen3.8-27b": {
       "reasoning_effort": "none",
       "reasoning_format": "hidden",
@@ -61,5 +81,17 @@
     }
   },
   "request_timeout_s": 120,
-  "_request_timeout_note": "Async eval runner: a single LLM request (after rate-limit waits) is cancelled after this many seconds and treated as an infrastructure error (the run stops and can be resumed)."
+  "_request_timeout_note": "Async eval runner: a single LLM request (after rate-limit waits) is cancelled after this many seconds and treated as an infrastructure error (the run stops and can be resumed).",
+  "agents": {
+    "_note": "Multi-agent pipeline: each agent's wall-clock limit, including rate-limit budget waits (a stage that runs past it falls back to the template). A report job's own deadline still applies on top.",
+    "evidence": {
+      "timeout_s": 180
+    },
+    "writer": {
+      "timeout_s": 150
+    },
+    "verifier": {
+      "timeout_s": 120
+    }
+  }
 }

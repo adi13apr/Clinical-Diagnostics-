@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 
 LLM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "llm.json"
+PIPELINES = ("single", "multi")
+AGENT_ROLES = ("evidence", "writer", "verifier")  # multi-agent pipeline; each defaults to report_model
 
 
 def load_llm_config(path=LLM_CONFIG_PATH):
@@ -30,7 +32,27 @@ def provider_settings(config=None):
     # Optional per-deployment model overrides, e.g. [groq] report_model = "..."
     for role in ("report_model", "judge_model"):
         settings[role] = _secret(settings["secret_section"], role) or settings[role]
+    for agent in AGENT_ROLES:
+        role = f"{agent}_model"
+        settings[role] = _secret(settings["secret_section"], role) or settings.get(role) or settings["report_model"]
     return name, settings
+
+
+def pipeline_mode(config=None):
+    """'single' or 'multi': env REPORT_PIPELINE, else "report_pipeline" in config/llm.json (default single).
+
+    On Streamlit Cloud a top-level REPORT_PIPELINE = "multi" in the secrets also becomes this env var.
+    """
+    config = config or load_llm_config()
+    mode = (os.environ.get("REPORT_PIPELINE") or config.get("report_pipeline") or "single").strip().lower()
+    if mode not in PIPELINES:
+        raise ValueError(f"Unknown REPORT_PIPELINE {mode!r}; expected one of {list(PIPELINES)}")
+    return mode
+
+
+def agent_timeout_s(agent, config=None):
+    """Per-agent time limit (s) of the multi-agent pipeline (config/llm.json "agents")."""
+    return float((config or load_llm_config()).get("agents", {}).get(agent, {}).get("timeout_s", 120))
 
 
 def request_options(model, config=None):

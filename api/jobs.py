@@ -35,6 +35,12 @@ JOB_TIMEOUT_MAX_S = 900
 JOB_BASE_S = 60            # the model, Grad-CAM and the LLM requests themselves (about 10 s), plus slack
 REPORT_CALLS = 4           # LLM calls in a normal report: 3 tool turns + the answer (Groq gpt-oss)
 REPORT_PROMPT_TOKENS = 6200  # the limiter's prompt estimates for those 4 calls together (1,227-2,019 each, 2026-10-26)
+# Multi-agent pipeline (REPORT_PIPELINE=multi), with one revision; the limiter's estimates on real tool outputs
+# (2026-10-26): evidence 551 + 691 + 921, writer 1,473, revision 1,946; verifier 1,479 per call
+MULTI_REPORT_CALLS = 5           # on the report model: 3 evidence tool turns + a draft + a revision
+MULTI_REPORT_PROMPT_TOKENS = 5600
+MULTI_VERIFIER_CALLS = 2         # on the verifier model: the draft and the revision
+MULTI_VERIFIER_PROMPT_TOKENS = 3000
 DEADLINE_MARGIN_S = 30     # the worker stops waiting for the budget this long before the job timeout
 QUEUED_TTL_S = 600         # a job no worker started within 10 min is dropped (e.g. no worker running)
 RESULT_TTL_S = 3600        # a finished job and its report are kept 1 h
@@ -73,7 +79,18 @@ def write_report(model, upload, llm_factory, cache, tracer, deadline=None):
         finish_trace(tracer)  # spans of a report that raised are still kept
 
 
-def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0):
+def _windows(workers, calls, prompt_tokens, tpm, rpm, max_completion_tokens):
+    """60 s windows `workers` reports need on one model's per-minute limits."""
+    reserved = prompt_tokens + calls * max_completion_tokens
+    windows = 1
+    if tpm:
+        windows = max(windows, math.ceil(workers * reserved / tpm))
+    if rpm:
+        windows = max(windows, math.ceil(workers * calls / rpm))
+    return windows
+
+
+def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0, pipeline="single", verifier=None):
     """RQ job_timeout (s) for one report, derived from the shared LLM budget.
 
     Every running worker draws on the same per-minute limits, so a report gets about 1/workers of
@@ -81,25 +98,38 @@ def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0):
     windows, plus JOB_BASE_S for the work itself. A report reserves its prompt estimates plus
     max_completion_tokens per call. Bounded to [JOB_TIMEOUT_MIN_S, JOB_TIMEOUT_MAX_S]; a worse than
     fair share is caught by the deadline (the template report instead of a killed job).
+
+    pipeline="multi": the evidence agent and writer use the report model (with one revision), and the
+    verifier ({tpm, rpm, max_completion_tokens} of its model, a separate budget) adds its own windows,
+    since it runs after the writer.
     """
     workers = max(int(workers or 1), 1)
-    reserved = REPORT_PROMPT_TOKENS + REPORT_CALLS * max_completion_tokens
-    windows = 1
-    if tpm:
-        windows = max(windows, math.ceil(workers * reserved / tpm))
-    if rpm:
-        windows = max(windows, math.ceil(workers * REPORT_CALLS / rpm))
+    if pipeline != "multi":
+        windows = _windows(workers, REPORT_CALLS, REPORT_PROMPT_TOKENS, tpm, rpm, max_completion_tokens)
+    else:
+        windows = _windows(workers, MULTI_REPORT_CALLS, MULTI_REPORT_PROMPT_TOKENS, tpm, rpm, max_completion_tokens)
+        if verifier:
+            windows += _windows(workers, MULTI_VERIFIER_CALLS, MULTI_VERIFIER_PROMPT_TOKENS, **verifier)
     return int(min(max(JOB_BASE_S + WINDOW_S * windows, JOB_TIMEOUT_MIN_S), JOB_TIMEOUT_MAX_S))
 
 
-def report_model_budget(config=None):
-    """{tpm, rpm, max_completion_tokens} of the configured report model (config/llm.json)."""
-    from agent.llm_config import load_llm_config, provider_settings, request_options
-    config = config or load_llm_config()
-    model = provider_settings(config)[1]["report_model"]
+def _model_budget(model, config):
+    from agent.llm_config import request_options
     limits = config["limits"].get(model, {})
     return {"tpm": limits.get("tpm"), "rpm": limits.get("rpm"),
             "max_completion_tokens": int(request_options(model, config).get("max_completion_tokens", 1000))}
+
+
+def report_model_budget(config=None):
+    """{tpm, rpm, max_completion_tokens} of the configured report model (config/llm.json), plus
+    pipeline="multi" and the verifier model's budget when REPORT_PIPELINE is multi."""
+    from agent.llm_config import load_llm_config, pipeline_mode, provider_settings
+    config = config or load_llm_config()
+    settings = provider_settings(config)[1]
+    if pipeline_mode(config) == "multi" and settings["kind"] == "openai_compatible":
+        return {**_model_budget(settings["writer_model"], config), "pipeline": "multi",
+                "verifier": _model_budget(settings["verifier_model"], config)}
+    return _model_budget(settings["report_model"], config)
 
 
 class JobView:

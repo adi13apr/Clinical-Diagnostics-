@@ -51,7 +51,14 @@ class ReportOut(BaseModel):
     fallback_reason: Optional[str] = Field(description="Why the template was used, when source is 'template'")
     cached: bool = Field(description="True if this LLM report was reused for the same image (no LLM calls spent)")
     guard_rejections: int = Field(description="LLM drafts the guard rejected before the final report")
-    tool_calls: list[str] = Field(description="Tools the LLM called while writing it")
+    tool_calls: list[str] = Field(description="Tools the LLM called while writing it (the evidence agent's, in "
+                                              "the multi pipeline)")
+    pipeline: Literal["single", "multi"] = Field(
+        description="The pipeline that actually ran: 'single' (one tool-calling agent) or 'multi' (evidence "
+                    "agent, writer and verifier). Set by REPORT_PIPELINE; multi runs as single on a provider "
+                    "without strict JSON output, and pipeline_note says so")
+    pipeline_note: Optional[str] = Field(None, description="Why a requested multi pipeline ran as single")
+    revisions: int = Field(0, description="Drafts sent back to the writer by the guard or the verifier (multi only)")
     report: Report
 
 

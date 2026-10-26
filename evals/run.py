@@ -98,6 +98,12 @@ def _finish_case(case, tools, tracer, result):
     truth = tools.run_classifier()
     llm_calls = [s for s in tracer.spans if s.name == "llm_call"]
     report_span = next(s for s in tracer.spans if s.name == "report")
+    by_model = {}
+    for s in llm_calls:
+        m = by_model.setdefault(s.attributes.get("model"), {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0})
+        m["llm_calls"] += 1
+        m["input_tokens"] += s.attributes.get("input_tokens") or 0
+        m["output_tokens"] += (s.attributes.get("output_tokens") or 0) + (s.attributes.get("thinking_tokens") or 0)
     return {
         "classifier": truth,
         "snapshot_match": (truth["predicted_class"], truth["calibrated_probability"], truth["status"]) ==
@@ -111,26 +117,33 @@ def _finish_case(case, tools, tracer, result):
         "steps": result.steps,
         "tool_calls": result.tool_calls,  # which tools the model actually called (c07 skipped one)
         "rejected": result.rejected,
+        # The pipeline that actually ran (multi requested on a provider without strict JSON runs as single)
+        "pipeline": result.pipeline,
+        "pipeline_note": result.pipeline_note,
+        "agent_models": result.agent_models,
+        "revisions": result.revisions,  # multi: drafts sent back by the guard or the verifier
+        "verifier_findings": result.findings,
         "agent_usage": {
             "llm_calls": len(llm_calls),
             "input_tokens": sum(s.attributes.get("input_tokens") or 0 for s in llm_calls),
             "output_tokens": sum((s.attributes.get("output_tokens") or 0) + (s.attributes.get("thinking_tokens") or 0)
                                  for s in llm_calls),
             "report_latency_ms": report_span.latency_ms,
+            "by_model": by_model,
         },
     }
 
 
 def run_case(case, service, llm, roots):
-    from agent.agent import generate_report
+    from agent.agent import run_report
     tools, tracer = _prepare_case(case, service, roots)
-    return _finish_case(case, tools, tracer, generate_report(tools, llm, tracer=tracer))
+    return _finish_case(case, tools, tracer, run_report(tools, llm, tracer=tracer))
 
 
 async def arun_case(case, service, llm, roots):
-    from agent.agent import agenerate_report
+    from agent.agent import arun_report
     tools, tracer = _prepare_case(case, service, roots)
-    return _finish_case(case, tools, tracer, await agenerate_report(tools, llm, tracer=tracer))
+    return _finish_case(case, tools, tracer, await arun_report(tools, llm, tracer=tracer))
 
 
 def new_record(case, run_id, data_hash, provider, model, fields):
@@ -244,7 +257,7 @@ def live(args):
     logging.getLogger("streamlit").setLevel(logging.ERROR)  # ModelService's st.cache_resource outside the app
 
     sys.path.insert(0, str(REPO / "scripts"))
-    from agent.agent import build_llm_client
+    from agent.agent import build_report_llm
     from agent.llm_config import provider_settings
     from calibrate import find_root
     from evals.judge import build_judge
@@ -253,8 +266,8 @@ def live(args):
     cases = load_cases()
     data_hash = dataset_hash(cases)
     provider, settings = provider_settings()
-    # Agent and judge get per-model token-aware budgets from config/llm.json (shared if the model is the same)
-    llm = build_llm_client("report")
+    # Agent(s) and judge get per-model token-aware budgets from config/llm.json (shared if the model is the same)
+    llm = build_report_llm(args.pipeline)
     judge = build_judge(args.judge_model)
     if llm is None or judge is None:
         raise SystemExit(f"No API key for provider {provider!r}: set st.secrets['{settings['secret_section']}']"
@@ -274,13 +287,21 @@ def live(args):
         records = {}
     run_id = run_path.stem
     mode = "sync" if args.sync else "async"
+    pipeline = getattr(llm, "pipeline", "single")
     print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, provider {provider}, "
-          f"reports {model}, judge {judge.model}, {mode} runner")
+          f"{pipeline} pipeline, reports {model}, judge {judge.model}, {mode} runner")
+    if llm.pipeline_note:
+        print(f"Note: {llm.pipeline_note}")
     service = ModelService(str(REPO / "best_student_model_aligned_final.pth"))
     roots = {"pneumonia": find_root(REPO / "data" / "pneumonia", "chest_xray", "train"),
              "tb": find_root(REPO / "data" / "tb", "TB_Chest_Radiography_Database", "Tuberculosis")}
 
     todo = cases[:args.limit] if args.limit else cases
+    if args.cases:
+        wanted = [c.strip() for c in args.cases.split(",") if c.strip()]
+        todo = [c for c in todo if any(c.case_id == w or c.case_id.startswith(w + "-") for w in wanted)]
+        if len(todo) != len(wanted):
+            raise SystemExit(f"--cases matched {[c.case_id for c in todo]}, not every one of {wanted}")
     started = time.perf_counter()
     if args.sync:
         stop = run_pipeline_sync(
@@ -304,7 +325,7 @@ def live(args):
         print(f"\n{len(done)}/{len(todo)} cases fully scored. Resume with: "
               f"python -m evals.run --live --resume {relative(run_path)}")
         return 2
-    if args.limit or args.run_file:
+    if args.limit or args.cases or args.run_file:
         return 0  # partial or side runs (e.g. benchmarks) never overwrite the dated results file
     summary = build_summary(load_run(run_path), cases, data_hash, run_path, load_baseline(), load_agreement(run_path))
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -507,6 +528,10 @@ def main(argv=None):
     ap.add_argument("--resume", nargs="?", const="latest", help="continue a live run (default: latest)")
     ap.add_argument("--run", help="run file to replay / export / compare (default: baseline run or latest)")
     ap.add_argument("--limit", type=int, help="only the first N cases")
+    ap.add_argument("--cases", help="with --live: only these case ids, comma-separated (prefix before the first '-' "
+                                    "is enough, e.g. c07)")
+    ap.add_argument("--pipeline", choices=["single", "multi"],
+                    help="with --live: report pipeline (default: env REPORT_PIPELINE, else config/llm.json)")
     ap.add_argument("--sync", action="store_true", help="with --live: use the original sequential runner")
     ap.add_argument("--run-file", help="with --live: write this run file instead of evals/runs/<timestamp>.jsonl")
     ap.add_argument("--judge-model", help="judge model (default: the agent's model)")

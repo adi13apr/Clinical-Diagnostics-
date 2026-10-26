@@ -122,10 +122,12 @@ def test_report_result_json_round_trip_is_exact(tools):
 
 def test_redis_report_cache_is_shared_and_expires(make_redis, redis_clock, tools):
     a, b = RedisReportCache(make_redis(), ttl_s=60), RedisReportCache(make_redis(), ttl_s=60)
-    key = ("ab" * 32, 0.1318, "openai/gpt-oss-120b")
+    key = ("ab" * 32, 0.1318, "openai/gpt-oss-120b", "single")
     a.put(key, report_result(tools))
     assert b.get(key) == report_result(tools) and len(b) == 1
-    assert b.get((key[0], 0.5, key[2])) is None  # temperature is part of the key
+    assert b.get((key[0], 0.5, key[2], key[3])) is None  # temperature is part of the key
+    assert b.get((key[0], key[1], key[2], "multi")) is None  # and so is the pipeline
+    assert b.key(key).startswith("cdp:report:v2:single:")
     assert b.client.pttl(b.key(key)) <= 60 * 1000
 
     redis_clock[0] += 61
@@ -135,7 +137,7 @@ def test_redis_report_cache_is_shared_and_expires(make_redis, redis_clock, tools
 def test_corrupt_or_unreachable_report_cache_is_a_miss(make_redis, redis_server, tools):
     errors = []
     cache = RedisReportCache(make_redis(), on_error=lambda op, e: errors.append((op, type(e).__name__)))
-    key = ("cd" * 32, 0.1318, "mock")
+    key = ("cd" * 32, 0.1318, "mock", "single")
     cache.client.set(cache.key(key), b"not json")
     assert cache.get(key) is None and errors == [("get", "JSONDecodeError")]
 

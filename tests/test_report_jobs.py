@@ -21,7 +21,8 @@ from api.settings import Settings
 from api.state import RedisUploadStore, SerializedModel
 from services.tracing import SupabaseTraceStore
 from test_api import (  # noqa: F401  (model_service and store are fixtures)
-    ALICE, BOB, DARK, SECRET, SUPABASE_URL, auth, model_service, predict, report_script, store,
+    ALICE, BOB, DARK, SECRET, SUPABASE_URL, auth, model_service, multi_report_llm, predict, report_script,
+    store,
 )
 from worker import report_worker
 from worker.report_worker import WorkerContext
@@ -117,6 +118,25 @@ def test_job_uses_the_llm_guard_and_shared_cache(queue_app):
     again = post_report(client, truth["trace_id"])  # a done job isn't reused: a new job, a cache hit
     second = poll(client, again["job_id"]).json()["result"]
     assert second["cached"] and second["report"] == first["report"] and len(llms[-1].calls) == 0
+
+
+def test_worker_runs_the_multi_pipeline_with_the_job_deadline(queue_app, store):
+    pipelines = []
+
+    def llm_factory():
+        pipelines.append(multi_report_llm(report_script(truth)))
+        return pipelines[-1]
+
+    client, _ = queue_app(llm_factory=llm_factory)
+    truth = predict(client)
+    started = time.monotonic()
+    result = poll(client, post_report(client, truth["trace_id"])["job_id"]).json()["result"]
+    assert result["source"] == "llm" and result["pipeline"] == "multi"
+    # write_report gave the pipeline the job's deadline: start + 180 s timeout - 30 s margin
+    worker_pipeline = pipelines[-1]
+    assert worker_pipeline.deadline is not None and 140 < worker_pipeline.deadline - started <= 151
+    names = {r["name"] for r in spans_in_db(store, truth["trace_id"])}
+    assert {"evidence_agent", "writer_agent", "verifier_agent", "handoff"} <= names  # flushed on the poll
 
 
 def test_guard_rejection_falls_back_in_the_worker_too(queue_app):
