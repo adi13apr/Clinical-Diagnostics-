@@ -43,7 +43,7 @@ Work in a new worktree, never `git checkout` in a shared folder:
 - **0**: pytest and the replay pass.
 - **1**: something is broken. Fix it; never weaken a check or the baseline to get green.
 - **2**: expected. The new guard rejects the recorded report, or the dataset changed. Run the live eval:
-  1. `live_eval.py start`, then `live_eval.py wait` until it exits 0. A full run takes about 45 min and about 220k Groq tokens. Exit 2 means still running (call `wait` again); exit 1 means stopped (resume as printed).
+  1. `live_eval.py start`, then `live_eval.py wait` until it exits 0. A full run takes about 45 min and about 220k Groq tokens. `wait` blocks up to 9 min, so give that shell call a 10-minute timeout. Exit 2 means still running (call `wait` again); exit 1 means stopped (resume as printed).
   2. `compare_runs.py --after <new run> --out <scratchpad>/compare.md`. **Exit 3** (more template fallbacks or guard rejections than the baseline run) means **stop**: show the user the table and don't update the baseline.
   3. `python -m evals.run --replay --run <new run> --update-baseline`. Write `evals/runs/<run>.notes.md` (why this run exists), then `verify.py` again, which must exit 0. Commit the run, its notes, `evals/results/<date>.md` and `evals/baseline.json`.
 
