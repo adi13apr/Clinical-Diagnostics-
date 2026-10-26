@@ -89,7 +89,7 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 
 Every step is a trace span (agent, tokens, latency, verdict), and each agent has its own time limit.
 
-**Smoke run, n=3, not a result** (c07, c29, c35): all three were written by the LLM and passed every deterministic check, and `c07` called all three tools. Each report used about 3.5k tokens on the report model (single agent: about 5.1k) plus about 2.1k on the verifier. When the budget had room, a report took about 5 s. The full 36-case comparison comes next, in its own branch.
+**Smoke run, n=3, not a result** (c07, c29, c35): all three were written by the LLM and passed every deterministic check, and `c07` called all three tools. Each report used about 3.4k tokens on the report model (single agent: about 5.2k) plus about 1.9k on the verifier's own budget. When the budget had room, a report took under 5 s. The full 36-case comparison comes next, in its own branch.
 
 ## Why the eval runner is async (and why that isn't threads)
 
