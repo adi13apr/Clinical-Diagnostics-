@@ -139,6 +139,15 @@ def test_verify_interprets_replay_failures(monkeypatch):
     assert verify.interpret_replay(1, drop + "FAIL: length_limits pass rate 90% < baseline 100%", ["c07"], False)[0] == "FAIL"
 
 
+def test_verify_knows_the_baseline_replay_tests():
+    out = ("FAILED tests/test_evals.py::test_committed_baseline_replays_cleanly - AssertionError: assert 1 == 0\n"
+           "FAILED tests/test_mcp_server.py::test_eval_summary_matches_the_committed_baseline\n2 failed, 477 passed")
+    assert verify.pytest_failures(out) == verify.BASELINE_TESTS
+    for test_id in verify.BASELINE_TESTS:  # renamed or moved tests would make verify.py report FAIL
+        path, name = test_id.split("::")
+        assert f"def {name}(" in (Path(__file__).resolve().parent.parent / path).read_text(encoding="utf-8")
+
+
 # compare_runs.py
 
 def test_compare_flags_more_fallbacks_and_rejections():

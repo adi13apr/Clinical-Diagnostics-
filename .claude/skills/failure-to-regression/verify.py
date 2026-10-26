@@ -2,9 +2,10 @@
 
     python verify.py [--case c07 ...]
 
-Exit 0: both pass. Exit 2: pytest passes and the replay fails only in the way a guard change or a new
-case must (the new guard rejects the recorded final report of the --case cases, or cases.jsonl changed
-so the hash no longer matches): run the live eval next. Exit 1: anything else.
+Exit 0: both pass. Exit 2: the replay fails only in the way a guard change or a new case must (the new
+guard rejects the recorded final report of the --case cases, or cases.jsonl changed so the hash no
+longer matches), and pytest fails at most in BASELINE_TESTS, which replay the same baseline: run the
+live eval next. Exit 1: anything else.
 """
 import argparse
 import re
@@ -12,6 +13,10 @@ import subprocess
 import sys
 
 from _repo import REPO
+
+# Tests that replay the committed baseline: they fail exactly when the replay does
+BASELINE_TESTS = {"tests/test_evals.py::test_committed_baseline_replays_cleanly",
+                  "tests/test_mcp_server.py::test_eval_summary_matches_the_committed_baseline"}
 
 
 def run(cmd):
@@ -46,25 +51,33 @@ def interpret_replay(code, output, targets, dataset_changed):
     return "FAIL", f"pass rates below baseline: {', '.join(sorted(drops)) or output.strip()[-300:]}"
 
 
+def pytest_failures(output):
+    return set(re.findall(r"^FAILED (\S+?)(?: - .*)?$", output, re.M))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--case", action="append", default=[], help="case(s) this fix targets, e.g. c07")
     args = ap.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")
-    code, out = run(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
-    tail = [l for l in out.strip().splitlines() if l.strip()][-1:]
-    pytest_ok = code == 0
-    print(f"pytest: {'PASS' if pytest_ok else 'FAIL'}  {tail[0] if tail else ''}")
-    if not pytest_ok:
-        print(out[-3000:])
+    code, pytest_out = run(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
+    tail = [l for l in pytest_out.strip().splitlines() if l.strip()][-1:]
+    failed = pytest_failures(pytest_out)
 
     diff = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "evals/cases.jsonl"], cwd=REPO)
-    code, out = run(["-m", "evals.run", "--replay"])
-    verdict, why = interpret_replay(code, out, args.case, diff.returncode != 0)
+    code_replay, out = run(["-m", "evals.run", "--replay"])
+    verdict, why = interpret_replay(code_replay, out, args.case, diff.returncode != 0)
+
+    pytest_verdict = "PASS" if code == 0 else \
+        "EXPECTED" if verdict == "EXPECTED" and failed and failed <= BASELINE_TESTS else "FAIL"
+    print(f"pytest: {pytest_verdict}  {tail[0] if tail else ''}"
+          + ("  (only the baseline replay tests fail)" if pytest_verdict == "EXPECTED" else ""))
+    if pytest_verdict == "FAIL":
+        print(pytest_out[-3000:])
     print(f"replay: {verdict}  {why}")
     if verdict == "FAIL":
         print(out[-2000:])
-    if not pytest_ok or verdict == "FAIL":
+    if pytest_verdict == "FAIL" or verdict == "FAIL":
         return 1
     if verdict == "EXPECTED":
         print("Next: python .claude/skills/failure-to-regression/live_eval.py start")
