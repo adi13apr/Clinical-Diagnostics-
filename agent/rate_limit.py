@@ -32,6 +32,17 @@ class DailyCapReached(Exception):
         self.model, self.what, self.used, self.cap = model, what, used, cap
 
 
+class BudgetWaitTooLong(Exception):
+    """The request doesn't fit now, and waiting for room would run past the caller's max_wait.
+
+    Report jobs pass max_wait so they can fall back to the template before RQ's job timeout kills them.
+    """
+
+    def __init__(self, model, wait, max_wait):
+        super().__init__(f"{model}: no room in the budget for {wait:.1f} s, but only {max_wait:.1f} s left")
+        self.model, self.wait, self.max_wait = model, wait, max_wait
+
+
 def estimate_tokens(*parts):
     """Rough prompt size (about 3.5 characters per token for English/JSON)."""
     return int(sum(len(p if isinstance(p, str) else json.dumps(p, default=str)) for p in parts) / 3.5) + 1
@@ -51,17 +62,25 @@ class BaseBudget:
         self.clock, self.sleep, self.async_sleep = clock, sleep, async_sleep
         self._async = {}  # event loop id -> (asyncio.Lock, asyncio.Semaphore)
 
-    def acquire(self, estimated_tokens, estimated_output=0):
+    def acquire(self, estimated_tokens, estimated_output=0, max_wait=None):
         """Block (time.sleep) until a request fits; returns a handle for record().
 
         estimated_output (usually max_completion_tokens) counts against otpm: Groq checks the
         request's expected output against its output-tokens-per-minute limit before running it.
+        With max_wait (seconds), raises BudgetWaitTooLong instead of sleeping past it; a request
+        that fits right away is always reserved.
         """
+        start = self.clock()
         while True:
             event, wait = self._try_reserve(estimated_tokens, estimated_output)
             if event is not None:
                 return event
+            self._check_wait(start, wait, max_wait)
             self.sleep(wait)
+
+    def _check_wait(self, start, wait, max_wait):
+        if max_wait is not None and self.clock() - start + wait > max_wait:
+            raise BudgetWaitTooLong(self.model, wait, max_wait - (self.clock() - start))
 
     async def _atry_reserve(self, estimated_tokens, estimated_output):
         return self._try_reserve(estimated_tokens, estimated_output)
@@ -73,17 +92,20 @@ class BaseBudget:
             self._async = {key: (asyncio.Lock(), asyncio.Semaphore(self.max_concurrent))}  # drop old loops
         return self._async[key]
 
-    async def aacquire(self, estimated_tokens, estimated_output=0):
+    async def aacquire(self, estimated_tokens, estimated_output=0, max_wait=None):
         """Async acquire: waits with asyncio.sleep, so other coroutines run meanwhile.
 
-        The asyncio.Lock makes waiters for this model queue in order instead of racing.
+        The asyncio.Lock makes waiters for this model queue in order instead of racing. max_wait as in
+        acquire (the time spent waiting for the lock counts).
         """
+        start = self.clock()
         lock, _ = self._primitives()
         async with lock:
             while True:
                 event, wait = await self._atry_reserve(estimated_tokens, estimated_output)
                 if event is not None:
                     return event
+                self._check_wait(start, wait, max_wait)
                 await self.async_sleep(wait)
 
     @asynccontextmanager

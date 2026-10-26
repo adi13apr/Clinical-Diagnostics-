@@ -23,7 +23,7 @@ from typing import Any, List, Optional
 from pydantic import ValidationError
 
 from agent.llm_config import load_llm_config, provider_settings, request_options
-from agent.rate_limit import BUDGETS, DailyCapReached, estimate_tokens
+from agent.rate_limit import BUDGETS, BudgetWaitTooLong, DailyCapReached, estimate_tokens
 from agent.schema import DISCLAIMER, Report
 from agent.tools import TOOL_DECLARATIONS, ReportTools
 from services.calibration import REFER_MESSAGE, STATUS_REFER
@@ -33,7 +33,9 @@ GEMINI_MODEL = "gemini-3.8-flash"  # stable per https://ai.google.dev/gemini-api
 MAX_STEPS = 5   # LLM calls per report, including the retry
 MAX_RETRIES = 1  # re-asks after an invalid or ungrounded report
 RATE_LIMIT_MAX_RETRY_DELAY = 10.0  # seconds; on a 429, wait and retry once only if Google asks for less
-DEFAULT_REQUEST_TIMEOUT_S = 120.0  # async requests (eval runner) give up after this; counts as infrastructure
+DEFAULT_REQUEST_TIMEOUT_S = 120.0  # a request gives up after this; counts as infrastructure
+# finish_reason of a reply cut off at the output-token limit (OpenAI-compatible, Gemini)
+TRUNCATED_FINISH_REASONS = {"length", "MAX_TOKENS"}
 
 BANNED_PATTERNS = [r"diagnosis\s+(is\s+|has\s+been\s+)?confirmed", r"confirmed\s+diagnosis"]
 # A banned phrase is allowed when its own clause negates it within a few words, e.g. "not a confirmed
@@ -103,10 +105,17 @@ class LLMClient(ABC):
     or {"role": "tool", "results": [(ToolCall, dict), ...]}.
     """
     name = "llm"
+    # time.monotonic() after which a call must not wait for the rate-limit budget (set for report jobs,
+    # so they fall back to the template before RQ's job timeout); None = wait as long as needed
+    deadline = None
 
     @abstractmethod
     def generate(self, system, messages, tools, tools_allowed=True):
         """Return the next LLMTurn. tools_allowed=False forbids tool calls (final-answer turn)."""
+
+    def budget_wait_left(self):
+        """Seconds this call may wait for the budget (max_wait), or None without a deadline."""
+        return None if self.deadline is None else max(self.deadline - time.monotonic(), 0.0)
 
 
 class RateLimitError(Exception):
@@ -129,6 +138,14 @@ class RateLimitError(Exception):
         """Client-side daily cap from config/llm.json (agent/rate_limit.py)."""
         return cls(None, f"client daily {cap.what} cap for {cap.model} (per day)", f"{cap.cap} {cap.what}s"
                    if cap.what == "token" else cap.cap, provider=provider, resets="midnight UTC (client cap)")
+
+
+class BudgetDeadlineError(RateLimitError):
+    """The shared rate-limit budget had no room before the report's deadline, so the LLM wasn't called."""
+
+    def __init__(self, wait, provider):
+        super().__init__(wait, "client rate-limit budget (report deadline)", None, provider=provider,
+                         resets="the next minute")
 
 
 def quota_info(error):
@@ -155,6 +172,8 @@ def retry_delay_seconds(error):
 
 def describe_llm_error(error):
     """Short, user-facing reason for an LLM failure (the full error stays in ReportResult.error_detail)."""
+    if isinstance(error, BudgetDeadlineError):
+        return f"{error.provider} rate limit: no room in the shared token budget before the report's time limit."
     if isinstance(error, RateLimitError):
         if error.daily:
             limit = error.quota_limit
@@ -269,9 +288,12 @@ class GeminiClient(LLMClient):
         if self.budget is None:
             return None
         try:
-            return self.budget.acquire(estimate_tokens(system, [m.get("text") for m in messages], tools) + 1000)
+            return self.budget.acquire(estimate_tokens(system, [m.get("text") for m in messages], tools) + 1000,
+                                       max_wait=self.budget_wait_left())
         except DailyCapReached as cap:
             raise RateLimitError.from_daily_cap(cap, "Gemini") from cap
+        except BudgetWaitTooLong as e:
+            raise BudgetDeadlineError(e.wait, "Gemini") from e
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -286,7 +308,8 @@ class OpenAICompatibleClient(LLMClient):
                  provider="Groq", async_client=None, async_sleep=asyncio.sleep, timeout_s=DEFAULT_REQUEST_TIMEOUT_S):
         if client is None:
             from openai import OpenAI
-            client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)  # retries are handled here
+            # retries are handled here; the timeout stops a hung request (report jobs wait longer than it)
+            client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=timeout_s)
         self.client, self.model, self.name = client, model, model
         self.sleep, self.budget, self.provider = sleep, budget, provider
         self.options = dict(options or {})
@@ -394,17 +417,22 @@ class OpenAICompatibleClient(LLMClient):
         if self.budget is None:
             return None
         try:
-            return self.budget.acquire(*self._reservation_size(payload, tool_specs))
+            return self.budget.acquire(*self._reservation_size(payload, tool_specs), max_wait=self.budget_wait_left())
         except DailyCapReached as cap:
             raise RateLimitError.from_daily_cap(cap, self.provider) from cap
+        except BudgetWaitTooLong as e:
+            raise BudgetDeadlineError(e.wait, self.provider) from e
 
     async def _areserve(self, payload, tool_specs):
         if self.budget is None:
             return None
         try:
-            return await self.budget.aacquire(*self._reservation_size(payload, tool_specs))
+            return await self.budget.aacquire(*self._reservation_size(payload, tool_specs),
+                                              max_wait=self.budget_wait_left())
         except DailyCapReached as cap:
             raise RateLimitError.from_daily_cap(cap, self.provider) from cap
+        except BudgetWaitTooLong as e:
+            raise BudgetDeadlineError(e.wait, self.provider) from e
 
 
 # Parameters the openai SDK accepts as keyword arguments; provider-specific ones (Groq's
@@ -780,6 +808,21 @@ def _report_loop(tools, llm, max_steps, max_retries, tracer):
                 continue
             return fall_back(describe_llm_error(e), detail, kind)
         turn = outcome
+        if turn.finish_reason in TRUNCATED_FINISH_REASONS:
+            # Cut off at max_completion_tokens: a partial report or tool call. Never replay it; retry once.
+            problem = f"the reply was cut off at the output-token limit (finish_reason {turn.finish_reason!r})"
+            trace_event(tracer, "llm_truncated", status="error", error=problem, step=step,
+                        finish_reason=turn.finish_reason, output_tokens=(turn.usage or {}).get("output_tokens"))
+            result.problems.append(problem)
+            result.rejected.append({"step": step, "text": turn.text, "problem": problem,
+                                    "finish_reason": turn.finish_reason})
+            if retries_left == 0:
+                return fall_back(f"Report cut off at the output-token limit after {max_retries} retry.",
+                                 problem, "model")
+            retries_left -= 1
+            messages.append({"role": "user", "text": "Your previous reply was cut off at the length limit and "
+                                                     "was discarded. Try again, keeping it brief."})
+            continue
         messages.append({"role": "assistant", "turn": turn})
 
         if turn.tool_calls:

@@ -198,30 +198,42 @@ docker compose down
 
 ### What we measured
 
-One run on 2026-10-25 (21:37 UTC): Windows 11, Docker Desktop, real Supabase and Groq (`openai/gpt-oss-120b`, limits 30 requests and 8,000 tokens per minute). Every number below comes from that run's output file.
+Two runs on 2026-10-25, same setup: Windows 11, Docker Desktop, 2 API replicas, 3 workers, real Supabase and Groq (`openai/gpt-oss-120b`, limits 30 requests and 8,000 tokens per minute). **Before** (21:37 UTC) is the run that found the problem; **after** (23:59 UTC) ran with the budget fix described below. Every number comes from those runs' output files and their trace spans.
 
-**Load balancing.** Six `/health` calls were answered by both replicas in strict alternation (A, B, A, B, A, B).
+**Load balancing.** In both runs, six `/health` calls were answered by both replicas in strict alternation (A, B, A, B, A, B).
 
-**Shared state.**
+**Shared state** (after; before gave the same results).
 - The X-ray was predicted on replica A.
-- The first Grad-CAM map request went to replica B and got `200`: B found A's upload in Redis.
+- The Grad-CAM map request went to replica B and got `200`: B found A's upload in Redis.
 - The Grad-CAM image took two requests (A, then B), both `200`.
 - `POST /report` on A queued a job. The same request on B returned **the same job id** (by then `running`), so no duplicate was queued.
-- One of the three worker containers wrote the report with the LLM. Six polls were spread over both replicas.
+- One of the three worker containers wrote the report with the LLM. Four polls were spread over both replicas.
 
 **Shared Groq budget, 3 reports at once** (pixel-different images, so the report cache couldn't answer):
 
-| | Observed | Limit |
-| --- | --- | --- |
-| LLM calls (3 workers, 21:38:02 to 21:41:07 UTC) | 15 | |
-| Most requests in any 60 s | 5 | 30 |
-| Most tokens in any 60 s | 5,478 | 8,000 |
-| Tokens in total: Redis counters / trace spans | 18,742 / 18,742 | |
-| Groq rate-limit errors or retries (429) | 0 | |
+| | Before | After | Limit |
+| --- | --- | --- | --- |
+| Output tokens reserved per call (`max_completion_tokens`) | 2,000 | 600 | |
+| Job timeout (RQ) | 180 s, fixed | 300 s, derived for 3 workers | |
+| LLM calls | 15 (21:38:02 to 21:41:07 UTC) | 16 (23:59:43 to 00:02:43 UTC) | |
+| Completion tokens per call: min / median / max | 21 / 27 / 217 | 21 / 26 / 229 | |
+| Most requests in any 60 s | 5 | 6 | 30 |
+| Most tokens in any 60 s | 5,478 | 7,124 | 8,000 |
+| Tokens in total: Redis counters / trace spans | 18,742 / 18,742 | 20,511 / 20,511 | |
+| Groq rate-limit errors or retries (429) | 0 | 0 | |
+| All three jobs ended within | 182 s | 176 s | |
+| **Reports written by the LLM** | **2 of 3** (1 `JobTimeoutException`) | **3 of 3** | |
 
-- Each worker took one job, and all three jobs ended within 182 s.
-- **Two reports were written by the LLM; one fell back to the template** (`JobTimeoutException`).
-- The cause: before each call the limiter reserves a prompt estimate plus `max_completion_tokens` (2,000), which is more than a call actually uses. So the third job's last call waited in the shared budget until RQ's 180 s job timeout. The budget was never exceeded, but that cost one report. A longer job timeout or a smaller reservation would fix it; neither has been changed yet.
+- **Before:** the limiter reserved a prompt estimate plus 2,000 output tokens per call, far more than a call used. So the third job's last call waited in the shared budget until RQ's 180 s job timeout. The budget was never exceeded, but that cost one report.
+- **The fix:**
+  - Each call now reserves its prompt estimate plus 600 output tokens. That is 2.5× the largest call measured (238 tokens) and 1.5× the largest whole report (400 tokens, across 216 eval reports). The reservation still covers the most a call can use, so the shared budget still can't be exceeded.
+  - The job timeout now grows with the number of workers sharing the budget (180 s for 1 worker, 300 s for 3).
+  - A job that can't get budget before its timeout ends with the template report instead of being killed mid-wait.
+  - A reply cut off at the 600-token limit is retried once.
+- **After:** no reply reached the limit (no retries for length) and no report was rejected.
+- **Reports still wait.** 7 of the 16 calls waited 52 to 65 s each for the budget, and the slowest report took 175 s: just under the old 180 s limit, with 125 s to spare under the new one.
+  - The smaller reservation let more calls run at once: up to 7,124 tokens in a minute, against 5,478 before.
+  - It doesn't raise throughput, though. At about 5,100 real tokens per report against 8,000 per minute, the budget handles about 1.5 reports per minute whatever is reserved.
 
 **A worker dying (unplanned).** In an earlier run the PC went into standby during this step, for about 35 minutes. After it woke, 2 of the 3 jobs were marked `failed` with "The report worker stopped before finishing", rather than staying "running". Its budget peaks (5 requests, 5,591 tokens in 60 s) were also within the limits.
 

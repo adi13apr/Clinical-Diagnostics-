@@ -14,13 +14,14 @@ The worker needs no Supabase settings: it never writes to Supabase (see api/jobs
 import logging
 import signal
 import sys
+import time
 from functools import partial
 
 from rq import SimpleWorker, get_current_job
 
 from agent.agent import RedisReportCache, build_llm_client, report_result_to_json
 from agent.rate_limit import BudgetRegistry
-from api.jobs import UPLOAD_EXPIRED, ReportJobs, write_report
+from api.jobs import DEADLINE_MARGIN_S, JOB_TIMEOUT_MIN_S, UPLOAD_EXPIRED, ReportJobs, write_report
 from api.settings import Settings
 from api.state import RedisUploadStore, SerializedModel, connect_redis, redis_location
 from services.tracing import make_tracer
@@ -71,17 +72,22 @@ def run_report_job(trace_id, user_id):
 
     Returns report_result_to_json(result), which RQ keeps for RESULT_TTL_S. Spans go to a Redis list
     (and the local traces/ JSONL); the API writes them to Supabase as the user when the job is polled.
+    LLM calls stop waiting for the shared budget DEADLINE_MARGIN_S before the job timeout, so a report
+    that can't get its turn ends as the template instead of a killed job.
     """
     if _context is None:
         raise RuntimeError("Report worker not configured (configure() was never called)")
     job = get_current_job()
+    timeout = job.timeout if job.timeout and job.timeout > 0 else JOB_TIMEOUT_MIN_S
+    deadline = time.monotonic() + timeout - DEADLINE_MARGIN_S
+    log.info("Report job %s: timeout %s s", job.id, timeout)
     upload = _context.uploads.get(trace_id, user_id)
     if upload is None:
         job.meta["error"] = UPLOAD_EXPIRED
         job.save_meta()
         raise UploadExpired(trace_id)
     tracer = make_tracer(_context.jobs.span_buffer(job.id), trace_id=trace_id)  # same trace as the prediction
-    result = write_report(_context.model, upload, _context.llm_factory, _context.cache, tracer)
+    result = write_report(_context.model, upload, _context.llm_factory, _context.cache, tracer, deadline=deadline)
     return report_result_to_json(result)
 
 

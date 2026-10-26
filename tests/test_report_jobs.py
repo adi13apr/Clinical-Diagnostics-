@@ -29,14 +29,15 @@ from worker.report_worker import WorkerContext
 
 @pytest.fixture
 def queue_app(model_service, store, make_redis, tmp_path, monkeypatch):
-    """make(llm_factory, is_async) -> (client, jobs): an API in queue mode, plus a worker context on the
-    same fake Redis (its own clients, like a separate process)."""
+    """make(llm_factory, is_async, **job_options) -> (client, jobs): an API in queue mode, plus a worker
+    context on the same fake Redis (its own clients, like a separate process). job_options go to the
+    API's ReportJobs (e.g. job_timeout_s)."""
     monkeypatch.setattr("services.tracing.TRACE_DIR", tmp_path / "traces")
     previous = []
 
-    def make(llm_factory=lambda: None, is_async=False):
+    def make(llm_factory=lambda: None, is_async=False, **job_options):
         redis = make_redis()
-        jobs = ReportJobs(redis, is_async=is_async)
+        jobs = ReportJobs(redis, is_async=is_async, **job_options)
         previous.append(report_worker.configure(WorkerContext(
             model=SerializedModel(model_service), uploads=RedisUploadStore(make_redis()),
             cache=RedisReportCache(make_redis()), llm_factory=llm_factory, jobs=ReportJobs(make_redis()))))
@@ -246,7 +247,8 @@ def test_a_job_whose_worker_died_ends_failed_not_running(queue_app, monkeypatch)
     assert poll(client, job_id).json()["status"] == "running"
 
     # The worker registered the job until start + timeout + 60 s; after that, a poll marks it failed
-    later = int(time.time()) + jobs.job_timeout_s + 61
+    timeout = Job.fetch(job_id, connection=jobs.client, serializer=jobs.queue.serializer).timeout
+    later = int(time.time()) + timeout + 61
     monkeypatch.setattr("rq.registry.current_timestamp", lambda: later)
     body = poll(client, job_id).json()
     assert body["status"] == "failed" and body["error"] == WORKER_DIED
