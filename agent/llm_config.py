@@ -55,6 +55,13 @@ def agent_timeout_s(agent, config=None):
     return float((config or load_llm_config()).get("agents", {}).get(agent, {}).get("timeout_s", 120))
 
 
+def agent_request_options(agent, model, config=None):
+    """The model's request options with the agent's overrides (config/llm.json agents.<agent>.request_options)."""
+    config = config or load_llm_config()
+    overrides = config.get("agents", {}).get(agent, {}).get("request_options", {})
+    return {**request_options(model, config), **{k: v for k, v in overrides.items() if not k.startswith("_")}}
+
+
 def request_options(model, config=None):
     """API request options for a model; keys starting with '_' are comments and never sent."""
     options = (config or load_llm_config()).get("request_options", {}).get(model, {})

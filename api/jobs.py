@@ -79,9 +79,10 @@ def write_report(model, upload, llm_factory, cache, tracer, deadline=None):
         finish_trace(tracer)  # spans of a report that raised are still kept
 
 
-def _windows(workers, calls, prompt_tokens, tpm, rpm, max_completion_tokens):
-    """60 s windows `workers` reports need on one model's per-minute limits."""
-    reserved = prompt_tokens + calls * max_completion_tokens
+def _windows(workers, calls, prompt_tokens, tpm, rpm, max_completion_tokens, output_tokens=None):
+    """60 s windows `workers` reports need on one model's per-minute limits. output_tokens (the calls'
+    caps together) replaces calls x max_completion_tokens when the calls have different caps."""
+    reserved = prompt_tokens + (calls * max_completion_tokens if output_tokens is None else output_tokens)
     windows = 1
     if tpm:
         windows = max(windows, math.ceil(workers * reserved / tpm))
@@ -90,7 +91,8 @@ def _windows(workers, calls, prompt_tokens, tpm, rpm, max_completion_tokens):
     return windows
 
 
-def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0, pipeline="single", verifier=None):
+def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0, pipeline="single", verifier=None,
+                       writer_max_completion_tokens=None):
     """RQ job_timeout (s) for one report, derived from the shared LLM budget.
 
     Every running worker draws on the same per-minute limits, so a report gets about 1/workers of
@@ -99,15 +101,18 @@ def report_job_timeout(workers, tpm=None, rpm=None, max_completion_tokens=0, pip
     max_completion_tokens per call. Bounded to [JOB_TIMEOUT_MIN_S, JOB_TIMEOUT_MAX_S]; a worse than
     fair share is caught by the deadline (the template report instead of a killed job).
 
-    pipeline="multi": the evidence agent and writer use the report model (with one revision), and the
-    verifier ({tpm, rpm, max_completion_tokens} of its model, a separate budget) adds its own windows,
-    since it runs after the writer.
+    pipeline="multi": the evidence agent (3 calls at max_completion_tokens) and the writer (2 calls at
+    writer_max_completion_tokens) use the report model, and the verifier ({tpm, rpm, max_completion_tokens}
+    of its model, a separate budget) adds its own windows, since it runs after the writer.
     """
     workers = max(int(workers or 1), 1)
     if pipeline != "multi":
         windows = _windows(workers, REPORT_CALLS, REPORT_PROMPT_TOKENS, tpm, rpm, max_completion_tokens)
     else:
-        windows = _windows(workers, MULTI_REPORT_CALLS, MULTI_REPORT_PROMPT_TOKENS, tpm, rpm, max_completion_tokens)
+        writer_cap = max_completion_tokens if writer_max_completion_tokens is None else writer_max_completion_tokens
+        output = (MULTI_REPORT_CALLS - 2) * max_completion_tokens + 2 * writer_cap
+        windows = _windows(workers, MULTI_REPORT_CALLS, MULTI_REPORT_PROMPT_TOKENS, tpm, rpm, max_completion_tokens,
+                           output_tokens=output)
         if verifier:
             windows += _windows(workers, MULTI_VERIFIER_CALLS, MULTI_VERIFIER_PROMPT_TOKENS, **verifier)
     return int(min(max(JOB_BASE_S + WINDOW_S * windows, JOB_TIMEOUT_MIN_S), JOB_TIMEOUT_MAX_S))
@@ -123,12 +128,15 @@ def _model_budget(model, config):
 def report_model_budget(config=None):
     """{tpm, rpm, max_completion_tokens} of the configured report model (config/llm.json), plus
     pipeline="multi" and the verifier model's budget when REPORT_PIPELINE is multi."""
-    from agent.llm_config import load_llm_config, pipeline_mode, provider_settings
+    from agent.llm_config import agent_request_options, load_llm_config, pipeline_mode, provider_settings
     config = config or load_llm_config()
     settings = provider_settings(config)[1]
     if pipeline_mode(config) == "multi" and settings["kind"] == "openai_compatible":
-        return {**_model_budget(settings["writer_model"], config), "pipeline": "multi",
-                "verifier": _model_budget(settings["verifier_model"], config)}
+        def cap(agent):
+            return int(agent_request_options(agent, settings[f"{agent}_model"], config).get("max_completion_tokens", 1000))
+        verifier = {**_model_budget(settings["verifier_model"], config), "max_completion_tokens": cap("verifier")}
+        return {**_model_budget(settings["evidence_model"], config), "max_completion_tokens": cap("evidence"),
+                "pipeline": "multi", "writer_max_completion_tokens": cap("writer"), "verifier": verifier}
     return _model_budget(settings["report_model"], config)
 
 

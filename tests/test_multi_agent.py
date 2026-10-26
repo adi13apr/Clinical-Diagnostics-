@@ -324,6 +324,32 @@ def test_model_failure_retried_once_infrastructure_falls_back(make_tools):
     assert result.reason.startswith("verifier agent:") and "network down" in result.error_detail
 
 
+def json_validate_failed():
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    body = {"error": {"message": "Failed to generate JSON.", "type": "invalid_request_error",
+                      "code": "json_validate_failed",
+                      "failed_generation": "max completion tokens reached before generating a valid document"}}
+    return openai.BadRequestError("Error code: 400 - json_validate_failed",
+                                  response=httpx.Response(400, request=request), body=body)
+
+
+def test_json_validate_failed_is_a_model_failure_retried_once(make_tools):
+    """Found by the smoke run: the writer's strict JSON hit max_completion_tokens (Groq 400)."""
+    from agent.agent import classify_llm_error, describe_llm_error
+    assert classify_llm_error(json_validate_failed()) == "model"
+    assert "JSON" in describe_llm_error(json_validate_failed())
+    tools = make_tools()
+
+    def cut(messages):
+        raise json_validate_failed()
+    pipeline = make_pipeline(writer=[cut, MockLLMClient.final(good_report(tools))], verifier=[MockLLMClient.final(verdict(True))])
+    result = generate_multi_agent_report(tools, pipeline)
+    assert result.source == "llm" and result.rejected[0]["text"] is None
+    pipeline = make_pipeline(writer=[cut, cut])
+    result = generate_multi_agent_report(tools, pipeline)
+    assert result.source == "fallback" and result.error_kind == "model"  # recorded by the eval, not a stop
+
+
 def test_rate_limit_falls_back_without_retry(make_tools):
     tools = make_tools()
 
@@ -483,6 +509,10 @@ def test_build_report_llm_multi_from_env_with_its_own_client_per_agent(monkeypat
     assert clients["evidence"].budget is clients["writer"].budget  # ...one shared budget per model
     assert clients["verifier"].budget is budgets.get("openai/gpt-oss-20b")
     assert llm.timeouts == {"evidence": 180, "writer": 150, "verifier": 120}
+    # Per-agent request options: the writer's strict JSON draft needs more room than a tool call
+    caps = {agent: client.options["max_completion_tokens"] for agent, client in clients.items()}
+    assert caps == {"evidence": 600, "writer": 1200, "verifier": 1600}
+    assert clients["writer"].options["reasoning_effort"] == "low"  # the model's own options are kept
     assert build_report_llm("single").pipeline == "single"  # an explicit argument wins
 
 
@@ -611,7 +641,11 @@ def test_job_timeout_for_the_multi_pipeline_counts_both_models(monkeypatch):
     assert report_job_timeout(1, tpm=8000, rpm=30, max_completion_tokens=600) == 180  # single unchanged
     monkeypatch.setenv("REPORT_PIPELINE", "multi")
     budget = report_model_budget()
-    assert budget["pipeline"] == "multi" and budget["verifier"]["max_completion_tokens"] == 1000
+    assert budget["pipeline"] == "multi" and budget["verifier"]["max_completion_tokens"] == 1600
+    assert budget["max_completion_tokens"] == 600 and budget["writer_max_completion_tokens"] == 1200
+    # Report model 5,600 + 3 x 600 + 2 x 1,200 = 9,800 reserved -> 2 windows; verifier 3,000 + 2 x 1,600 = 6,200
+    # -> 1 window: 240 s. 3 workers: 4 + 3 windows -> 480 s
+    assert report_job_timeout(1, **budget) == 240 and report_job_timeout(3, **budget) == 480
 
 
 # ---- Streamlit: "Generate report" runs whatever build_report_llm returns ----

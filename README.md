@@ -74,8 +74,22 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 - **Source confound:** each disease comes from a different dataset (pneumonia: pediatric JPEGs; TB: adult PNGs; Normal: both). The model may partly learn the source. Normal recall is 100% on images from the TB dataset but 95.1% on images from the pneumonia dataset, and every metric above is in-distribution.
 - **Slow reports:** about 58 s each on Groq's free tier, mostly waiting to stay under the 8k tokens/min limit (4 sequential LLM calls per report).
 - **Grad-CAM** is coarse (a 3×2 grid, not a lung segmentation) and usually diffuse.
-- **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one in the 20 Oct run). The guard now blocks the missing dataset caveat that caused, but it doesn't check that region text came from `get_gradcam`.
+- **The model can skip a tool.** In the default single-agent pipeline, nothing forces the report model to call all three tools (`c07` skipped one in the 20 Oct run). The guard now blocks the missing dataset caveat that caused, but it doesn't check that region text came from `get_gradcam`. The experimental multi-agent pipeline (below) re-asks once for a skipped tool and otherwise uses the template.
 - **Unreviewed medical text:** the condition text in `agent/condition_info.json` is a draft that hasn't been reviewed by a clinician. The judge model is a Groq *Preview* model.
+
+### Multi-agent report pipeline (experimental, off by default)
+
+`REPORT_PIPELINE=multi` swaps the single report agent for three agents run by an orchestrator ([`agent/multi_agent.py`](agent/multi_agent.py)). The single agent stays the default and the baseline for comparison.
+
+1. **Evidence agent** (`gpt-oss-120b`, tool calls): must call all three tools. If it stops early, it is asked once more, naming the missing tool; otherwise the template report is used.
+2. **Writer** (`gpt-oss-120b`, no tools): writes the report as strict JSON from the tool outputs only, including the dataset caveat.
+3. **Guard:** the same deterministic checks as before, on every draft.
+4. **Verifier** (`gpt-oss-20b`, a separate Groq budget): checks each claim against the tool outputs. An unsupported claim sends the draft back once.
+5. **Guard again** on the final report: it has the last word, even after the verifier approves.
+
+Every step is a trace span (agent, tokens, latency, verdict), and each agent has its own time limit.
+
+**Smoke run, n=3, not a result** (c07, c29, c35): all three were written by the LLM and passed every deterministic check, and `c07` called all three tools. Each report used about 3.5k tokens on the report model (single agent: about 5.1k) plus about 2.1k on the verifier. When the budget had room, a report took about 5 s. The full 36-case comparison comes next, in its own branch.
 
 ## Why the eval runner is async (and why that isn't threads)
 

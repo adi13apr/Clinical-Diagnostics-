@@ -192,14 +192,21 @@ def describe_llm_error(error):
     if hasattr(error, "status_code"):  # openai.APIStatusError (Groq and other OpenAI-compatible APIs)
         if _is_tool_use_failed(error):
             return "The model produced an invalid tool call."
+        if _is_bad_generation(error, "json_validate_failed"):
+            return "The model's JSON output didn't match the schema (or was cut off)."
         return f"LLM API error {error.status_code}."
     return f"LLM call failed ({type(error).__name__})."
 
 
 def _is_tool_use_failed(error):
+    return _is_bad_generation(error, "tool_use_failed")
+
+
+def _is_bad_generation(error, code_name):
+    """A 400 with this error code: the model's output was malformed (not the request or the service)."""
     body = getattr(error, "body", None)
     code = (body.get("error", body) if isinstance(body, dict) else {}).get("code") if isinstance(body, dict) else None
-    return getattr(error, "status_code", None) == 400 and (code == "tool_use_failed" or "tool_use_failed" in str(error))
+    return getattr(error, "status_code", None) == 400 and (code == code_name or code_name in str(error))
 
 
 def classify_llm_error(error):
@@ -209,7 +216,10 @@ def classify_llm_error(error):
     """
     if isinstance(error, RateLimitError):
         return "rate_limit"
-    if _is_tool_use_failed(error) or isinstance(error, json.JSONDecodeError):
+    # json_validate_failed: strict json_schema output that didn't validate, e.g. cut off at
+    # max_completion_tokens (the multi-agent writer/verifier; the single agent never asks for it)
+    if (_is_tool_use_failed(error) or _is_bad_generation(error, "json_validate_failed")
+            or isinstance(error, json.JSONDecodeError)):
         return "model"
     return "infrastructure"
 
@@ -625,7 +635,7 @@ def build_report_llm(pipeline=None, config=None, budgets=None):
     show the pipeline that actually ran. Each agent gets its own client; agents on the same model share
     that model's budget from budgets (as build_llm_client).
     """
-    from agent.llm_config import AGENT_ROLES, agent_timeout_s, pipeline_mode
+    from agent.llm_config import AGENT_ROLES, agent_request_options, agent_timeout_s, pipeline_mode
     config = config or load_llm_config()
     mode = pipeline or pipeline_mode(config)
     if mode == "single":
@@ -641,6 +651,8 @@ def build_report_llm(pipeline=None, config=None, budgets=None):
                for agent in AGENT_ROLES}
     if any(client is None for client in clients.values()):
         return None
+    for agent, client in clients.items():  # e.g. the writer's larger max_completion_tokens
+        client.options = agent_request_options(agent, client.model, config)
     from agent.multi_agent import MultiAgentPipeline
     return MultiAgentPipeline(**clients, timeouts={agent: agent_timeout_s(agent, config) for agent in AGENT_ROLES})
 

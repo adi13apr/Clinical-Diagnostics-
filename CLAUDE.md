@@ -32,6 +32,7 @@ $env:INTEGRATION_REDIS_URL="redis://127.0.0.1:6380/15"; pytest tests/test_integr
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
 python -m evals.run --replay       # re-score the committed eval run (no network; what CI runs)
 python -m evals.run --live --resume  # continue the live eval (real model + LLM; needs data/ and a key)
+python -m evals.run --live --pipeline multi --cases c07,c29,c35 --run-file <scratch>.jsonl  # multi-agent smoke run
 python -m evals.benchmark --simulated  # old (sync) vs new (async) runner with fake-latency clients
 cd web && npm install && npm run dev   # React UI on :5173 (needs web/.env.local and the API)
 cd web && npm run lint && npm run build
@@ -104,7 +105,9 @@ services/                   Non-UI logic. Each module exposes one class (calibra
 agent/                      LLM report agent (see "Report agent")
   schema.py                 Pydantic Report + fixed DISCLAIMER
   tools.py                  ReportTools: run_classifier, get_gradcam, get_condition_info; TOOL_DECLARATIONS
-  agent.py                  LLMClient / OpenAICompatibleClient / GeminiClient / MockLLMClient, tool loop, guard, fallback
+  agent.py                  LLMClient / OpenAICompatibleClient / GeminiClient / MockLLMClient, tool loop, guard, fallback,
+                            build_report_llm (REPORT_PIPELINE), run_report, the report cache
+  multi_agent.py            Multi-agent pipeline: evidence agent -> writer -> verifier, run by an orchestrator
   llm_config.py             Provider selection + keys from config/llm.json, st.secrets, env
   rate_limit.py             Token-aware per-model budgets (rpm, tpm, otpm, daily caps; sync + async): ModelBudget (memory),
                             RedisModelBudget (shared via REDIS_URL, API only), BudgetRegistry, budget_for()
@@ -203,11 +206,11 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
 
 ## Report agent (`agent/`)
 
-- **Flow:** "Generate report" → `generate_report_for_image(model_service, image, prediction, build_llm_client())` → `ReportResult(report, source="llm"|"fallback", model, reason, steps, problems, tool_calls, rejected, error_detail, cached)`.
+- **Flow:** "Generate report" → `generate_report_for_image(model_service, image, prediction, build_report_llm())` → `ReportResult(report, source="llm"|"fallback", model, reason, steps, problems, tool_calls, rejected, error_detail, cached, pipeline, pipeline_note, agent_models, revisions, findings)`. `build_report_llm()` returns the single agent's client (default) or a `MultiAgentPipeline` (see "Multi-agent pipeline"); `run_report` picks the loop. Every entry point (Streamlit, API, worker, MCP, `evals.run`) goes through it.
   - `rejected` holds the exact text of every LLM output the guard rejected; save real ones to `tests/fixtures/` as regression tests.
   - `reason` is short and user-facing. The raw provider error goes in `error_detail` and is never shown in the UI.
 - **Cache:** `REPORT_CACHE` is a process-wide, thread-safe LRU of 256 entries, keyed by (SHA-256 of the decoded pixels + mode + size, temperature, model name).
-  - The Streamlit app always uses it. The API uses `RedisReportCache` instead when `REDIS_URL` is set (same `get`/`put`, TTL 24 h, key `cdp:report:v1:{fingerprint}:{temperature!r}:{model}`).
+  - The Streamlit app always uses it. The API uses `RedisReportCache` instead when `REDIS_URL` is set (same `get`/`put`, TTL 24 h, key `cdp:report:v2:{pipeline}:{fingerprint}:{temperature!r}:{model}`; v2 since 2026-10-26, when the pipeline joined the key, so a single and a multi report for the same image never share an entry).
   - Redis values are JSON (`report_result_to_json`: every `ReportResult` field, the `Report` via `model_dump`), never pickle. Reading re-validates the `Report`; a value that doesn't parse, or any Redis error, is a miss reported to `on_error` (the API logs it). Bump `RedisReportCache.VERSION` when the format changes.
   - `agent/agent.py` never imports `redis` (the client is passed in), so the Streamlit app needs no Redis package; `tests/test_shared_state.py` checks this.
   - Only `source == "llm"` results are cached. Fallbacks are free to rebuild, and caching one would block a later Gemini attempt.
@@ -256,6 +259,24 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - Model turns are replayed as received, which keeps thought signatures. Each `FunctionResponse` carries the call's `id` and `name`.
   - The final answer is plain JSON text, not `response_json_schema`: combining structured output with tools wasn't confirmed in the docs.
 - **Tests** use `MockLLMClient` (scripted `LLMTurn`s / callables). The Gemini and Groq wiring is tested offline with fake clients (`tests/test_providers.py` fakes `chat.completions.create` and builds real `openai` errors with `httpx` responses). Never call the network in tests.
+
+## Multi-agent pipeline (`agent/multi_agent.py`)
+
+- **Switch:** `REPORT_PIPELINE=single|multi` (env; on Streamlit Cloud a top-level secret of that name becomes the env var), else `report_pipeline` in `config/llm.json`, **default `single`** until a full eval shows multi is at least as good. `build_report_llm(pipeline=None)` reads it (`evals.run --pipeline` overrides). Multi needs an OpenAI-compatible provider (strict `json_schema`); with `LLM_PROVIDER=gemini` the single agent runs and `pipeline_note` says so. `ReportResult.pipeline`, the `report` span's `pipeline`/`pipeline_note` attributes, the API's `ReportResponse.pipeline`, MCP's `ReportOut.pipeline` and eval records all hold the pipeline that **actually ran**, never the requested one.
+- **The single agent is the baseline and is untouched:** `_report_loop`, `SYSTEM_PROMPT` and the guard rules are the same. Change the multi pipeline only in `_Orchestrator`.
+- **States** (`State`, one `orchestrator_state` event per transition): `evidence → write → guard → verify → final_guard → done`; `write` again for one revision (`MAX_REVISIONS = 1`, shared by the guard and the verifier); `fallback` from anywhere (the same `fallback_report` template).
+- **Agents** (each its own client from `build_llm_client(model=...)`, so per-agent deadlines don't clash; agents on one model share its budget, in Redis when `REDIS_URL` is set; `agents.<agent>.request_options` override the model's options):
+  - **Evidence** (`evidence_model`, 120b; tool calls, `EVIDENCE_SYSTEM`): must call `run_classifier`, `get_gradcam` and `get_condition_info` **for the predicted class** (another class doesn't count). It stops as soon as all three returned (no final-text call). If it answers in text first, the orchestrator re-asks once, naming what's missing (`evidence_reask` event); still missing → template (`error_kind` model). This fixes c07's skipped tool for multi. The `EvidenceBundle` holds the tool outputs only (never the agent's words), plus `dataset_caveat` = `model_limitations[0]`.
+  - **Writer** (`writer_model`, 120b; `generate_json` with `REPORT_JSON_SCHEMA`, strict; `WRITER_SYSTEM`): sees `EvidenceBundle.prompt_json()` only. Cap 1200 (`agents.writer.request_options`): strict JSON plus reasoning used 584 of 600 on c35, and 600 got Groq's 400 `json_validate_failed` ("max completion tokens reached"). That 400 is now classified `model` (one retry, then the template).
+  - **Verifier** (`verifier_model`, `openai/gpt-oss-20b`, Production, **its own** Groq budget: 1000 requests/day and 8000 tokens/min on this account; cap 1600, measured 745–895): `VERDICT_JSON_SCHEMA` → `VerifierVerdict(findings=[ClaimFinding(claim, supported, source, reason)])`, at least one. It sees the bundle and the draft without the disclaimer. Any unsupported claim → one revision; still unsupported → template. Invalid verdict → one retry → template.
+- **Guard:** `check_grounding` on every draft **before** the verifier (a rejected draft never costs a verifier call; event `guard`), and on the final report with the fixed disclaimer (event `final_guard`): it has the last word even after the verifier approved. Schema-invalid drafts are rejections too.
+- **`rejected` vs `revisions`:** `rejected` keeps the single agent's meaning (drafts the guard rejected, cut-off drafts, model errors with `text: None`), so `guard_replay_consistent` still holds. Drafts the verifier sent back go to `revisions` (`by`, `text`, `problems`, `unsupported`) only; in `rejected` they would fail the replay, because the guard accepts them.
+- **One loop, two drivers:** `_Orchestrator.run` is a generator yielding `AgentRequest(agent, step, kind "tools"|"json", ..., deadline)`; `_drive_sync` (app, API, worker) and `_drive_async` (eval) call `generate`/`generate_json` or their async versions. Tested equal.
+- **Time limits:** `config/llm.json` `agents.<agent>.timeout_s` (evidence 180, writer 150, verifier 120 s): wall clock **including budget waits**, per stage invocation. `_arm` sets the client's `deadline` (budget waits stop there → `BudgetDeadlineError`) and `call_timeout_s` (the request's own timeout) to what's left; nothing left → `AgentTimeoutError` (infrastructure). A report job's deadline (`pipeline.deadline`, set by `write_report`) caps every stage.
+- **Tracing:** `report` (pipeline=multi) → `evidence_agent` / `writer_agent` / `verifier_agent` spans (agent, model, step, calls, input/output tokens, verdict, latency) → their `llm_call` (with `agent`) and `tool_call` spans; events `orchestrator_state`, `handoff` (from/to agent, message type, chars), `evidence_reask`, `revision_requested`, `guard`, `final_guard`, `fallback_used`, all in `EVENT_SPANS`. `summarize_spans` groups `llm_call`s by their enclosing `report` span, so a multi report counts once.
+- **Job timeout:** `report_job_timeout(..., pipeline="multi", writer_max_completion_tokens=, verifier=)`: the report model reserves 5,600 prompt + 3×600 + 2×1,200 (one revision), and the verifier adds its own windows (3,000 + 2×1,600): 1 worker 240 s, 3 workers 480 s.
+- **Estimated vs measured.** Limiter estimates on real tool outputs: evidence 551 + 691 + 921, writer 1,473, revision 1,946, verifier 1,479. **Smoke run, n=3, not results** (2026-10-26, c07/c29/c35, with the verifier cap still at 1000; the run file is not in the repo): 5 calls each; 120b 2.9k in + 0.5–0.6k out, 20b 1.3k in + 0.75–0.9k out, so about 5.6k tokens per report in total vs about 5.1k for single, but only about 3.5k on the report model. 4.5–5.5 s when the budget had room, 55.5 s for the third report (waiting for 120b's window). 3/3 written by the LLM, no revisions, every deterministic check passed (c07 called all three tools and quoted the caveat). The full comparison belongs to a separate branch.
+- **Tests:** `tests/test_multi_agent.py` (each agent alone, transitions, re-ask, revision limit, guard before and after the verifier, timeouts, sync = async, cache keys, factory, Streamlit `AppTest`, eval record with the unchanged checks, job timeout); multi variants in `test_api.py` (inline), `test_report_jobs.py` (worker, job deadline) and `test_mcp_server.py` (every `generate_report` test runs in both modes). `tests/conftest.py` clears `REPORT_PIPELINE` for every test.
 
 ## Tracing (`services/tracing.py`)
 
@@ -403,7 +424,7 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **Tracing:** same span names as the dashboard. `/predict` makes the trace (`prediction` → `preprocess`/`classify`/`calibrate`, `log_prediction`), and `/gradcam` and `/report` add to the same `trace_id`. Sinks are local JSONL plus `SupabaseTraceStore(user db)`; sink errors become a response warning.
 - **matplotlib:** `api/__init__.py` sets the `Agg` backend. Outside Streamlit, Windows picked Tk, and the Grad-CAM figure crashed in worker threads (found by a real-model smoke test).
 - **Type hints:** the "no type hints" rule doesn't apply to the API's FastAPI parameters and Pydantic models, which need annotations. Plain helpers in `api/` still have none.
-- **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `MAX_UPLOAD_MB`, `REDIS_URL` (needed for more than one replica; it also switches reports to the worker queue, so **run at least one worker** with it).
+- **Deploy:** see "Deployment". Env vars: `SUPABASE_URL`, `SUPABASE_KEY` (publishable), optionally `SUPABASE_JWT_SECRET`, `FRONTEND_URL` (comma-separated), `GROQ_API_KEY`, `REPORT_PIPELINE` (single|multi; give the API and the workers the same value, docker-compose.yml passes it to both), `MAX_UPLOAD_MB`, `REDIS_URL` (needed for more than one replica; it also switches reports to the worker queue, so **run at least one worker** with it).
 
 ## MCP server (`mcp_server/`)
 
@@ -411,7 +432,7 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **SDK:** `mcp` 2.x. `FastMCP` was renamed `mcp.server.mcpserver.MCPServer`; `mcp.server.fastmcp` only raises an error. Tests use `mcp.Client(server)` (in memory) and `Client(StdioServerParameters(...))`.
 - **Tools** (`create_server` in `server.py`): `classify_xray`, `gradcam_summary`, `generate_report`, `get_trace`, `eval_summary`. Tool bodies are blocking and run in `anyio.to_thread` via `run_blocking`. The model behind `SerializedModel` (from `api/state.py`) is loaded on the first call, so `initialize`/`tools/list` need no torch work.
   - Output fields reuse `ReportTools.run_classifier()` (4 dp) and `GRADCAM_CAVEAT`, so they match what the report agent sees.
-  - `generate_report` calls `generate_report_for_image` (process-wide `REPORT_CACHE`, guard, retry, template). It maps `source` "fallback" → **"template"**, and never returns `error_detail`.
+  - `generate_report` calls `generate_report_for_image` (process-wide `REPORT_CACHE`, guard, retry, template) with `build_report_llm()`, so `REPORT_PIPELINE` applies. It maps `source` "fallback" → **"template"**, never returns `error_detail`, and returns `pipeline` (the one that ran), `pipeline_note` and `revisions`.
   - **One trace per prediction:** each `classify_xray` is a new trace, remembered by `image_fingerprint` (LRU 100, no pixels or paths). `gradcam_summary`/`generate_report` on the same image add to it, classifying first if the image is new.
   - `get_trace` reads only `MCP_TRACE_DIR` (default `traces/mcp/`), **never** the app's shared `traces/*.jsonl`.
   - `eval_summary` accepts only `latest` or `^\d{8}T\d{6}Z$` that exists in `evals/runs/`, and refuses a dataset-hash mismatch.
@@ -493,6 +514,8 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - `requirements.txt` is unpinned and is what Streamlit Cloud installs. Dev-only tools go in `requirements-dev.txt`.
 
 ## Known issues (not yet fixed)
+
+- Multi-agent pipeline: only a 3-case smoke run so far, so the default stays `single` until a full 36-case comparison (separate branch). The verifier is an LLM and may flag supported claims (false positives would show up as revisions and fallbacks). Throughput is still bounded by 120b's 8k tokens/min; the verifier's tokens come from 20b's own bucket. Not run with Gemini (falls back to single by design).
 
 - `agent/condition_info.json` is a draft that hasn't had clinical review. It must be signed off before clinical use.
 - The judge (`qwen/qwen3.8-27b`) is a Groq **Preview** model; Groq may change or remove it. Re-confirm the ID before relying on old scores.
