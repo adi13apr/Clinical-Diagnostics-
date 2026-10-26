@@ -22,6 +22,7 @@ from PIL import Image
 
 from agent.agent import REPORT_CACHE, MockLLMClient, RedisReportCache, ReportCache
 from agent.rate_limit import BUDGETS, ModelBudget, RedisModelBudget
+from test_agent import CAVEAT
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier
 from api.main import check_redis, create_app, daily_volume, shared_state
 from api.settings import Settings
@@ -535,7 +536,7 @@ def report_script(truth):
         "summary": f"The model's most likely category is {truth['predicted_class']}. "
                    "This is a screening result, not a diagnosis.",
         "recommendation": "Share this result with a clinician at the next visit.",
-        "limitations": ["Evaluated on two public datasets only."],
+        "limitations": [CAVEAT],
         "disclaimer": "Not medical advice.",
     }
     return [MockLLMClient.tool("run_classifier"), MockLLMClient.tool("get_gradcam"),

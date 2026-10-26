@@ -49,8 +49,10 @@ def test_reproduce_finds_a_case_by_prefix_and_diagnoses_it(tmp_path, capsys):
     record, path = reproduce.load_record("c07", run)
     assert record["case_id"].startswith("c07-") and path == run
     d = reproduce.show_record(record, path)
-    assert d == {"failing_checks": ["dataset_caveat_present"], "guard_ok": True, "guard_problem": None}
-    assert "Guard today: ACCEPTS" in capsys.readouterr().out
+    # The guard has required the caveat since the c07 fix, so the recorded LLM report no longer replays
+    assert d["failing_checks"] == ["guard_replay_consistent", "dataset_caveat_present"]
+    assert not d["guard_ok"] and "must include this caveat" in d["guard_problem"]
+    assert "Guard today: rejects" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         reproduce.load_record("c09", run)
 
@@ -61,7 +63,8 @@ def test_reproduce_writes_a_fixture_the_generic_test_can_enforce(tmp_path, monke
     reproduce.write_fixture("gptoss_c07_test", "c07 skipped a tool", record, None, reproduce.diagnose(record))
     fixture = json.loads((tmp_path / "gptoss_c07_test.json").read_text(encoding="utf-8"))
     assert fixture["report"] == record["report"] and fixture["truth"]["status"] == "refer"
-    assert fixture["expect"] == {"guard": "reject", "guard_problem": None, "checks_fail": ["dataset_caveat_present"]}
+    assert fixture["expect"] == {"guard": "reject", "guard_problem": None,
+                                 "checks_fail": ["guard_replay_consistent", "dataset_caveat_present"]}
     with pytest.raises(SystemExit):  # never overwrites
         reproduce.write_fixture("gptoss_c07_test", "again", record, None, reproduce.diagnose(record))
 

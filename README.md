@@ -20,7 +20,7 @@ The React app works only while that PC is on: the API isn't on a cloud host yet,
 2. **Calibration and triage:** raw probabilities are rescaled with a single temperature fitted on the validation split. If the top calibrated probability is below **0.9**, the result is marked **refer: uncertain, clinician review recommended**.
 3. **Grad-CAM:** computed on the last convolutional layer, summarised as the most influential zone of the image.
 4. **Report agent:** an LLM (Groq `openai/gpt-oss-120b` by default) gathers facts through three tools: classifier output, Grad-CAM summary, and the project's fixed condition text (a draft that a clinician hasn't reviewed yet; see [Known limits](#known-limits)).
-   - A guard rejects any report whose class, probability or status differs from the classifier, or that claims a confirmed diagnosis.
+   - A guard rejects any report whose class, probability or status differs from the classifier, that claims a confirmed diagnosis, or that leaves out the dataset caveat from the condition-info tool.
    - After one retry, a fixed template report is used instead.
    - The LLM never sees the image or patient details, and can't change the prediction.
 5. **Logging:** predictions, triage status and step-level traces (latency, tokens, guard verdicts) go to Supabase, with per-user row-level security, and to local JSONL.
@@ -42,13 +42,12 @@ The raw model was strongly **under**-confident: its probabilities never reached 
 
 ### Report agent eval
 
-36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-20.md`](evals/results/2026-10-20.md).
+36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-26.md`](evals/results/2026-10-26.md).
 
-- **Deterministic checks: 11 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
-  - The 12th check, that the dataset caveat is quoted from the tool, fails on 1 of 36 (`c07`): the model skipped the condition-info tool and invented its own limitations.
+- **Deterministic checks: 12 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; the dataset caveat is quoted from the tool; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
   - CI replays this run on every push and fails if any rate drops.
-- All 36 reports were written by the LLM: no template fallbacks and no guard rejections.
-- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.58–4.97 out of 5 on faithfulness, uncertainty language, actionability and plain language.
+- All 36 reports were written by the LLM, with no template fallbacks. The guard rejected 2 drafts (`c35`, `c36`: confident TB results whose recommendation opened with "Refer:"), and both were fixed on the one retry.
+- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.64–5.0 out of 5 on faithfulness, uncertainty language, actionability and plain language.
 - **Judge vs human:** I scored 15 reports blind (from the 18 Oct run) with the same rubric. They agree on 82% of scores exactly and 97% within one point, but both of us rated almost everything 5, so that number is flattering.
   - The one report I marked down (`c32`: "No immediate referral is required" for a 99.99% Pneumonia result) got 5/5 from the judge on faithfulness and actionability.
 - **Judge sensitivity:** given 5 deliberately bad reports (wrong class, missing referral, TB "no follow-up needed", overconfident wording, invented symptom), the judge scored the broken part 1/5 in **all 5** ([`evals/judge_sensitivity.md`](evals/judge_sensitivity.md)). The guard blocks 3 of them.
@@ -68,13 +67,14 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 - **Ungrounded caveat.** In the pilot, the judge marked down a report for saying the model was evaluated on "two public datasets". The fact was true, but it came from the agent's instructions rather than any tool output. It was moved into a tool, so it's now grounded.
 - **Dismissed follow-up (found by human review, missed by the judge).** `c32` said "No immediate referral is required" for a 99.99% Pneumonia result. The guard now rejects any Pneumonia/TB report that says no referral, action or follow-up is needed, and the template always recommends clinician follow-up. In the latest run, `c32` reads "Clinician follow-up is advised…".
 - **My own regression (found by the judge, missed by the guard).** The first prompt wording for that rule made 5 of 8 confident Pneumonia/TB reports open with "Refer: uncertain…", calling 99.99% results uncertain. The judge scored them 1–2. The prompt was fixed and the guard now rejects it; that run is kept as evidence (`evals/runs/20261020T071107Z`).
+- **Missing dataset caveat (found by an eval check, missed by the guard and the judge).** `c07` skipped the condition-info tool and invented its own limitations ("may be affected by image quality, positioning…"), dropping the dataset/source-confound caveat; the judge gave it faithfulness 5. The guard now reads the caveat from the tool itself and rejects any report that doesn't quote it, whichever tools the model called, and its rejection message quotes the text to copy on the retry. That exact report is a fixture, and in the next run (`20261026T040807Z`) all 36 reports carry the caveat.
 
 ### Known limits
 
 - **Source confound:** each disease comes from a different dataset (pneumonia: pediatric JPEGs; TB: adult PNGs; Normal: both). The model may partly learn the source. Normal recall is 100% on images from the TB dataset but 95.1% on images from the pneumonia dataset, and every metric above is in-distribution.
 - **Slow reports:** about 58 s each on Groq's free tier, mostly waiting to stay under the 8k tokens/min limit (4 sequential LLM calls per report).
 - **Grad-CAM** is coarse (a 3×2 grid, not a lung segmentation) and usually diffuse.
-- **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one). The eval flags it, but the guard doesn't block it yet.
+- **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one in the 20 Oct run). The guard now blocks the missing dataset caveat that caused, but it doesn't check that region text came from `get_gradcam`.
 - **Unreviewed medical text:** the condition text in `agent/condition_info.json` is a draft that hasn't been reviewed by a clinician. The judge model is a Groq *Preview* model.
 
 ## Why the eval runner is async (and why that isn't threads)

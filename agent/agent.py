@@ -577,8 +577,12 @@ def asserts_confirmed_diagnosis(text):
     return False
 
 
-def check_grounding(report, truth):
-    """Problems that make a schema-valid report unacceptable (empty list = grounded)."""
+def check_grounding(report, truth, caveat=None):
+    """Problems that make a schema-valid report unacceptable (empty list = grounded).
+
+    caveat: the dataset/source-confound caveat (get_condition_info's first model_limitations item);
+    when given, the limitations must contain it word for word.
+    """
     problems = []
     for key in ("predicted_class", "calibrated_probability", "status"):
         if getattr(report, key) != truth[key]:
@@ -594,7 +598,27 @@ def check_grounding(report, truth):
     if dismisses_abnormal_result(truth["predicted_class"], report.recommendation):
         problems.append(f"predicted_class is {truth['predicted_class']}, so the recommendation must not say "
                         "no referral, action or follow-up is needed; advise clinician follow-up")
+    if caveat and not includes_caveat(report.limitations, caveat):
+        problems.append("the limitations must include this caveat from get_condition_info's model_limitations, "
+                        f"copied word for word: \"{caveat}\"")
     return problems
+
+
+HYPHENS = str.maketrans(dict.fromkeys("‐‑‒–—", "-"))
+
+
+def _normalize(text):
+    return " ".join(text.translate(HYPHENS).split()).lower()
+
+
+def includes_caveat(limitations, caveat):
+    """True if one limitation contains the caveat verbatim (ignoring case, whitespace and hyphen variants).
+
+    Added after the 20261020T075220Z run: c07 skipped get_condition_info and invented its own
+    limitations, dropping the dataset/source-confound caveat; the guard accepted it and the judge
+    scored its faithfulness 5. The eval check dataset_caveat_present uses the same rule.
+    """
+    return any(_normalize(caveat) in _normalize(item) for item in limitations)
 
 
 def labels_confident_as_refer(report):
@@ -612,8 +636,8 @@ def dismisses_abnormal_result(predicted_class, recommendation):
     return predicted_class != "Normal" and bool(DISMISSIVE_NEXT_STEP.search(recommendation))
 
 
-def parse_report(text, truth):
-    """(Report, None) if the text is a valid, grounded report, else (None, problem)."""
+def parse_report(text, truth, caveat=None):
+    """(Report, None) if the text is a valid, grounded report, else (None, problem). caveat: see check_grounding."""
     raw = (text or "").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)  # tolerate a markdown fence
     try:
@@ -625,7 +649,7 @@ def parse_report(text, truth):
     except ValidationError as e:
         return None, "schema validation failed: " + "; ".join(
             f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
-    problems = check_grounding(report, truth)
+    problems = check_grounding(report, truth, caveat)
     if problems:
         return None, "grounding check failed: " + "; ".join(problems)
     return report, None
@@ -667,7 +691,8 @@ def fallback_report(tools):
         limitations=[info["what_this_result_means"], *info["model_limitations"]],  # all from the tool output
         disclaimer=DISCLAIMER,
     )
-    assert not check_grounding(report, truth), check_grounding(report, truth)
+    problems = check_grounding(report, truth, info["model_limitations"][0])
+    assert not problems, problems
     return report
 
 
@@ -775,6 +800,8 @@ def _report_loop(tools, llm, max_steps, max_retries, tracer):
     fallback logic lives here, so both drivers behave identically.
     """
     truth = tools.run_classifier()  # ground truth for the guard, independent of what the LLM calls
+    # Every report must carry the dataset/source-confound caveat, even if the LLM skips get_condition_info
+    caveat = tools.get_condition_info()["model_limitations"][0]
     result = ReportResult(report=None, source="fallback")
 
     def fall_back(reason, detail=None, kind=None):
@@ -837,7 +864,7 @@ def _report_loop(tools, llm, max_steps, max_retries, tracer):
             messages.append({"role": "tool", "results": results})
             continue
 
-        report, problem = parse_report(turn.text, truth)
+        report, problem = parse_report(turn.text, truth, caveat)
         trace_event(tracer, "guard", status="ok" if report is not None else "reject",
                     error=problem, result="pass" if report is not None else "reject", reason=problem, step=step)
         if report is not None:
