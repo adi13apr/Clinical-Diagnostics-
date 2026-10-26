@@ -3,7 +3,8 @@ import json
 
 from pydantic import ValidationError
 
-from agent.agent import asserts_confirmed_diagnosis, dismisses_abnormal_result, labels_confident_as_refer, parse_report
+from agent.agent import (asserts_confirmed_diagnosis, dismisses_abnormal_result, includes_caveat,
+                         labels_confident_as_refer, parse_report)
 from agent.schema import Report, count_sentences
 
 # Length limits for what a clinician or patient reads on screen / in the PDF
@@ -60,19 +61,35 @@ def check_length_limits(record):
             and all(len(l) <= MAX_LIMITATION_CHARS for l in r["limitations"]))
 
 
+def guard_verdict(record, text=None):
+    """Today's guard on a recorded report (or on `text`, a raw LLM draft): (Report, None) or (None, problem).
+
+    The one place that calls the guard from a record, so a guard that needs more of the tool outputs
+    only changes here (used by guard_replay_consistent and tests/test_regression_fixtures.py).
+    The agent always reads the caveat from get_condition_info; a record without it is checked without.
+    """
+    caveats = _model_limitations(record)
+    return parse_report(json.dumps(record["report"]) if text is None else text, record["classifier"],
+                        caveats[0] if caveats else None)
+
+
+def _model_limitations(record):
+    return ((record.get("tool_outputs") or {}).get("condition_info") or {}).get("model_limitations")
+
+
 def check_guard_replay_consistent(record):
     """Today's guard agrees with the recorded verdicts: rejected drafts still rejected, final LLM report accepted."""
     rejected = record.get("rejected") or []
     if record["report_source"] != "llm" and not rejected:
         return None
     for item in rejected:
-        if item.get("finish_reason"):
-            continue  # cut off at the length limit: rejected for that, not by the guard
-        report, _ = parse_report(item["text"], record["classifier"])
+        if item.get("finish_reason") or item.get("text") is None:
+            continue  # cut off at the length limit, or an API-level model error: not a guard verdict
+        report, _ = guard_verdict(record, item["text"])
         if report is not None:
             return False
     if record["report_source"] == "llm":
-        report, _ = parse_report(json.dumps(record["report"]), record["classifier"])
+        report, _ = guard_verdict(record)
         return report is not None
     return True
 
@@ -90,21 +107,17 @@ def check_abnormal_result_not_dismissed(record):
     return not dismisses_abnormal_result(record["classifier"]["predicted_class"], record["report"]["recommendation"])
 
 
-def _norm(text):
-    return " ".join(text.replace("‐", "-").replace("‑", "-").replace("‒", "-")
-                    .replace("–", "-").replace("—", "-").split()).lower()
-
-
 def check_dataset_caveat_present(record):
     """The dataset/source-confound caveat from get_condition_info appears verbatim in the limitations.
 
     Added after 20261020T075220Z: c07 skipped get_condition_info and invented its own limitations,
-    dropping the caveat; the judge scored its faithfulness 5.
+    dropping the caveat; the judge scored its faithfulness 5. The agent's guard enforces the same
+    rule (agent.agent.includes_caveat).
     """
-    caveats = ((record.get("tool_outputs") or {}).get("condition_info") or {}).get("model_limitations")
+    caveats = _model_limitations(record)
     if not caveats:
         return None
-    return any(_norm(caveats[0]) in _norm(item) for item in record["report"]["limitations"])
+    return includes_caveat(record["report"]["limitations"], caveats[0])
 
 
 def check_confident_not_called_uncertain(record):

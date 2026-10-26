@@ -32,5 +32,12 @@
     "recommendation": "No immediate referral is required, but a clinician should review the image together with the patient’s symptoms, physical exam and possibly lab tests before deciding on treatment.",
     "status": "confident",
     "summary": "The AI model identified patterns on the X‑ray that match those it has seen in pneumonia cases, with a very high probability. The attention map shows a diffuse influence across both upper zones and other lung areas, which is only an approximate indication of where the model focused."
+  },
+  "expect": {
+    "guard": "reject",
+    "guard_problem": "must not say no referral, action or follow-up is needed",
+    "checks_fail": [
+      "abnormal_result_not_dismissed"
+    ]
   }
 }

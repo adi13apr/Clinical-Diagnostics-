@@ -25,6 +25,8 @@ docker build -t clinical-api .     # API image (port 7860); see "Deployment"
 python scripts/smoke_test.py       # live API check; needs API_URL and SUPABASE_ACCESS_TOKEN
 pip install -r requirements-mcp.txt   # MCP server (also pulled in by requirements-dev.txt)
 python mcp_server                  # MCP server over stdio (what clients run: venv python + the folder path)
+python .claude/skills/release-check/release_check.py   # pytest + eval replay + smoke test, PASS/FAIL/SKIP table
+python .claude/skills/failure-to-regression/reproduce.py --case c07   # one failure: checks, guard verdict, report
 pytest                             # no Supabase, dataset or GPU needed
 $env:INTEGRATION_REDIS_URL="redis://127.0.0.1:6380/15"; pytest tests/test_integration_redis.py   # real Redis; FLUSHES that DB
 python scripts/calibrate.py        # re-fit temperature; needs the datasets in data/ (below)
@@ -80,6 +82,9 @@ mcp_server/                 MCP server (stdio, SDK mcp 2.x MCPServer); see "MCP 
   schemas.py                Pydantic tool outputs (the SDK publishes them as outputSchema)
   __main__.py               `python <repo>/mcp_server` from any cwd (swaps the package dir on sys.path for the repo)
 requirements-mcp.txt        requirements.txt + mcp>=2.3,<3
+.claude/skills/             Claude Code Agent Skills (see "Agent Skills")
+  failure-to-regression/    SKILL.md + reproduce, add_case, verify, live_eval, compare_runs (+ _repo paths)
+  release-check/            SKILL.md + release_check.py
 Dockerfile, .dockerignore   API image (CPU torch, uid 1000, port 7860); .dockerignore keeps .streamlit/ out
 docker-compose.yml          redis (no persistence, healthcheck) + api x2 + worker x N (same image) + nginx in front (queue mode)
 deploy/nginx/nginx.conf     Round-robin over the api replicas (Docker DNS, `resolve`); adds X-Upstream-Addr
@@ -148,7 +153,8 @@ evals/                      Report-agent eval suite (see "Evals")
   human_labels.csv          Blind sheet for a HUMAN to score (never fill it in programmatically)
 .github/workflows/ci.yml    pytest + eval replay
 tests/                      pytest; conftest.py stubs the network so tests need no checkpoint or Supabase
-  fixtures/                 Verbatim LLM outputs used as regression tests
+  fixtures/                 Verbatim LLM outputs used as regression tests; an "expect" block makes
+                            tests/test_regression_fixtures.py enforce one (guard verdict, failing checks)
 data/                       Gitignored. Kaggle datasets + data/cache/calibration_logits.npz
 traces/                     Gitignored. Span JSONL, one file per UTC day (ephemeral on Streamlit Cloud)
 best_student_model_aligned_final.pth   state_dict for StudentEfficientNet (~16 MB, committed)
@@ -242,6 +248,7 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - no assertion of a confirmed diagnosis (`asserts_confirmed_diagnosis`, using `BANNED_PATTERNS`). A match is allowed when a negation cue (not, no, never, without, cannot, n't, until, unless, before) appears in the 4 words before it within the same clause (clauses split on punctuation, "but", "however"). "No doubt" and "not only" don't count as negations. This was added after Gemini wrote "a screening aid, not a confirmed diagnosis" (fixture `gemini_rejected_negated_confirmed.json`);
   - a `refer` case's recommendation must contain "clinician review";
   - a Pneumonia/TB recommendation must not say no referral, action or follow-up is needed (`dismisses_abnormal_result` / `DISMISSIVE_NEXT_STEP`; Normal exempt). Added after the 2026-10-20 human review: the reviewer marked down `c32` ("No immediate referral is required" for 99.99% Pneumonia), the judge scored it 5/5, and it's now the fixture `gptoss_c32_dismissed_referral.json`. The system prompt states the rule too.
+  - the limitations must quote the dataset/source-confound caveat (`get_condition_info`'s first `model_limitations` item) word for word, ignoring case, whitespace and hyphen variants (`includes_caveat`, also used by the eval check `dataset_caveat_present`). `check_grounding(report, truth, caveat)`: `_report_loop` reads the caveat from `tools` itself, so the rule holds even when the model skips `get_condition_info`; the rejection message quotes the caveat for the retry. Added after `c07` in `20261020T075220Z` skipped the tool and invented its limitations (judge faithfulness 5; fixture `gptoss_c07_missing_dataset_caveat.json`). Without `caveat` (e.g. `evals/judge_sensitivity.py`) the rule is skipped.
   - The disclaimer is always replaced with `schema.DISCLAIMER`.
 - **`fallback_report`:** a deterministic template built only from tool outputs. It is always schema-valid and grounded (asserted), and it works even when Grad-CAM fails. Pneumonia/TB recommendations always end with `CLINICIAN_FOLLOW_UP` ("Arrange clinician follow-up for this result.").
 - **`GeminiClient`:** `models.generate_content` with manual function calling. It is stateless: the history is resent each call, and nothing is stored server-side, unlike the Interactions API.
@@ -275,11 +282,12 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - `load_cases` raises `SchemaVersionError` on a `schema_version` mismatch. `EvalCase` forbids unknown fields.
   - `dataset_hash` is computed over canonical JSON, independent of CRLF/LF, and is stored in every run record. Replay refuses records from a different hash.
   - Rebuilding needs `--force` and changes the hash, which means a new live run and a new baseline.
-- **Deterministic checks** (`checks.py`): schema valid, class/probability/status match the classifier, refer → "clinician review", no confirmed-diagnosis claim (`asserts_confirmed_diagnosis`), limitations present (1–5), length limits (summary 2–3 sentences and ≤ 600 chars, recommendation ≤ 500, each limitation ≤ 300), `guard_replay_consistent` (today's guard still rejects the recorded rejected drafts and accepts the final LLM report), and `abnormal_result_not_dismissed`. The last one fails if a Pneumonia/TB recommendation says no referral, action or follow-up is needed (`DISMISSIVE_NEXT_STEP`; tolerates Unicode hyphens and one word in between). Normal predictions are exempt, per the human reviewer. Pass rates exclude not-applicable cases (`None`).
+  - Category `regression`: a case added by hand after a failure (`add_case.py`, test split only). `build_cases(keep)` carries these over on a rebuild, renumbered after the built cases (`next_case_id`). Adding one changes the hash too.
+- **Deterministic checks** (`checks.py`): schema valid, class/probability/status match the classifier, refer → "clinician review", no confirmed-diagnosis claim (`asserts_confirmed_diagnosis`), limitations present (1–5), length limits (summary 2–3 sentences and ≤ 600 chars, recommendation ≤ 500, each limitation ≤ 300), `guard_replay_consistent` (today's guard still rejects the recorded rejected drafts and accepts the final LLM report; it calls the guard through `guard_verdict(record)`, the one place the eval does, so a guard needing more tool outputs changes only there), and `abnormal_result_not_dismissed`. The last one fails if a Pneumonia/TB recommendation says no referral, action or follow-up is needed (`DISMISSIVE_NEXT_STEP`; tolerates Unicode hyphens and one word in between). Normal predictions are exempt, per the human reviewer. Pass rates exclude not-applicable cases (`None`).
   - `abnormal_result_not_dismissed` uses the same rule as the agent's guard (`agent.agent.dismisses_abnormal_result`). **Any guard change makes `guard_replay_consistent` fail** on recorded drafts the new guard would reject; that's intended. Re-run `--live` and `--update-baseline` after changing the guard.
   - `confident_not_called_uncertain` mirrors the guard's `labels_confident_as_refer`: only refer cases may use "Refer: uncertain…". An ambiguous prompt rule once made 5 of 8 confident Pneumonia/TB reports use it; see `evals/runs/20261020T071107Z.notes.md` and the fixture `gptoss_confident_called_uncertain.json`. **After any prompt change, re-run the eval before trusting it.**
-  - `dataset_caveat_present` (**eval only, not in the guard**): the first `model_limitations` item must appear verbatim in the limitations, with whitespace and hyphens normalised. It fails on `c07` in the baseline run (35/36), where gpt-oss skipped `get_condition_info` and invented limitations. To block it in the guard, `check_grounding` would need the condition-info output, plus a new run and baseline. Run records now include `tool_calls`.
-- **Current baseline run:** `20261020T075220Z` (11 of 12 checks at 100%). The human labels belong to `20261018T161443Z`.
+  - `dataset_caveat_present`: the first `model_limitations` item must appear verbatim in the limitations, with whitespace and hyphens normalised (`includes_caveat`, the same rule as the guard). It failed on `c07` in `20261020T075220Z` (35/36), where gpt-oss skipped `get_condition_info` and invented limitations; the guard has enforced it since. `guard_verdict` passes the recorded `tool_outputs.condition_info.model_limitations[0]` to the guard (records without it are checked without the caveat). Run records include `tool_calls`.
+- **Current baseline run:** `20261026T040807Z` (12 of 12 checks at 100%, 0 fallbacks; 2 drafts rejected by `labels_confident_as_refer` on `c35`/`c36` and fixed on retry; the caveat rule didn't fire, since no case skipped `get_condition_info`). The human labels belong to `20261018T161443Z`.
 - **Judge** (`judge.py`, `build_judge()`): Groq `qwen/qwen3.8-27b`, a different model family from the report model to avoid self-preference. It uses strict `json_schema` (`JUDGE_JSON_SCHEMA`: closed objects, scores as an integer enum 1–5, and Pydantic validates the result). `GeminiJudge` (`response_schema`) is used when the provider is gemini. `rubric.md` is sent verbatim. The judge sees tool outputs and the report only, never the true label. `--judge-model` overrides the model.
 - **Async runner (default; `--sync` = old):** `run_pipeline_async`, in one event loop, writes reports in order and puts each new record on a queue for a single judge coroutine, so judging case N overlaps the report for case N+1. No threads.
   - `run_pipeline_sync` is the original loop. Both take plain callables (`make_record`/`amake_record`, `judge`, `append`), so tests and `evals/benchmark.py` drive them with fake-latency clients.
@@ -412,6 +420,13 @@ There is one client, `AuthService.client`, built with the anon/publishable key f
 - **stdout:** the SDK points fd 1 at stderr while it serves stdio, so stray prints from torch/Streamlit can't corrupt the protocol (the stdio test would fail if they did).
 - **Keys and cwd:** MCP clients start the server in any cwd, where `st.secrets` wouldn't find the repo's file. So `load_llm_key()` copies only the provider section's `api_key` from `<repo>/.streamlit/secrets.toml` into the env (the env wins). Relative image paths resolve against the first allowed directory, never the cwd. Register the server as `<venv python> <repo>\mcp_server`, not `-m`.
 - **No HTTP transport yet** (README TODO): it would need auth, since anyone reaching the port could read the allowed folders.
+
+## Agent Skills (`.claude/skills/`)
+
+- Claude Code loads them from the repo (`/failure-to-regression <case|trace|file>`, `/release-check`). Keep each `SKILL.md` short and put mechanical work in its scripts; tests in `tests/test_skill_scripts.py` (offline) and `tests/test_regression_fixtures.py`.
+- Scripts import the repo through `_repo.py` (`REPO` = 3 levels up; `main_checkout()` finds the main worktree for gitignored `data/`, `.env`, `.streamlit/secrets.toml`, since a worktree has none).
+- **failure-to-regression:** `reproduce.py` (case id from a run, `--trace` from local `traces/` only, `--mcp-output` = `{"classification", "report"}` from the MCP tools; `--write-fixture` adds `expect` with `guard_problem: null` to fill in), `add_case.py`, `verify.py` (exit 0 pass, 2 = replay fails only as a guard change or new case must, 1 fail), `live_eval.py start|wait|status` (detached `evals.run --live`; `wait` blocks ≤ 540 s so it fits one shell call; links `data/` and copies only the provider's API key into the child's env from the main checkout), `compare_runs.py` (all cases vs the baseline run: fallbacks, guard rejections split from API-level model errors and truncations, checks, judge means; **exit 3 if fallbacks or guard rejections rose: stop and ask before `--update-baseline`**).
+- **release-check:** `release_check.py` runs pytest, `evals.run --replay` and `scripts/smoke_test.py`. Smoke target: `--api-url`, `API_URL`, else local 7860/7861; token: `SUPABASE_ACCESS_TOKEN`, else the `.env` demo account (password grant). Missing either → SKIP, never PASS. It doesn't rebuild the API: the local container is the live one behind Vercel.
 
 ## Web UI (`web/`)
 
