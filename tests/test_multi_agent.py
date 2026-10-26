@@ -225,6 +225,47 @@ def test_c07_like_bundle_always_carries_the_dataset_caveat_to_the_writer(make_to
     assert caveat in result.report.limitations
 
 
+def test_caveat_reaches_the_bundle_the_writer_and_both_guards_like_the_single_path(make_tools, monkeypatch):
+    """The c07 guard rule: the single agent reads the caveat from the tools and passes it to check_grounding;
+    the multi path does the same, for the guard before the verifier and for the final guard."""
+    tools = make_tools()
+    caveat = tools.get_condition_info()["model_limitations"][0]
+    real, seen = multi.check_grounding, []
+
+    def guard(report, truth, caveat=None):
+        seen.append(caveat)
+        return real(report, truth, caveat)
+    monkeypatch.setattr(multi, "check_grounding", guard)
+    pipeline = make_pipeline(writer=[MockLLMClient.final(good_report(tools))], verifier=[MockLLMClient.final(verdict(True))])
+    orchestrator = _Orchestrator(tools, pipeline, None)
+    result = _drive_sync(orchestrator.run(), pipeline, None)
+    assert orchestrator.caveat == caveat and result.source == "llm"
+    assert seen == [caveat, caveat]  # draft guard, final guard
+    bundle = json.loads(pipeline.clients["writer"].calls[0][0]["text"].split("EVIDENCE:\n", 1)[1].rsplit("\n\n", 1)[0])
+    assert bundle["dataset_caveat"] == caveat
+
+
+def test_draft_without_the_caveat_is_rejected_before_the_verifier_and_revised(make_tools):
+    tools = make_tools()
+    caveat = tools.get_condition_info()["model_limitations"][0]
+    invented = good_report(tools, limitations=["The model was trained on public data."])  # c07's failure
+    pipeline = make_pipeline(writer=[MockLLMClient.final(invented), MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True))])
+    result = generate_multi_agent_report(tools, pipeline)
+    assert result.source == "llm" and caveat in result.report.limitations
+    assert len(pipeline.clients["verifier"].calls) == 1  # the caveat-less draft was never verified
+    assert caveat in result.rejected[0]["problem"] and result.revisions[0]["by"] == "guard"
+    assert caveat in pipeline.clients["writer"].calls[1][-1]["text"]  # the revision request quotes it
+
+
+def test_caveat_missing_twice_uses_the_template(make_tools):
+    tools = make_tools()
+    invented = MockLLMClient.final(good_report(tools, limitations=["The model was trained on public data."]))
+    result = generate_multi_agent_report(tools, make_pipeline(writer=[invented, invented]))
+    assert result.source == "fallback" and "caveat" in result.reason
+    assert tools.get_condition_info()["model_limitations"][0] in result.report.limitations  # the template quotes it
+
+
 # ---- Verifier findings lead to a revision; the revision limit ----
 
 def test_unsupported_claim_is_revised_once_then_accepted(make_tools):

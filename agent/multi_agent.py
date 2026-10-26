@@ -38,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent.agent import (
     DISCLAIMER, MAX_RETRIES, TRUNCATED_FINISH_REASONS, ReportResult, _close_report_span, check_grounding,
-    classify_llm_error, describe_llm_error, fallback_report, llm_call_attributes, parse_report,
+    classify_llm_error, describe_llm_error, fallback_report, llm_call_attributes,
 )
 from agent.schema import ClassName, Report, Status
 from agent.tools import CLASS_NAMES, TOOL_DECLARATIONS
@@ -277,6 +277,9 @@ class _Orchestrator:
     def __init__(self, tools, pipeline, tracer):
         self.tools, self.pipeline, self.tracer = tools, pipeline, tracer
         self.truth = tools.run_classifier()  # ground truth for the guard, independent of what the agents do
+        # The dataset/source-confound caveat every report must quote, read from the tools like the single agent
+        # (_report_loop) does, so the guard holds it whatever the evidence agent called
+        self.caveat = tools.get_condition_info()["model_limitations"][0]
         self.result = ReportResult(report=None, source="fallback", pipeline="multi",
                                    agent_models=pipeline.models)
         self.steps = 0
@@ -490,7 +493,7 @@ class _Orchestrator:
 
     def _guard(self, report):
         """check_grounding on a draft (before the verifier). Returns the problem, or None if it passed."""
-        problems = check_grounding(report, self.truth)
+        problems = check_grounding(report, self.truth, self.caveat)
         problem = "grounding check failed: " + "; ".join(problems) if problems else None
         trace_event(self.tracer, "guard", status="ok" if problem is None else "reject", error=problem,
                     result="pass" if problem is None else "reject", reason=problem, step=self.steps, agent="writer")
@@ -554,7 +557,7 @@ class _Orchestrator:
     def _finish(self, report):
         """The guard has the final say on exactly what is returned (the fixed disclaimer included)."""
         final = report.model_copy(update={"disclaimer": DISCLAIMER})
-        problems = check_grounding(final, self.truth)
+        problems = check_grounding(final, self.truth, self.caveat)
         trace_event(self.tracer, "final_guard", status="ok" if not problems else "reject",
                     error="; ".join(problems) or None, result="pass" if not problems else "reject")
         if problems:
