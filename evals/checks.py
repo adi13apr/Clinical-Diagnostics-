@@ -66,6 +66,8 @@ def check_guard_replay_consistent(record):
     if record["report_source"] != "llm" and not rejected:
         return None
     for item in rejected:
+        if item.get("finish_reason"):
+            continue  # cut off at the length limit: rejected for that, not by the guard
         report, _ = parse_report(item["text"], record["classifier"])
         if report is not None:
             return False

@@ -50,7 +50,8 @@
     "openai/gpt-oss-120b": {
       "reasoning_effort": "low",
       "include_reasoning": false,
-      "max_completion_tokens": 2000
+      "max_completion_tokens": 600,
+      "_why_600": "The rate limiter reserves this per call, so it sets how many calls fit in tpm. Measured completion tokens (output + reasoning): 21-238 per call (median 27; 23 llm_call spans of the 2026-10-25 demo runs) and 266-400 per whole report (216 eval reports). 600 = 2.5x the largest call, 1.5x the largest report. A reply cut off here (finish_reason length) is retried once, then the template is used."
     },
     "qwen/qwen3.8-27b": {
       "reasoning_effort": "none",
