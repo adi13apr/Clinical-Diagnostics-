@@ -108,6 +108,11 @@ class LLMClient(ABC):
     # time.monotonic() after which a call must not wait for the rate-limit budget (set for report jobs,
     # so they fall back to the template before RQ's job timeout); None = wait as long as needed
     deadline = None
+    # Seconds the next request may take on the network (the multi-agent pipeline's per-agent timeouts);
+    # None = the client's own request timeout
+    call_timeout_s = None
+    pipeline = "single"   # agent.multi_agent.MultiAgentPipeline says "multi"
+    pipeline_note = None  # why a requested multi pipeline runs as single (build_report_llm)
 
     @abstractmethod
     def generate(self, system, messages, tools, tools_allowed=True):
@@ -187,14 +192,21 @@ def describe_llm_error(error):
     if hasattr(error, "status_code"):  # openai.APIStatusError (Groq and other OpenAI-compatible APIs)
         if _is_tool_use_failed(error):
             return "The model produced an invalid tool call."
+        if _is_bad_generation(error, "json_validate_failed"):
+            return "The model's JSON output didn't match the schema (or was cut off)."
         return f"LLM API error {error.status_code}."
     return f"LLM call failed ({type(error).__name__})."
 
 
 def _is_tool_use_failed(error):
+    return _is_bad_generation(error, "tool_use_failed")
+
+
+def _is_bad_generation(error, code_name):
+    """A 400 with this error code: the model's output was malformed (not the request or the service)."""
     body = getattr(error, "body", None)
     code = (body.get("error", body) if isinstance(body, dict) else {}).get("code") if isinstance(body, dict) else None
-    return getattr(error, "status_code", None) == 400 and (code == "tool_use_failed" or "tool_use_failed" in str(error))
+    return getattr(error, "status_code", None) == 400 and (code == code_name or code_name in str(error))
 
 
 def classify_llm_error(error):
@@ -204,7 +216,10 @@ def classify_llm_error(error):
     """
     if isinstance(error, RateLimitError):
         return "rate_limit"
-    if _is_tool_use_failed(error) or isinstance(error, json.JSONDecodeError):
+    # json_validate_failed: strict json_schema output that didn't validate, e.g. cut off at
+    # max_completion_tokens (the multi-agent writer/verifier; the single agent never asks for it)
+    if (_is_tool_use_failed(error) or _is_bad_generation(error, "json_validate_failed")
+            or isinstance(error, json.JSONDecodeError)):
         return "model"
     return "infrastructure"
 
@@ -340,14 +355,39 @@ class OpenAICompatibleClient(LLMClient):
                               resets="the provider's daily window")
 
     def generate(self, system, messages, tools, tools_allowed=True):
-        import openai
         payload, tool_specs, options = self._prepare(system, messages, tools, tools_allowed)
+        return self._complete(payload, tool_specs, {"tools": tool_specs, **split_request_options(options)})
+
+    async def agenerate(self, system, messages, tools, tools_allowed=True):
+        payload, tool_specs, options = self._prepare(system, messages, tools, tools_allowed)
+        return await self._acomplete(payload, tool_specs, {"tools": tool_specs, **split_request_options(options)})
+
+    def generate_json(self, system, messages, schema_name, schema):
+        """A turn whose text is JSON matching schema (strict json_schema), with no tools: the multi-agent
+        pipeline's writer and verifier. Same budget, 429 rule and parsing as generate()."""
+        payload, kwargs = self._prepare_json(system, messages, schema_name, schema)
+        return self._complete(payload, [], kwargs)
+
+    async def agenerate_json(self, system, messages, schema_name, schema):
+        payload, kwargs = self._prepare_json(system, messages, schema_name, schema)
+        return await self._acomplete(payload, [], kwargs)
+
+    def _prepare_json(self, system, messages, schema_name, schema):
+        response_format = {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": schema}}
+        # The schema is part of the request, so it counts towards the prompt estimate (passed as "tool specs")
+        return self._messages(system, messages), {"response_format": response_format,
+                                                  **split_request_options(self.options)}
+
+    def _complete(self, payload, tool_specs, kwargs):
+        import openai
         retries = 0
+        if self.call_timeout_s is not None:
+            kwargs = dict(kwargs, timeout=min(self.call_timeout_s, self.timeout_s))
+        size_parts = tool_specs or kwargs.get("response_format") or []
         for attempt in (1, 2):
-            reservation = self._reserve(payload, tool_specs)
+            reservation = self._reserve(payload, size_parts)
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model, messages=payload, tools=tool_specs, **split_request_options(options))
+                response = self.client.chat.completions.create(model=self.model, messages=payload, **kwargs)
                 break
             except openai.RateLimitError as e:
                 delay = openai_retry_after(e)
@@ -360,18 +400,18 @@ class OpenAICompatibleClient(LLMClient):
             self.budget.record(reservation, response.usage.total_tokens, response.usage.completion_tokens)
         return self._parse(response, retries)
 
-    async def agenerate(self, system, messages, tools, tools_allowed=True):
+    async def _acomplete(self, payload, tool_specs, kwargs):
         import openai
-        payload, tool_specs, options = self._prepare(system, messages, tools, tools_allowed)
         retries = 0
+        timeout = self.timeout_s if self.call_timeout_s is None else min(self.call_timeout_s, self.timeout_s)
+        size_parts = tool_specs or kwargs.get("response_format") or []
         for attempt in (1, 2):
-            reservation = await self._areserve(payload, tool_specs)
+            reservation = await self._areserve(payload, size_parts)
             try:
                 async with (self.budget.slot() if self.budget is not None else nullcontext()):
                     response = await asyncio.wait_for(
-                        self._async().chat.completions.create(
-                            model=self.model, messages=payload, tools=tool_specs, **split_request_options(options)),
-                        self.timeout_s)
+                        self._async().chat.completions.create(model=self.model, messages=payload, **kwargs),
+                        timeout)
                 break
             except openai.RateLimitError as e:
                 delay = openai_retry_after(e)
@@ -486,25 +526,40 @@ class MockLLMClient(LLMClient):
     """Scripted client for tests. Each script item is an LLMTurn or a callable(messages) -> LLMTurn."""
     name = "mock"
 
-    def __init__(self, script, delay_s=0.0):
+    def __init__(self, script, delay_s=0.0, name="mock"):
         self.script = list(script)
         self.calls = []
         self.tools_allowed = []
+        self.systems = []   # system prompt of each call
+        self.schemas = []   # schema name of each generate_json call (None for generate)
         self.delay_s = delay_s  # simulated network latency (benchmarks/tests)
+        self.name = name
 
     def generate(self, system, messages, tools, tools_allowed=True):
         if self.delay_s:
             time.sleep(self.delay_s)
-        return self._next(messages, tools_allowed)
+        return self._next(system, messages, tools_allowed)
 
     async def agenerate(self, system, messages, tools, tools_allowed=True):
         if self.delay_s:
             await asyncio.sleep(self.delay_s)
-        return self._next(messages, tools_allowed)
+        return self._next(system, messages, tools_allowed)
 
-    def _next(self, messages, tools_allowed):
+    def generate_json(self, system, messages, schema_name, schema):
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        return self._next(system, messages, False, schema_name)
+
+    async def agenerate_json(self, system, messages, schema_name, schema):
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self._next(system, messages, False, schema_name)
+
+    def _next(self, system, messages, tools_allowed, schema_name=None):
         self.calls.append(list(messages))
         self.tools_allowed.append(tools_allowed)
+        self.systems.append(system)
+        self.schemas.append(schema_name)
         if not self.script:
             raise RuntimeError("MockLLMClient script exhausted")
         item = self.script.pop(0)
@@ -532,9 +587,19 @@ class ReportResult:
     error_detail: Optional[str] = None  # full LLM error text (not shown to users)
     error_kind: Optional[str] = None    # classify_llm_error(): rate_limit / infrastructure / model
     cached: bool = False                 # served from the report cache, no LLM requests spent
+    pipeline: str = "single"             # the pipeline that actually ran: "single" or "multi"
+    pipeline_note: Optional[str] = None  # why a requested multi pipeline ran as single
+    # Multi-agent pipeline only:
+    agent_models: dict = field(default_factory=dict)   # agent -> model ({"evidence", "writer", "verifier"})
+    revisions: List[dict] = field(default_factory=list)  # drafts sent back to the writer, with why (guard/verifier)
+    findings: List[dict] = field(default_factory=list)   # the verifier's findings on the final draft
 
     def source_line(self):
         """One line saying who wrote the report, for the UI and PDF (the fallback reason is UI-only)."""
+        if self.source == "llm" and self.pipeline == "multi":
+            return (f"Written by {self.model} from the classifier's output in the multi-agent pipeline; its "
+                    f"claims were checked by {self.agent_models.get('verifier', 'a verifier')}, and class, "
+                    "probability and status were checked against the classifier.")
         if self.source == "llm":
             return (f"Written by {self.model} from the classifier's output; class, probability and "
                     "status were checked against the classifier.")
@@ -559,6 +624,37 @@ def build_llm_client(role="report", model=None, config=None, budgets=None):
     return OpenAICompatibleClient(settings["api_key"], model, settings["base_url"], budget=budget,
                                   options=request_options(model, config), provider=name.capitalize(),
                                   timeout_s=config.get("request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S))
+
+
+def build_report_llm(pipeline=None, config=None, budgets=None):
+    """What writes reports: the single agent's LLMClient, or a MultiAgentPipeline. None without a key.
+
+    pipeline is "single" or "multi" (default: env REPORT_PIPELINE, else config/llm.json report_pipeline).
+    Multi needs an OpenAI-compatible provider (strict json_schema for the writer and verifier); with
+    another one (gemini) the single agent runs, and pipeline_note says why, so traces and eval records
+    show the pipeline that actually ran. Each agent gets its own client; agents on the same model share
+    that model's budget from budgets (as build_llm_client).
+    """
+    from agent.llm_config import AGENT_ROLES, agent_request_options, agent_timeout_s, pipeline_mode
+    config = config or load_llm_config()
+    mode = pipeline or pipeline_mode(config)
+    if mode == "single":
+        return build_llm_client("report", config=config, budgets=budgets)
+    name, settings = provider_settings(config)
+    if settings["kind"] != "openai_compatible":
+        llm = build_llm_client("report", config=config, budgets=budgets)
+        if llm is not None:
+            llm.pipeline_note = (f"REPORT_PIPELINE=multi needs an OpenAI-compatible provider; {name} ran the "
+                                 "single agent.")
+        return llm
+    clients = {agent: build_llm_client(model=settings[f"{agent}_model"], config=config, budgets=budgets)
+               for agent in AGENT_ROLES}
+    if any(client is None for client in clients.values()):
+        return None
+    for agent, client in clients.items():  # e.g. the writer's larger max_completion_tokens
+        client.options = agent_request_options(agent, client.model, config)
+    from agent.multi_agent import MultiAgentPipeline
+    return MultiAgentPipeline(**clients, timeouts={agent: agent_timeout_s(agent, config) for agent in AGENT_ROLES})
 
 
 def asserts_confirmed_diagnosis(text):
@@ -720,6 +816,7 @@ def generate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETRIES, tr
     """
     with trace_span(tracer, "report", llm=getattr(llm, "name", None)) as span:
         result = _drive_sync(_report_loop(tools, llm, max_steps, max_retries, tracer), llm, tracer)
+        result.pipeline_note = getattr(llm, "pipeline_note", None)
         _close_report_span(span, result, tracer)
     return result
 
@@ -728,13 +825,32 @@ async def agenerate_report(tools, llm, max_steps=MAX_STEPS, max_retries=MAX_RETR
     """Async generate_report (eval runner): identical decisions, LLM calls awaited."""
     with trace_span(tracer, "report", llm=getattr(llm, "name", None)) as span:
         result = await _drive_async(_report_loop(tools, llm, max_steps, max_retries, tracer), llm, tracer)
+        result.pipeline_note = getattr(llm, "pipeline_note", None)
         _close_report_span(span, result, tracer)
     return result
 
 
+def run_report(tools, llm, tracer=None):
+    """The report from whichever pipeline llm is: a MultiAgentPipeline runs the multi-agent orchestrator,
+    anything else (an LLMClient or None) the single tool-calling agent."""
+    if getattr(llm, "pipeline", "single") == "multi":
+        from agent.multi_agent import generate_multi_agent_report
+        return generate_multi_agent_report(tools, llm, tracer=tracer)
+    return generate_report(tools, llm, tracer=tracer)
+
+
+async def arun_report(tools, llm, tracer=None):
+    """Async run_report (eval runner)."""
+    if getattr(llm, "pipeline", "single") == "multi":
+        from agent.multi_agent import agenerate_multi_agent_report
+        return await agenerate_multi_agent_report(tools, llm, tracer=tracer)
+    return await agenerate_report(tools, llm, tracer=tracer)
+
+
 def _close_report_span(span, result, tracer):
     trace_event(tracer, "fallback_used", used=result.source == "fallback", reason=result.reason)
-    safe_set(span, source=result.source, steps=result.steps, rejected=len(result.rejected))
+    safe_set(span, source=result.source, steps=result.steps, rejected=len(result.rejected),
+             pipeline=result.pipeline, pipeline_note=result.pipeline_note)
 
 
 @dataclass
@@ -929,19 +1045,20 @@ def report_result_from_json(text):
 class RedisReportCache:
     """ReportCache shared between API replicas through Redis: same get/put, entries expire after ttl_s.
 
-    Key: {prefix}report:v1:{image fingerprint}:{temperature}:{model}; value: report_result_to_json().
-    A value that no longer parses (old format, corrupt) is a miss, and so is a Redis error: the cache
-    only saves LLM requests, so the report is written anyway. on_error(operation, exc) hears about both.
+    Key: {prefix}report:v2:{pipeline}:{image fingerprint}:{temperature}:{model}; value:
+    report_result_to_json(). A value that no longer parses (old format, corrupt) is a miss, and so is a
+    Redis error: the cache only saves LLM requests, so the report is written anyway. on_error(operation,
+    exc) hears about both.
     """
 
-    VERSION = "v1"  # bump when the stored format changes
+    VERSION = "v2"  # bump when the stored format changes (v2: pipeline in the key, multi-agent fields)
 
     def __init__(self, client, ttl_s=REDIS_REPORT_TTL_S, prefix="cdp:", on_error=None):
         self.client, self.ttl_s, self.prefix, self.on_error = client, ttl_s, prefix, on_error
 
     def key(self, key):
-        fingerprint, temperature, model = key
-        return f"{self.prefix}report:{self.VERSION}:{fingerprint}:{float(temperature)!r}:{model}"
+        fingerprint, temperature, model, pipeline = key
+        return f"{self.prefix}report:{self.VERSION}:{pipeline}:{fingerprint}:{float(temperature)!r}:{model}"
 
     def get(self, key):
         try:
@@ -973,20 +1090,22 @@ def image_fingerprint(image):
 
 
 def generate_report_for_image(model_service, image, prediction=None, llm=None, cache=REPORT_CACHE, tracer=None):
-    """Dashboard entry point. Reuses a cached LLM report for the same image, temperature and model.
+    """Dashboard entry point. Reuses a cached LLM report for the same image, temperature, model and pipeline.
 
-    Only LLM reports are cached: a fallback (e.g. after a rate limit) costs nothing to rebuild, and
-    caching it would stop a later click from trying the LLM again.
+    llm is an LLMClient (the single agent) or a MultiAgentPipeline (build_report_llm). Only LLM reports
+    are cached: a fallback (e.g. after a rate limit) costs nothing to rebuild, and caching it would stop
+    a later click from trying the LLM again.
     """
     key = None
     if llm is not None and cache is not None:
-        key = (image_fingerprint(image), float(model_service.temperature), llm.name)
+        pipeline = getattr(llm, "pipeline", "single")
+        key = (image_fingerprint(image), float(model_service.temperature), llm.name, pipeline)
         hit = cache.get(key)
         if hit is not None:
-            with trace_span(tracer, "report", llm=llm.name, source=hit.source, cached=True):
+            with trace_span(tracer, "report", llm=llm.name, source=hit.source, cached=True, pipeline=hit.pipeline):
                 trace_event(tracer, "report_cache_hit")
             return dataclasses.replace(hit, cached=True, steps=0)
-    result = generate_report(ReportTools(model_service, image, prediction, tracer=tracer), llm, tracer=tracer)
+    result = run_report(ReportTools(model_service, image, prediction, tracer=tracer), llm, tracer=tracer)
     if key is not None and result.source == "llm":
         cache.put(key, result)
     return result

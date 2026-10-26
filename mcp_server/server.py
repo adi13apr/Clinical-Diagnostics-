@@ -62,7 +62,7 @@ class Clinic:
             self._model = SerializedModel(model_service)
         self._model_lock = threading.Lock()
         self.model_path = Path(model_path)
-        self.llm_factory = llm_factory    # None: agent.agent.build_llm_client
+        self.llm_factory = llm_factory    # None: agent.agent.build_report_llm (REPORT_PIPELINE picks single/multi)
         self.report_cache = report_cache  # None: the process-wide agent.agent.REPORT_CACHE
         self.allowed_dirs = allowed_dirs_from_env() if allowed_dirs is None else [Path(d).resolve() for d in allowed_dirs]
         self.trace_dir = Path(trace_dir or os.environ.get("MCP_TRACE_DIR") or MCP_TRACE_DIR)
@@ -156,11 +156,11 @@ class Clinic:
             caveat=GRADCAM_CAVEAT if regions["peak_region"] else f"{regions['note']} {GRADCAM_CAVEAT}")
 
     def generate_report(self, image_path):
-        from agent.agent import REPORT_CACHE, build_llm_client, generate_report_for_image
+        from agent.agent import REPORT_CACHE, build_report_llm, generate_report_for_image
         image = self.load_image(image_path)
         trace_id, prediction = self.latest_prediction(image)
         tracer = self.tracer(trace_id)  # same trace as the prediction, like the dashboard
-        llm = (self.llm_factory or build_llm_client)()
+        llm = (self.llm_factory or build_report_llm)()
         cache = REPORT_CACHE if self.report_cache is None else self.report_cache  # an empty cache is falsy
         try:
             result = generate_report_for_image(self.model(), image, prediction, llm=llm, cache=cache, tracer=tracer)
@@ -170,7 +170,8 @@ class Clinic:
         return ReportOut(trace_id=trace_id, source="llm" if llm else "template", written_by=result.source_line(),
                          model=result.model if llm else None, fallback_reason=None if llm else result.reason,
                          cached=result.cached, guard_rejections=len(result.rejected),
-                         tool_calls=list(result.tool_calls), report=result.report)
+                         tool_calls=list(result.tool_calls), pipeline=result.pipeline,
+                         pipeline_note=result.pipeline_note, revisions=len(result.revisions), report=result.report)
 
     def get_trace(self, trace_id):
         try:

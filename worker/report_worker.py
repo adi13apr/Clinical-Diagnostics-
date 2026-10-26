@@ -19,7 +19,7 @@ from functools import partial
 
 from rq import SimpleWorker, get_current_job
 
-from agent.agent import RedisReportCache, build_llm_client, report_result_to_json
+from agent.agent import RedisReportCache, build_report_llm, report_result_to_json
 from agent.rate_limit import BudgetRegistry
 from api.jobs import DEADLINE_MARGIN_S, JOB_TIMEOUT_MIN_S, UPLOAD_EXPIRED, ReportJobs, write_report
 from api.settings import Settings
@@ -40,7 +40,7 @@ class WorkerContext:
         self.model = model                # SerializedModel
         self.uploads = uploads            # RedisUploadStore (the API's uploads)
         self.cache = cache                # RedisReportCache (shared with the API)
-        self.llm_factory = llm_factory    # build_llm_client with the Redis rate-limit budgets
+        self.llm_factory = llm_factory    # build_report_llm with the Redis rate-limit budgets
         self.jobs = jobs                  # ReportJobs: where the spans go
 
 
@@ -63,7 +63,7 @@ def build_context(settings, client):
         model=model,
         uploads=RedisUploadStore(client, settings.upload_ttl_s, settings.upload_max_items),
         cache=cache,
-        llm_factory=partial(build_llm_client, budgets=BudgetRegistry(client)),
+        llm_factory=partial(build_report_llm, budgets=BudgetRegistry(client)),
         jobs=ReportJobs(client))
 
 
