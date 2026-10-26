@@ -317,6 +317,28 @@ The first tool call loads the model (a few seconds, about 440 MB of memory). Lis
 
 > **TODO:** a streamable HTTP transport (for remote clients). It's left out on purpose for now: it would need authentication, because anything that can reach the port could read the allowed folders through the tools.
 
+## Agent Skills (`.claude/skills/`)
+
+Two [Claude Code skills](https://docs.claude.com/en/docs/claude-code/skills) package the workflows behind [Things the evals caught](#things-the-evals-caught). Claude Code loads them automatically in this repo. Run one with `/failure-to-regression c07` or `/release-check`, or just describe the task. Each `SKILL.md` is short; Python scripts next to it do the mechanical work. Every script has `--help` and runs offline except the live eval and the smoke test.
+
+**`failure-to-regression`** turns one bad report into a permanent check:
+
+| Step | Script |
+| --- | --- |
+| Reproduce it from an eval case, a trace id or a saved MCP `generate_report` output: failing checks, today's guard verdict, the exact report | `reproduce.py` |
+| Add the image to `evals/cases.jsonl` as a `regression` case (test split only; no change if it's already a case) | `add_case.py` |
+| Save the exact output as a fixture with an `expect` block (`tests/test_regression_fixtures.py` enforces every one), then write the check or guard rule | `reproduce.py --write-fixture` |
+| Run pytest and the replay, and tell an expected replay failure (the new guard rejects the recorded report) from a real one | `verify.py` |
+| Run the live eval in the background, then compare fallbacks, guard rejections, checks and judge scores on all 36 cases against the baseline run; it stops before `--update-baseline` if fallbacks or rejections went up | `live_eval.py`, `compare_runs.py` |
+| Draft the README entry and open a PR | `SKILL.md` instructions |
+
+**`release-check`** runs pytest, the eval replay and the API smoke test before a merge and prints a PASS / FAIL / SKIP table (`release_check.py`). The smoke test needs a running API (`API_URL`, or a local one on 7860/7861) and a token (`SUPABASE_ACCESS_TOKEN`, or the demo account in `.env`). Without them it is SKIP, never PASS.
+
+```powershell
+venv\Scripts\python.exe .claude\skills\failure-to-regression\reproduce.py --case c07
+venv\Scripts\python.exe .claude\skills\release-check\release_check.py
+```
+
 ## Deployment
 
 | Part | Where | How it updates |

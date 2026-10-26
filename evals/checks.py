@@ -60,19 +60,28 @@ def check_length_limits(record):
             and all(len(l) <= MAX_LIMITATION_CHARS for l in r["limitations"]))
 
 
+def guard_verdict(record, text=None):
+    """Today's guard on a recorded report (or on `text`, a raw LLM draft): (Report, None) or (None, problem).
+
+    The one place that calls the guard from a record, so a guard that needs more of the tool outputs
+    only changes here (used by guard_replay_consistent and tests/test_regression_fixtures.py).
+    """
+    return parse_report(json.dumps(record["report"]) if text is None else text, record["classifier"])
+
+
 def check_guard_replay_consistent(record):
     """Today's guard agrees with the recorded verdicts: rejected drafts still rejected, final LLM report accepted."""
     rejected = record.get("rejected") or []
     if record["report_source"] != "llm" and not rejected:
         return None
     for item in rejected:
-        if item.get("finish_reason"):
-            continue  # cut off at the length limit: rejected for that, not by the guard
-        report, _ = parse_report(item["text"], record["classifier"])
+        if item.get("finish_reason") or item.get("text") is None:
+            continue  # cut off at the length limit, or an API-level model error: not a guard verdict
+        report, _ = guard_verdict(record, item["text"])
         if report is not None:
             return False
     if record["report_source"] == "llm":
-        report, _ = parse_report(json.dumps(record["report"]), record["classifier"])
+        report, _ = guard_verdict(record)
         return report is not None
     return True
 
