@@ -1,7 +1,7 @@
 ---
 name: failure-to-regression
-description: Turn a report-agent failure in this repo into a permanent regression check (eval case, deterministic check or guard rule, fixture test, README entry, PR). Use when a bad AI report has been found, given as an eval case id (e.g. c07), a trace id, a saved MCP generate_report output, or a human-review or judge note. Not for classifier errors (a wrong class with a faithful report): no report-level check can catch those.
-argument-hint: <case id | trace id | MCP output file> [what went wrong]
+description: "Turn a report-agent failure in this repo into a permanent regression check (eval case, deterministic check or guard rule, fixture test, README entry, PR). Use when a bad AI report has been found, given as an eval case id (e.g. c07), a trace id, a saved MCP generate_report output, or a human-review or judge note. Not for classifier errors (a wrong class with a faithful report), which no report-level check can catch."
+argument-hint: "<case id | trace id | MCP output file> [what went wrong]"
 ---
 
 # Failure to regression check

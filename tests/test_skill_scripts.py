@@ -203,3 +203,16 @@ def test_release_check_summary_never_counts_skip_as_pass():
         "length_limits pass rate 90% < baseline 100%"
     assert release_check.smoke_detail("FAIL  POST /report/{id}  3.4s  KeyError\n5/6 steps passed") == \
         "5/6 steps passed (failed: POST /report/{id} 3.4s)"
+
+
+# SKILL.md frontmatter (a bad one makes Claude Code skip the skill silently)
+
+@pytest.mark.parametrize("skill", sorted(p.name for p in SKILLS.iterdir() if (p / "SKILL.md").exists()))
+def test_skill_frontmatter_parses(skill):
+    import yaml
+    text = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+    assert text.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
+    meta = yaml.safe_load(text.split("---\n", 2)[1])
+    assert meta["name"] == skill
+    assert 50 < len(meta["description"]) <= 1024
+    assert "Use when" in meta["description"] or "Use before" in meta["description"]  # says when to load it
