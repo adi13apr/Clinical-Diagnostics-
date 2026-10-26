@@ -8,6 +8,7 @@ from PIL import Image
 
 from agent.agent import GeminiClient, LLMTurn, MockLLMClient, generate_report, generate_report_for_image
 from agent.tools import ReportTools
+from test_agent import CAVEAT
 from services.prediction_handler import PredictionService
 from services.tracing import (
     JsonlTraceSink, Tracer, estimate_cost, finish_trace, make_tracer, summarize_spans, trace_event, trace_span,
@@ -132,7 +133,7 @@ def test_broken_tracer_does_not_break_report(make_service, calibration_file, mon
     truth = tools.run_classifier()
     report = {"predicted_class": truth["predicted_class"], "calibrated_probability": truth["calibrated_probability"],
               "status": truth["status"], "summary": "One sentence. Two sentences.", "recommendation": "See a clinician.",
-              "limitations": ["x"], "disclaimer": "y"}
+              "limitations": [CAVEAT], "disclaimer": "y"}
     result = generate_report(tools, MockLLMClient([MockLLMClient.final(report)]), tracer=BrokenTracer())
     assert result.source == "llm"
 
@@ -214,7 +215,7 @@ def tools_and_truth(make_service, calibration_file, monkeypatch):
 def valid_report(truth, **overrides):
     data = {"predicted_class": truth["predicted_class"], "calibrated_probability": truth["calibrated_probability"],
             "status": truth["status"], "summary": "The model suggests Normal. This is a screening result.",
-            "recommendation": "Share with a clinician.", "limitations": ["Two public datasets only."],
+            "recommendation": "Share with a clinician.", "limitations": [CAVEAT],
             "disclaimer": "Not advice."}
     data.update(overrides)
     return data
