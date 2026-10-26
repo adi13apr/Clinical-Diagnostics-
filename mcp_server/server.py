@@ -219,7 +219,7 @@ class Clinic:
         case_ids = {c.case_id for c in cases}
         reports = [r for r in records.values() if r.get("report") and r["case_id"] in case_ids]
         judged = [r for r in reports if r.get("judge")]
-        baseline = evals.load_baseline()
+        baseline = evals.load_baseline(evals.run_pipeline(records))  # each pipeline has its own baseline
         rates = pass_rates(reports)
         base_rates = (baseline or {}).get("deterministic_pass_rates", {})
         llm_written = sum(r["report_source"] == "llm" for r in reports)

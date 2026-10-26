@@ -1,6 +1,7 @@
 """Judge sensitivity: does the LLM judge score deliberately bad reports low?
 
-    python -m evals.judge_sensitivity      # live judge (needs a key); writes evals/judge_sensitivity.{json,md}
+    python -m evals.judge_sensitivity             # live judge (needs a key); writes evals/judge_sensitivity.{json,md}
+    python -m evals.judge_sensitivity --verifier  # the multi-agent verifier on the same reports (+ controls)
 
 Each case takes a real report and its real tool outputs from a committed run, breaks exactly
 one thing, and records the judge's scores. A case counts as caught when the criterion that was
@@ -21,6 +22,8 @@ REPO = Path(__file__).resolve().parent.parent
 BASE_RUN = REPO / "evals" / "runs" / "20261018T161443Z.jsonl"  # human-reviewed run; its reports were judged good
 OUT_JSON = REPO / "evals" / "judge_sensitivity.json"
 OUT_MD = REPO / "evals" / "judge_sensitivity.md"
+VERIFIER_OUT_JSON = REPO / "evals" / "verifier_sensitivity.json"  # --verifier: the multi-agent verifier instead
+VERIFIER_OUT_MD = REPO / "evals" / "verifier_sensitivity.md"
 CAUGHT_AT_OR_BELOW = 2
 
 CASES = [
@@ -97,6 +100,72 @@ def run_sensitivity(judge, records):
     return results
 
 
+def pipeline_guard_blocks(case):
+    """The guard as the multi-agent pipeline runs it on a draft (with the dataset caveat from the tools):
+    None, or the problem. A draft it blocks never reaches the verifier."""
+    caveats = (case["tool_outputs"].get("condition_info") or {}).get("model_limitations") or []
+    _, problem = parse_report(json.dumps(case["report"]), case["truth"], caveats[0] if caveats else None)
+    return problem
+
+
+def verifier_cases(records):
+    """The 5 bad reports, then the unmodified base reports they came from (controls: should pass)."""
+    built = [dict(c, kind="bad") for c in build_cases(records)]
+    for base_id in dict.fromkeys(spec["base"] for spec in CASES):
+        base = records[base_id]
+        built.append({"spec": {"id": f"control_{base_id.split('-')[0]}", "base": base_id,
+                               "what": "Unmodified base report (control)"},
+                      "tool_outputs": base["tool_outputs"], "report": copy.deepcopy(base["report"]),
+                      "truth": base["classifier"], "kind": "control"})
+    return built
+
+
+def run_verifier_sensitivity(verifier, records):
+    """The multi-agent verifier on each bad report and control, with the pipeline's exact request.
+
+    Caught (bad report) / false alarm (control) = at least one claim marked unsupported. The pipeline
+    view: the guard runs first, so a report it blocks is caught before the verifier is asked.
+    """
+    from agent.multi_agent import bundle_from_tool_outputs, verify_once
+    from agent.schema import Report
+    results = []
+    for case in verifier_cases(records):
+        spec = case["spec"]
+        verdict, turn = verify_once(verifier, bundle_from_tool_outputs(case["tool_outputs"]),
+                                    Report.model_validate(case["report"]))
+        flagged = [f.model_dump() for f in verdict.unsupported]
+        problem = pipeline_guard_blocks(case)
+        results.append({
+            "id": spec["id"], "kind": case["kind"], "base_case": spec["base"], "what": spec["what"],
+            "claims": len(verdict.findings), "unsupported": flagged, "flagged_by_verifier": bool(flagged),
+            "blocked_by_guard": problem is not None, "guard_problem": problem,
+            "pipeline": "guard" if problem is not None else ("verifier" if flagged else "passes"),
+            "usage": turn.usage,
+        })
+    return results
+
+
+def verifier_markdown(results, verifier_model):
+    bad = [r for r in results if r["kind"] == "bad"]
+    controls = [r for r in results if r["kind"] == "control"]
+    lines = [f"# Verifier sensitivity ({verifier_model})", "",
+             f"The judge-sensitivity set's {len(bad)} deliberately bad reports, plus their {len(controls)} unmodified "
+             "base reports as controls, through the multi-agent verifier (same prompt, schema and evidence as in "
+             "the pipeline). Caught / false alarm = at least one claim marked unsupported.", "",
+             f"- **Verifier caught: {sum(r['flagged_by_verifier'] for r in bad)}/{len(bad)}** bad reports",
+             f"- Verifier false alarms on controls: {sum(r['flagged_by_verifier'] for r in controls)}/{len(controls)}",
+             f"- Guard (as the pipeline runs it, before the verifier) blocks: "
+             f"{sum(r['blocked_by_guard'] for r in bad)}/{len(bad)} bad reports",
+             f"- Pipeline (guard, then verifier) stops: {sum(r['pipeline'] != 'passes' for r in bad)}/{len(bad)} bad reports",
+             "", "| Report | Kind | Claims | Verifier flagged | Guard blocks? | Stopped by | Unsupported claims (verifier's reason) |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for r in results:
+        claims = "; ".join(f"\"{f['claim']}\" ({f['reason']})" for f in r["unsupported"]) or "—"
+        lines.append(f"| {r['what']} | {r['kind']} | {r['claims']} | {len(r['unsupported'])} | "
+                     f"{'yes' if r['blocked_by_guard'] else 'no'} | {r['pipeline']} | {claims.replace('|', '/')} |")
+    return "\n".join(lines) + "\n"
+
+
 def to_markdown(results, judge_model):
     caught = sum(r["caught_by_judge"] for r in results)
     blocked = sum(r["blocked_by_guard"] for r in results)
@@ -122,8 +191,13 @@ def main(argv=None):
     logging.getLogger("streamlit").setLevel(logging.ERROR)
     from evals.judge import build_judge
 
-    argparse.ArgumentParser(description=__doc__.split("\n")[0]).parse_args(argv)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--verifier", action="store_true",
+                    help="run the multi-agent verifier instead of the judge; writes evals/verifier_sensitivity.{json,md}")
+    args = ap.parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")
+    if args.verifier:
+        return main_verifier()
     judge = build_judge()
     if judge is None:
         raise SystemExit("No API key for the judge provider (config/llm.json).")
@@ -135,6 +209,23 @@ def main(argv=None):
     }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     md = to_markdown(results, judge.model)
     OUT_MD.write_text(md, encoding="utf-8")
+    print(md)
+    return 0
+
+
+def main_verifier():
+    from agent.agent import build_report_llm
+    pipeline = build_report_llm("multi")
+    if pipeline is None or getattr(pipeline, "pipeline", None) != "multi":
+        raise SystemExit("The multi-agent pipeline needs a Groq API key (config/llm.json provider groq).")
+    verifier = pipeline.clients["verifier"]
+    results = run_verifier_sensitivity(verifier, load_base_records())
+    VERIFIER_OUT_JSON.write_text(json.dumps({
+        "verifier_model": verifier.name, "base_run": BASE_RUN.relative_to(REPO).as_posix(),
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "results": results,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    md = verifier_markdown(results, verifier.name)
+    VERIFIER_OUT_MD.write_text(md, encoding="utf-8")
     print(md)
     return 0
 
