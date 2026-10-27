@@ -19,7 +19,9 @@ from agent.multi_agent import REQUIRED_TOOLS
 from evals import multi_metrics
 from evals.checks import CHECKS, pass_rates
 from evals.dataset import dataset_hash, load_cases
-from evals.run import REPO, RESULTS_DIR, audit_path, check_dataset_hash, load_run, relative, run_pipeline
+from evals.run import (
+    REPO, RESULTS_DIR, _rejection_kind, audit_path, check_dataset_hash, load_run, relative, run_pipeline,
+)
 from evals.schema import CRITERIA
 from services.tracing import estimate_cost
 
@@ -64,10 +66,9 @@ def report_cost(record):
 
 
 def guard_rejections(record):
-    """Drafts the guard rejected (with text, not cut off), and API-level model errors (no text)."""
-    rejected = record.get("rejected") or []
-    drafts = [x for x in rejected if x.get("text") is not None and not x.get("finish_reason")]
-    return len(drafts), sum(1 for x in rejected if x.get("text") is None)
+    """Drafts the guard rejected, and API-level model errors (no draft), as evals.run's summary counts them."""
+    kinds = [_rejection_kind(x) for x in record.get("rejected") or []]
+    return kinds.count("guard"), kinds.count("model_error")
 
 
 def side(records):

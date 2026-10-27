@@ -388,7 +388,8 @@ async def test_condition_info_resources_carry_the_draft_review_status(make_serve
 
 @pytest.mark.asyncio
 async def test_latest_eval_results_resource(make_server):
-    newest = sorted((REPO / "evals" / "results").glob("20*.md"))[-1]
+    # Dated run summaries only, not e.g. 2026-10-27_single_vs_multi.md
+    newest = sorted((REPO / "evals" / "results").glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md"))[-1]
     async with Client(make_server()) as client:
         text = resource_text(await client.read_resource("clinical://evals/latest"))
     assert text == newest.read_text(encoding="utf-8") and text.startswith("# Eval results")

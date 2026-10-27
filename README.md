@@ -45,7 +45,7 @@ The raw model was strongly **under**-confident: its probabilities never reached 
 36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-26.md`](evals/results/2026-10-26.md).
 
 - **Deterministic checks: 12 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; the dataset caveat is quoted from the tool; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
-  - CI replays this run on every push and fails if any rate drops.
+  - CI replays this run, and the multi-agent run below, on every push and fails if any rate drops in either.
 - All 36 reports were written by the LLM, with no template fallbacks. The guard rejected 2 drafts (`c35`, `c36`: confident TB results whose recommendation opened with "Refer:"), and both were fixed on the one retry.
 - An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.64–5.0 out of 5 on faithfulness, uncertainty language, actionability and plain language.
 - **Judge vs human:** I scored 15 reports blind (from the 18 Oct run) with the same rubric. They agree on 82% of scores exactly and 97% within one point, but both of us rated almost everything 5, so that number is flattering.
@@ -79,7 +79,7 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 
 ### Multi-agent report pipeline (experimental, off by default)
 
-`REPORT_PIPELINE=multi` swaps the single report agent for three agents run by an orchestrator ([`agent/multi_agent.py`](agent/multi_agent.py)). The single agent stays the default and the baseline for comparison.
+`REPORT_PIPELINE=multi` swaps the single report agent for three agents run by an orchestrator ([`agent/multi_agent.py`](agent/multi_agent.py)). The single agent stays the default: in a full comparison it had fewer template fallbacks (below).
 
 1. **Evidence agent** (`gpt-oss-120b`, tool calls): must call all three tools. If it stops early, it is asked once more, naming the missing tool; otherwise the template report is used.
 2. **Writer** (`gpt-oss-120b`, no tools): writes the report as strict JSON from the tool outputs only, including the dataset caveat.
@@ -89,7 +89,22 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 
 Every step is a trace span (agent, tokens, latency, verdict), and each agent has its own time limit.
 
-**Smoke run, n=3, not a result** (c07, c29, c35): all three were written by the LLM and passed every deterministic check, and `c07` called all three tools. Each report used about 3.4k tokens on the report model (single agent: about 5.2k) plus about 1.9k on the verifier's own budget. When the budget had room, a report took under 5 s. The full 36-case comparison comes next, in its own branch.
+**Single vs multi on the same 36 cases** ([`evals/results/2026-10-27_single_vs_multi.md`](evals/results/2026-10-27_single_vs_multi.md); single run `20261026T040807Z`, multi run `20261027T000140Z`, same judge):
+
+| | Single | Multi |
+| --- | --- | --- |
+| Deterministic checks at 100% | 12 of 12 | 12 of 12 |
+| Template fallbacks | **0** | **3** |
+| Judge means (faithfulness / uncertainty / actionability / plain language) | 5.00 / 4.81 / 5.00 / 4.64 | 4.86 / 4.81 / 4.81 / 4.61 |
+| Guard rejections; verifier revisions | 2; — | 0; 2 |
+| gpt-oss-120b tokens per report; gpt-oss-20b | 5,249; — | 3,614; 1,795 |
+| Latency per report, median / p90 | 58.8 s / 60.0 s | 54.7 s / 59.8 s |
+| Nominal cost, 36 reports (billed $0 on the free tier) | $0.034 | $0.038 |
+
+- **Why single stays the default:** the rule was to switch only if multi ties or beats single on every deterministic check *and* has no more fallbacks. All 3 multi fallbacks came from the verifier's JSON: gpt-oss-20b failed Groq's strict schema on 12 of 47 calls (an out-of-list `source` value), and the one retry didn't fix 3 of them.
+- **Also worse in multi:** 9 of 33 reports list the dataset caveat twice (a writer-prompt artifact), and `c19` got actionability 1 from the judge.
+- **What the verifier adds:** on the 5 planted bad reports it flagged all 5, each on the planted claim, with no false alarms on the 3 originals ([`evals/verifier_sensitivity.md`](evals/verifier_sensitivity.md)); the guard alone stops 3. Live, it sent back 2 Normal reports that said no follow-up was needed, which the guard allows. A second model agreed with both flags. The guard still matters too: the verifier would have passed both drafts the guard rejected in the single run.
+- **Judge noise:** re-scoring 5 single-run reports a day later left 12 of 20 scores unchanged (mean change 0), so most per-criterion differences above are within ±1 noise.
 
 ## Why the eval runner is async (and why that isn't threads)
 

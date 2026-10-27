@@ -1,0 +1,248 @@
+{
+ "shadow_verifier": [
+  {
+   "run_id": "20261026T040807Z",
+   "case_id": "c35-Tuberculosis-327",
+   "step": 4,
+   "guard_problem": "grounding check failed: status is 'confident', so the report must not call the result uncertain or use the refer sentence \"Refer: uncertain, clinician review recommended\"",
+   "findings": [
+    {
+     "claim": "The AI model identified patterns on the X‑ray that match those seen in tuberculosis cases.",
+     "supported": true,
+     "source": "classifier",
+     "reason": "The classifier predicted Tuberculosis with 100% probability."
+    },
+    {
+     "claim": "Calibrated probability of 1.0.",
+     "supported": true,
+     "source": "classifier",
+     "reason": "Classifier calibrated_probability is 1.0."
+    },
+    {
+     "claim": "Grad‑CAM heat map shows a diffuse pattern of attention.",
+     "supported": true,
+     "source": "gradcam",
+     "reason": "Gradcam focus is listed as diffuse."
+    },
+    {
+     "claim": "Diffuse pattern especially in the right upper zone.",
+     "supported": true,
+     "source": "gradcam",
+     "reason": "Gradcam peak_region is right upper zone."
+    },
+    {
+     "claim": "This reflects model focus rather than definitive anatomy.",
+     "supported": true,
+     "source": "gradcam",
+     "reason": "Gradcam caveat notes the zones are coarse and may not be clinically relevant."
+    },
+    {
+     "claim": "Clinician follow‑up is needed to confirm or rule out tuberculosis with appropriate microbiological testing.",
+     "supported": true,
+     "source": "condition_info",
+     "reason": "typical_next_steps advises clinician microbiological testing."
+    },
+    {
+     "claim": "The model was trained and evaluated on two public datasets in which each disease came from a different source, so performance on images from other hospitals or scanners may be lower.",
+     "supported": true,
+     "source": "condition_info",
+     "reason": "Model limitations list this caveat."
+    },
+    {
+     "claim": "Grad‑CAM regions are approximate and show what influenced the model, not confirmed findings.",
+     "supported": true,
+     "source": "condition_info",
+     "reason": "Model limitations include this statement."
+    }
+   ],
+   "unsupported": 0,
+   "error": null,
+   "usage": {
+    "input_tokens": 1226,
+    "output_tokens": 644
+   }
+  },
+  {
+   "run_id": "20261026T040807Z",
+   "case_id": "c36-Tuberculosis-337",
+   "step": 4,
+   "guard_problem": "grounding check failed: status is 'confident', so the report must not call the result uncertain or use the refer sentence \"Refer: uncertain, clinician review recommended\"",
+   "findings": [
+    {
+     "claim": "The AI model identified patterns on the chest X‑ray that resemble tuberculosis, with a calibrated probability of 1.0.",
+     "supported": true,
+     "source": "classifier",
+     "reason": "classifier gives predicted_class TB and calibrated_probability 1.0"
+    },
+    {
+     "claim": "The attention map shows a diffuse focus, especially in the right upper zone.",
+     "supported": true,
+     "source": "gradcam",
+     "reason": "gradcam focus diffuse, peak_region right upper zone"
+    },
+    {
+     "claim": "This result suggests the image shares features seen in TB cases, though it does not confirm disease.",
+     "supported": true,
+     "source": "condition_info",
+     "reason": "condition_info what_this_result_means states same"
+    }
+   ],
+   "unsupported": 0,
+   "error": null,
+   "usage": {
+    "input_tokens": 1247,
+    "output_tokens": 361
+   }
+  }
+ ],
+ "flag_checks": [
+  {
+   "case_id": "c12-person1300_virus_2240",
+   "step": 5,
+   "claim": "Otherwise, no immediate further imaging is required",
+   "verifier_source": "none",
+   "verifier_reason": "Evidence does not state that no further imaging is required when symptoms are absent",
+   "checker_supported": false,
+   "checker_evidence": "",
+   "checker_reason": "The evidence explicitly states that typical next steps include clinician assessment if symptoms are present and that a 'Normal' result does not rule out disease, but it does not contain a statement about no immediate further imaging being required.",
+   "error": null,
+   "usage": {
+    "input_tokens": 874,
+    "output_tokens": 61
+   }
+  },
+  {
+   "case_id": "c34-Normal-1113",
+   "step": 5,
+   "claim": "No specific follow‑up is required based on this result.",
+   "verifier_source": "none",
+   "verifier_reason": "condition_info states clinicians should assess if symptoms present; recommendation conflicts with that.",
+   "checker_supported": false,
+   "checker_evidence": "",
+   "checker_reason": "The evidence explicitly states that a clinician should assess the patient if symptoms are present and that a 'Normal' result does not rule out disease, contradicting the claim that no follow-up is required based solely on this result.",
+   "error": null,
+   "usage": {
+    "input_tokens": 881,
+    "output_tokens": 62
+   }
+  }
+ ],
+ "judge_drift": [
+  {
+   "case_id": "c01-NORMAL2-IM-0195-0001",
+   "judge_model": "qwen/qwen3.8-27b",
+   "recorded": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 5
+   },
+   "now": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 5
+   },
+   "error": null,
+   "usage": {
+    "input_tokens": 1635,
+    "output_tokens": 132,
+    "thinking_tokens": null
+   }
+  },
+  {
+   "case_id": "c09-person109_virus_203",
+   "judge_model": "qwen/qwen3.8-27b",
+   "recorded": {
+    "faithfulness": 5,
+    "uncertainty_language": 4,
+    "actionability": 5,
+    "plain_language": 4
+   },
+   "now": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 4,
+    "plain_language": 5
+   },
+   "error": null,
+   "usage": {
+    "input_tokens": 1620,
+    "output_tokens": 178,
+    "thinking_tokens": null
+   }
+  },
+  {
+   "case_id": "c17-person427_virus_875",
+   "judge_model": "qwen/qwen3.8-27b",
+   "recorded": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 4
+   },
+   "now": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 5
+   },
+   "error": null,
+   "usage": {
+    "input_tokens": 1651,
+    "output_tokens": 183,
+    "thinking_tokens": null
+   }
+  },
+  {
+   "case_id": "c25-NORMAL2-IM-0325-0001",
+   "judge_model": "qwen/qwen3.8-27b",
+   "recorded": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 4
+   },
+   "now": {
+    "faithfulness": 4,
+    "uncertainty_language": 4,
+    "actionability": 5,
+    "plain_language": 4
+   },
+   "error": null,
+   "usage": {
+    "input_tokens": 1652,
+    "output_tokens": 155,
+    "thinking_tokens": null
+   }
+  },
+  {
+   "case_id": "c33-person843_bacteria_2763",
+   "judge_model": "qwen/qwen3.8-27b",
+   "recorded": {
+    "faithfulness": 5,
+    "uncertainty_language": 4,
+    "actionability": 5,
+    "plain_language": 5
+   },
+   "now": {
+    "faithfulness": 5,
+    "uncertainty_language": 5,
+    "actionability": 5,
+    "plain_language": 4
+   },
+   "error": null,
+   "usage": {
+    "input_tokens": 1624,
+    "output_tokens": 171,
+    "thinking_tokens": null
+   }
+  }
+ ],
+ "run": "evals/runs/20261027T000140Z.jsonl",
+ "single_run": "evals/runs/20261026T040807Z.jsonl",
+ "verifier_model": "openai/gpt-oss-20b",
+ "checker_model": "qwen/qwen3.8-27b",
+ "judge_model": "qwen/qwen3.8-27b",
+ "updated_at": "2026-10-27T18:25:11+00:00"
+}

@@ -29,8 +29,8 @@ jobs:
       - name: Unit tests
         run: pytest -q
 
-      # Re-scores the committed eval run with no network; fails if any deterministic
-      # pass rate drops below evals/baseline.json
+      # Re-scores the committed eval runs (single and multi-agent pipelines) with no network; fails if
+      # any deterministic pass rate drops below its pipeline's baseline (evals/baseline*.json)
       - name: Eval replay
         run: python -m evals.run --replay
 

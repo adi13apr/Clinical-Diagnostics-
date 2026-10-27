@@ -420,6 +420,14 @@ def fmt(x, pct=False):
     return f"{x:.1%}" if pct else f"{x}"
 
 
+def _rejection_kind(item):
+    """A `rejected` entry: 'guard' (a draft the guard or schema check refused), 'model_error' (an API-level
+    model failure, no text) or 'truncated' (cut off at max_completion_tokens)."""
+    if item.get("finish_reason"):
+        return "truncated"
+    return "model_error" if item.get("text") is None else "guard"
+
+
 def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agreement_result=None):
     cases_by_id = {c.case_id: c for c in cases}
     records = [r for r in records_by_id.values() if r.get("report") and r["case_id"] in cases_by_id]
@@ -480,11 +488,22 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
         lines.append(f"| {cat} | {len(rs)} | {sum(r['report_source'] == 'llm' for r in rs)} | {fmt(mean(js))} |")
 
     usage = [r["agent_usage"] for r in llm_records if r.get("agent_usage")]
-    rejected = [r for r in records if r.get("rejected")]
+
+    # `rejected` also holds API-level model errors (no text, e.g. an invalid tool call or Groq's
+    # json_validate_failed) and replies cut off at the token limit: count each kind on its own
+    def entries(kind):
+        return [(r, x) for r in records for x in r.get("rejected") or [] if _rejection_kind(x) == kind]
+
+    def counted(kind, noun):
+        found = entries(kind)
+        reasons = sorted({x["problem"].split(":")[0] for _, x in found})
+        return (f"{len(found)} {noun} in {len({r['case_id'] for r, _ in found})} reports"
+                + (f" ({', '.join(reasons)})" if found else ""))
+
     lines += ["", "## Agent operations", "",
-              f"- Guard rejections: {sum(len(r['rejected']) for r in rejected)} drafts in {len(rejected)} reports"
-              + (f" ({', '.join(sorted({x['problem'].split(':')[0] for r in rejected for x in r['rejected']}))})"
-                 if rejected else ""),
+              f"- Guard rejections: {counted('guard', 'drafts')}",
+              f"- Model errors retried (API-level, no draft): {counted('model_error', 'calls')}",
+              f"- Replies cut off at the token limit: {counted('truncated', 'replies')}",
               f"- Fallbacks: {len(records) - len(llm_records)}"
               + (f" ({'; '.join(sorted({r['fallback_reason'] for r in records if r['report_source'] != 'llm'}))})"
                  if len(records) > len(llm_records) else ""),

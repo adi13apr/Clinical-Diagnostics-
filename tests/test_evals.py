@@ -242,6 +242,18 @@ def test_replay_checks_each_pipeline_against_its_own_baseline(tmp_path, monkeypa
     assert "FAIL: status_matches_classifier" in capsys.readouterr().out
 
 
+def test_summary_counts_guard_rejections_apart_from_model_errors():
+    record = make_record(CASES[0], rejected=None)
+    record["rejected"] = [
+        {"step": 2, "text": "{}", "problem": "grounding check failed: x"},                       # a guard verdict
+        {"step": 3, "agent": "verifier", "text": None, "problem": "verifier agent: bad JSON"},  # API-level error
+        {"step": 4, "text": "{", "finish_reason": "length", "problem": "cut off"}]
+    md = eval_run.build_summary({CASES[0].case_id: record}, CASES, dataset_hash(CASES), "run.jsonl")["markdown"]
+    assert "- Guard rejections: 1 drafts in 1 reports (grounding check failed)" in md
+    assert "- Model errors retried (API-level, no draft): 1 calls in 1 reports (verifier agent)" in md
+    assert "- Replies cut off at the token limit: 1 replies in 1 reports (cut off)" in md
+
+
 def test_live_records_carry_the_run_metadata():
     commit, dirty = eval_run.git_state()
     assert commit is None or (len(commit) == 40 and isinstance(dirty, bool))
