@@ -105,6 +105,7 @@ Every step is a trace span (agent, tokens, latency, verdict), and each agent has
 - **Also worse in multi:** 9 of 33 reports list the dataset caveat twice (a writer-prompt artifact), and `c19` got actionability 1 from the judge.
 - **What the verifier adds:** on the 5 planted bad reports it flagged all 5, each on the planted claim, with no false alarms on the 3 originals ([`evals/verifier_sensitivity.md`](evals/verifier_sensitivity.md)); the guard alone stops 3. Live, it sent back 2 Normal reports that said no follow-up was needed, which the guard allows. A second model agreed with both flags. The guard still matters too: the verifier would have passed both drafts the guard rejected in the single run.
 - **Judge noise:** re-scoring 5 single-run reports a day later left 12 of 20 scores unchanged (mean change 0), so most per-criterion differences above are within ±1 noise.
+- **In the Compose stack** (`REPORT_PIPELINE=multi`, 2 API replicas, 3 workers, `demo_results/20261027T183834Z.json`): 3 concurrent multi-agent report jobs took 62 s, 65 s and 114 s, against a derived job timeout of 480 s. All 3 were written by the LLM, with no Groq 429s. The peak was 7,070 gpt-oss-120b tokens in any 60 s (limit 8,000). A lone job took 5.5 s.
 
 ## Why the eval runner is async (and why that isn't threads)
 
