@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from evals import multi_metrics
 from evals.checks import CHECKS, pass_rates
 from evals.dataset import CASES_PATH, dataset_hash, load_cases
 from evals.human_labels import (
@@ -27,7 +28,8 @@ from evals.schema import CRITERIA, RECORD_VERSION
 REPO = Path(__file__).resolve().parent.parent
 RUNS_DIR = REPO / "evals" / "runs"
 RESULTS_DIR = REPO / "evals" / "results"
-BASELINE_PATH = REPO / "evals" / "baseline.json"
+BASELINE_PATH = REPO / "evals" / "baseline.json"              # the single agent's run
+BASELINE_MULTI_PATH = REPO / "evals" / "baseline_multi.json"  # the multi-agent pipeline's run
 
 
 class StopRun(Exception):
@@ -62,6 +64,24 @@ def relative(path):
         return Path(path).resolve().relative_to(REPO).as_posix()
     except ValueError:
         return str(path)
+
+
+def run_pipeline(records):
+    """The pipeline a run's reports came from ("multi" or "single"; records before the field are single)."""
+    return "multi" if any(r.get("pipeline") == "multi" for r in records.values()) else "single"
+
+
+def git_state():
+    """(commit, dirty) of the code a live run uses; (None, None) outside a git checkout."""
+    import subprocess
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True,
+                                check=True).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO,
+                                    capture_output=True, text=True, check=True).stdout.strip())
+        return commit, dirty
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
 
 
 def check_dataset_hash(records, expected, run_path):
@@ -123,6 +143,8 @@ def _finish_case(case, tools, tracer, result):
         "agent_models": result.agent_models,
         "revisions": result.revisions,  # multi: drafts sent back by the guard or the verifier
         "verifier_findings": result.findings,
+        # multi: times the evidence agent stopped early and was re-asked for the missing tools
+        "evidence_reasks": sum(1 for s in tracer.spans if s.name == "evidence_reask"),
         "agent_usage": {
             "llm_calls": len(llm_calls),
             "input_tokens": sum(s.attributes.get("input_tokens") or 0 for s in llm_calls),
@@ -146,9 +168,10 @@ async def arun_case(case, service, llm, roots):
     return _finish_case(case, tools, tracer, await arun_report(tools, llm, tracer=tracer))
 
 
-def new_record(case, run_id, data_hash, provider, model, fields):
+def new_record(case, run_id, data_hash, provider, model, fields, meta=None):
+    """meta: run metadata repeated in every record (pipeline_requested, git_commit, git_dirty)."""
     return {"record_version": RECORD_VERSION, "case_id": case.case_id, "run_id": run_id,
-            "dataset_hash": data_hash, "provider": provider, "agent_model": model,
+            "dataset_hash": data_hash, "provider": provider, "agent_model": model, **(meta or {}),
             "recorded_at": datetime.now(timezone.utc).isoformat(), **fields, "judge": None, "judge_error": None}
 
 
@@ -258,7 +281,7 @@ def live(args):
 
     sys.path.insert(0, str(REPO / "scripts"))
     from agent.agent import build_report_llm
-    from agent.llm_config import provider_settings
+    from agent.llm_config import pipeline_mode, provider_settings
     from calibrate import find_root
     from evals.judge import build_judge
     from services.model_handler import ModelService
@@ -266,8 +289,9 @@ def live(args):
     cases = load_cases()
     data_hash = dataset_hash(cases)
     provider, settings = provider_settings()
+    requested = args.pipeline or pipeline_mode()
     # Agent(s) and judge get per-model token-aware budgets from config/llm.json (shared if the model is the same)
-    llm = build_report_llm(args.pipeline)
+    llm = build_report_llm(requested)
     judge = build_judge(args.judge_model)
     if llm is None or judge is None:
         raise SystemExit(f"No API key for provider {provider!r}: set st.secrets['{settings['secret_section']}']"
@@ -288,8 +312,13 @@ def live(args):
     run_id = run_path.stem
     mode = "sync" if args.sync else "async"
     pipeline = getattr(llm, "pipeline", "single")
+    commit, dirty = git_state()
+    # Every record carries these, so a run file alone says what was asked for and what code ran it
+    # (the pipeline that actually ran, and each agent's model, come from the ReportResult)
+    meta = {"pipeline_requested": requested, "git_commit": commit, "git_dirty": dirty}
     print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, provider {provider}, "
-          f"{pipeline} pipeline, reports {model}, judge {judge.model}, {mode} runner")
+          f"{pipeline} pipeline (requested {requested}), reports {model}, judge {judge.model}, {mode} runner, "
+          f"commit {(commit or '?')[:12]}{' (uncommitted changes)' if dirty else ''}")
     if llm.pipeline_note:
         print(f"Note: {llm.pipeline_note}")
     service = ModelService(str(REPO / "best_student_model_aligned_final.pth"))
@@ -306,11 +335,13 @@ def live(args):
     if args.sync:
         stop = run_pipeline_sync(
             todo, records,
-            lambda case: new_record(case, run_id, data_hash, provider, model, run_case(case, service, llm, roots)),
+            lambda case: new_record(case, run_id, data_hash, provider, model, run_case(case, service, llm, roots),
+                                    meta),
             judge, lambda r: append_record(run_path, r))
     else:
         async def amake_record(case):
-            return new_record(case, run_id, data_hash, provider, model, await arun_case(case, service, llm, roots))
+            return new_record(case, run_id, data_hash, provider, model, await arun_case(case, service, llm, roots),
+                              meta)
         stop = asyncio.run(run_pipeline_async(todo, records, amake_record, judge, lambda r: append_record(run_path, r)))
     elapsed = time.perf_counter() - started
     print(f"\n{mode} runner wall time: {elapsed:.1f} s for {len(todo)} cases")
@@ -327,7 +358,8 @@ def live(args):
         return 2
     if args.limit or args.cases or args.run_file:
         return 0  # partial or side runs (e.g. benchmarks) never overwrite the dated results file
-    summary = build_summary(load_run(run_path), cases, data_hash, run_path, load_baseline(), load_agreement(run_path))
+    summary = build_summary(load_run(run_path), cases, data_hash, run_path, load_baseline(pipeline),
+                            load_agreement(run_path))
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"{datetime.now(timezone.utc):%Y-%m-%d}.md"
     out.write_text(summary["markdown"], encoding="utf-8")
@@ -337,8 +369,14 @@ def live(args):
 
 # ---- Scoring / summary ----
 
-def load_baseline():
-    return json.loads(BASELINE_PATH.read_text(encoding="utf-8")) if BASELINE_PATH.exists() else None
+def baseline_path(pipeline="single"):
+    return BASELINE_MULTI_PATH if pipeline == "multi" else BASELINE_PATH
+
+
+def load_baseline(pipeline="single"):
+    """The committed baseline for a pipeline (each pipeline is compared with its own run), or None."""
+    path = baseline_path(pipeline)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
 def load_agreement(run_path):
@@ -349,6 +387,17 @@ def load_agreement(run_path):
     if source is not None and (REPO / source).resolve() != Path(run_path).resolve():
         return {"other_run": source}  # different reports: comparing would be meaningless
     return agreement(read_labels(), load_run(run_path))
+
+
+def audit_path(run_path):
+    """evals.verifier_audit's output for a run (post-hoc verifier and claim checks)."""
+    return Path(run_path).with_suffix(".audit.json")
+
+
+def load_shadow(run_path):
+    """The post-hoc verifier's verdicts on guard-rejected drafts, or None if the run has no audit."""
+    path = audit_path(run_path)
+    return json.loads(path.read_text(encoding="utf-8"))["shadow_verifier"] if path.exists() else None
 
 
 def compare_to_baseline(rates, baseline):
@@ -371,6 +420,14 @@ def fmt(x, pct=False):
     return f"{x:.1%}" if pct else f"{x}"
 
 
+def _rejection_kind(item):
+    """A `rejected` entry: 'guard' (a draft the guard or schema check refused), 'model_error' (an API-level
+    model failure, no text) or 'truncated' (cut off at max_completion_tokens)."""
+    if item.get("finish_reason"):
+        return "truncated"
+    return "model_error" if item.get("text") is None else "guard"
+
+
 def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agreement_result=None):
     cases_by_id = {c.case_id: c for c in cases}
     records = [r for r in records_by_id.values() if r.get("report") and r["case_id"] in cases_by_id]
@@ -387,6 +444,13 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
              f"- Run file: `{relative(run_path)}`; reports scored: {len(records)}/{len(cases)}, judged: {len(judged)}",
              f"- Agent model: {records[0]['agent_model'] if records else '—'}; judge: "
              f"{judged[0]['judge']['model'] if judged else '—'}",
+             f"- Pipeline: {run_pipeline(records_by_id)}"
+             + (f" (requested {records[0]['pipeline_requested']})" if records and records[0].get("pipeline_requested")
+                else "")
+             + (f"; agents: {', '.join(f'{a} {m}' for a, m in records[0]['agent_models'].items())}"
+                if records and records[0].get("agent_models") else "")
+             + (f"; commit `{records[0]['git_commit'][:12]}`{' (uncommitted changes)' if records[0].get('git_dirty') else ''}"
+                if records and records[0].get("git_commit") else ""),
              f"- Report source: {len(llm_records)} LLM, {len(records) - len(llm_records)} template fallback; "
              f"classifier snapshot drift: {sum(not r['snapshot_match'] for r in records)}",
              "", "## Deterministic checks", "",
@@ -424,19 +488,31 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
         lines.append(f"| {cat} | {len(rs)} | {sum(r['report_source'] == 'llm' for r in rs)} | {fmt(mean(js))} |")
 
     usage = [r["agent_usage"] for r in llm_records if r.get("agent_usage")]
-    rejected = [r for r in records if r.get("rejected")]
+
+    # `rejected` also holds API-level model errors (no text, e.g. an invalid tool call or Groq's
+    # json_validate_failed) and replies cut off at the token limit: count each kind on its own
+    def entries(kind):
+        return [(r, x) for r in records for x in r.get("rejected") or [] if _rejection_kind(x) == kind]
+
+    def counted(kind, noun):
+        found = entries(kind)
+        reasons = sorted({x["problem"].split(":")[0] for _, x in found})
+        return (f"{len(found)} {noun} in {len({r['case_id'] for r, _ in found})} reports"
+                + (f" ({', '.join(reasons)})" if found else ""))
+
     lines += ["", "## Agent operations", "",
-              f"- Guard rejections: {sum(len(r['rejected']) for r in rejected)} drafts in {len(rejected)} reports"
-              + (f" ({', '.join(sorted({x['problem'].split(':')[0] for r in rejected for x in r['rejected']}))})"
-                 if rejected else ""),
+              f"- Guard rejections: {counted('guard', 'drafts')}",
+              f"- Model errors retried (API-level, no draft): {counted('model_error', 'calls')}",
+              f"- Replies cut off at the token limit: {counted('truncated', 'replies')}",
               f"- Fallbacks: {len(records) - len(llm_records)}"
               + (f" ({'; '.join(sorted({r['fallback_reason'] for r in records if r['report_source'] != 'llm'}))})"
                  if len(records) > len(llm_records) else ""),
               f"- Per LLM report: {fmt(mean([u['llm_calls'] for u in usage]))} calls, "
               f"{fmt(mean([u['input_tokens'] for u in usage]))} input / {fmt(mean([u['output_tokens'] for u in usage]))} "
-              f"output tokens, {fmt(mean([u['report_latency_ms'] / 1000 for u in usage]))} s"]
+              f"output tokens, {fmt(mean([u['report_latency_ms'] / 1000 for u in usage]))} s", ""]
+    lines += multi_metrics.summary_lines(records, load_shadow(run_path))
 
-    lines += ["", "## Judge vs human", ""]
+    lines += ["## Judge vs human", ""]
     if agreement_result and "other_run" in agreement_result:
         lines.append(f"The human scores in `{relative(HUMAN_LABELS_PATH)}` are for reports from "
                      f"`{agreement_result['other_run']}`, not this run, so no agreement is computed here "
@@ -461,29 +537,50 @@ def build_summary(records_by_id, cases, data_hash, run_path, baseline=None, agre
 
 
 def replay(args):
+    """Re-score saved runs. Without --run: every committed baseline's run (single, and multi once it
+    exists), so a regression in either pipeline fails CI. With --run: that run, against the baseline
+    of the pipeline it came from."""
+    if args.run:
+        return replay_one(Path(args.run), args)
+    targets = [(p, load_baseline(p)) for p in ("single", "multi")]
+    targets = [(p, b) for p, b in targets if b is not None]
+    if not targets:
+        run_path = latest_run()
+        if run_path is None:
+            raise SystemExit("No run to replay. Run python -m evals.run --live first.")
+        return replay_one(run_path, args)
+    status = 0
+    for pipeline, baseline in targets:
+        print(f"===== {pipeline} pipeline: {baseline['run']} =====\n")
+        status = max(status, replay_one(REPO / baseline["run"], args))
+    return status
+
+
+def replay_one(run_path, args):
     cases = load_cases()
     data_hash = dataset_hash(cases)
-    baseline = load_baseline()
-    run_path = Path(args.run) if args.run else (REPO / baseline["run"] if baseline else latest_run())
-    if run_path is None or not run_path.exists():
-        raise SystemExit("No run to replay. Run python -m evals.run --live first.")
+    if not run_path.exists():
+        raise SystemExit(f"No run {relative(run_path)} to replay.")
     records = load_run(run_path)
     check_dataset_hash(records, data_hash, run_path)
+    pipeline = run_pipeline(records)
+    baseline = load_baseline(pipeline)
     summary = build_summary(records, cases, data_hash, run_path, baseline, load_agreement(run_path))
     print(summary["markdown"])
     if args.summary_out:
         Path(args.summary_out).write_text(summary["markdown"], encoding="utf-8")
     if args.update_baseline:
         n_reports = sum(1 for r in records.values() if r.get("report"))
-        BASELINE_PATH.write_text(json.dumps({
-            "run": relative(run_path), "dataset_hash": data_hash,
+        path = baseline_path(pipeline)
+        path.write_text(json.dumps({
+            "run": relative(run_path), "pipeline": pipeline, "dataset_hash": data_hash,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "reports": n_reports, "cases": len(cases),
             "note": "" if n_reports == len(cases) else
                     "PROVISIONAL: built from a partial run; re-run --replay --update-baseline once it completes",
             "deterministic_pass_rates": {k: v["rate"] for k, v in summary["rates"].items()},
         }, indent=2) + "\n", encoding="utf-8")
-        print(f"Updated {relative(BASELINE_PATH)}")
+        print(f"Updated {relative(path)}")
         return 0
     if summary["drops"]:
         for name, current, base in summary["drops"]:

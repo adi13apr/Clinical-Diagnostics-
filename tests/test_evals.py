@@ -217,6 +217,56 @@ def test_committed_baseline_replays_cleanly():
     assert eval_run.main(["--replay"]) == 0
 
 
+def test_replay_checks_each_pipeline_against_its_own_baseline(tmp_path, monkeypatch, capsys):
+    single_path, multi_path = tmp_path / "single.jsonl", tmp_path / "multi.jsonl"
+    write_run(single_path, [make_record(c) for c in CASES[:4]])
+    write_run(multi_path, [dict(make_record(c), pipeline="multi") for c in CASES[:4]])
+    monkeypatch.setattr(eval_run, "REPO", tmp_path)
+    monkeypatch.setattr(eval_run, "BASELINE_PATH", tmp_path / "baseline.json")
+    monkeypatch.setattr(eval_run, "BASELINE_MULTI_PATH", tmp_path / "baseline_multi.json")
+    monkeypatch.setattr(eval_run, "HUMAN_LABELS_PATH", tmp_path / "missing.csv")
+    assert eval_run.main(["--replay", "--run", str(single_path), "--update-baseline"]) == 0
+    assert eval_run.main(["--replay", "--run", str(multi_path), "--update-baseline"]) == 0
+    assert json.loads((tmp_path / "baseline_multi.json").read_text())["run"] == "multi.jsonl"
+    assert json.loads((tmp_path / "baseline.json").read_text())["pipeline"] == "single"
+    capsys.readouterr()
+    assert eval_run.main(["--replay"]) == 0  # no --run: both baselines' runs
+    out = capsys.readouterr().out
+    assert "===== single pipeline: single.jsonl" in out and "===== multi pipeline: multi.jsonl" in out
+
+    # A regression in the multi run alone fails the replay, even though single is fine
+    bad = [dict(make_record(c), pipeline="multi") for c in CASES[:4]]
+    bad[0]["report"]["status"] = "refer" if bad[0]["classifier"]["status"] == "confident" else "confident"
+    write_run(multi_path, bad)
+    assert eval_run.main(["--replay"]) == 1
+    assert "FAIL: status_matches_classifier" in capsys.readouterr().out
+
+
+def test_summary_counts_guard_rejections_apart_from_model_errors():
+    record = make_record(CASES[0], rejected=None)
+    record["rejected"] = [
+        {"step": 2, "text": "{}", "problem": "grounding check failed: x"},                       # a guard verdict
+        {"step": 3, "agent": "verifier", "text": None, "problem": "verifier agent: bad JSON"},  # API-level error
+        {"step": 4, "text": "{", "finish_reason": "length", "problem": "cut off"}]
+    md = eval_run.build_summary({CASES[0].case_id: record}, CASES, dataset_hash(CASES), "run.jsonl")["markdown"]
+    assert "- Guard rejections: 1 drafts in 1 reports (grounding check failed)" in md
+    assert "- Model errors retried (API-level, no draft): 1 calls in 1 reports (verifier agent)" in md
+    assert "- Replies cut off at the token limit: 1 replies in 1 reports (cut off)" in md
+
+
+def test_live_records_carry_the_run_metadata():
+    commit, dirty = eval_run.git_state()
+    assert commit is None or (len(commit) == 40 and isinstance(dirty, bool))
+    record = eval_run.new_record(CASES[0], "r", "h", "groq", "m", {"pipeline": "single"},
+                                 {"pipeline_requested": "multi", "git_commit": commit, "git_dirty": dirty})
+    assert record["pipeline_requested"] == "multi" and record["pipeline"] == "single"  # asked vs what ran
+    assert record["git_commit"] == commit
+    md = eval_run.build_summary({CASES[0].case_id: dict(make_record(CASES[0]), pipeline_requested="multi",
+                                                        git_commit="a" * 40, agent_models={"writer": "w"})},
+                                CASES, dataset_hash(CASES), "run.jsonl")["markdown"]
+    assert "- Pipeline: single (requested multi); agents: writer w; commit `aaaaaaaaaaaa`" in md
+
+
 # Judge
 
 def judge_client(response_or_error):

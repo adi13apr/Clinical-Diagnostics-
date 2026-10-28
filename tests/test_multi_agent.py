@@ -726,3 +726,149 @@ def test_streamlit_generate_report_runs_the_multi_pipeline(make_tools, monkeypat
     assert "multi-agent pipeline" in result.source_line()
     report_span = next(s for s in tracers[-1].spans if s.name == "report")
     assert report_span.attributes["pipeline"] == "multi"
+
+
+# ---- Eval metrics for the multi pipeline (evals.multi_metrics, verifier_audit, compare) ----
+
+JUDGED = {"model": "mock-judge", "usage": None,
+          "scores": {c: {"score": 5, "reason": "r"}
+                     for c in ("faithfulness", "uncertainty_language", "actionability", "plain_language")}}
+
+
+def multi_record(tools, pipeline, run_id="run-m", case_index=0):
+    """A real eval record (evals.run._finish_case + new_record) from a scripted multi-agent report."""
+    from evals.dataset import dataset_hash, load_cases
+    from evals.run import _finish_case, new_record
+    cases = load_cases()
+    case = cases[case_index]
+    tracer = Tracer()
+    result = generate_multi_agent_report(tools, pipeline, tracer=tracer)
+    record = new_record(case, run_id, dataset_hash(cases), "groq", pipeline.name,
+                        _finish_case(case, tools, tracer, result),
+                        {"pipeline_requested": "multi", "git_commit": "c" * 40, "git_dirty": False})
+    return dict(record, judge=JUDGED)
+
+
+def test_a_verifier_revision_keeps_its_whole_verdict(make_tools):
+    tools = make_tools()
+    pipeline = make_pipeline(writer=[MockLLMClient.final(unsupported_report(tools)),
+                                     MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True, False)), MockLLMClient.final(verdict(True))])
+    result = generate_multi_agent_report(tools, pipeline)
+    assert [f["supported"] for f in result.revisions[0]["findings"]] == [True, False]  # the supported claim too
+    assert [f["claim"] for f in result.revisions[0]["unsupported"]] == ["claim 1"]
+
+
+def test_multi_metrics_from_a_real_record(make_tools):
+    from evals import multi_metrics
+    tools = make_tools()
+    # The evidence agent stops after two tools (one re-ask); the verifier flags the first draft
+    evidence = [MockLLMClient.tool("run_classifier"), MockLLMClient.tool("get_gradcam"), MockLLMClient.final("DONE"),
+                MockLLMClient.tool("get_condition_info")]
+    pipeline = make_pipeline(evidence=evidence,
+                             writer=[MockLLMClient.final(unsupported_report(tools)),
+                                     MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True, False)),
+                                       MockLLMClient.final(verdict(True, True))])
+    record = multi_record(tools, pipeline)
+    assert record["pipeline_requested"] == "multi" and record["git_commit"] == "c" * 40
+    assert record["evidence_reasks"] == 1
+    assert multi_metrics.tools_metrics([record]) == {"cases": 1, "all_three_called": 1, "skipped": [], "reasks": 1,
+                                                     "cases_reasked": 1}
+    rev = multi_metrics.revision_metrics([record])
+    assert rev["total"] == 1 and rev["by"] == {"guard": 0, "verifier": 1}
+    assert rev["reasons"][0]["why"] == ["unsupported: claim 1"]
+    ver = multi_metrics.verifier_metrics([record])
+    assert ver["verdicts"] == 2 and ver["claims_per_verdict"] == 2 and ver["unsupported_total"] == 1
+    assert [f["claim"] for f in multi_metrics.flagged_claims([record])] == ["claim 1"]
+    # The flagged draft had passed the guard (it runs first), and today's guard still passes it
+    dis = multi_metrics.disagreement([record])
+    assert dis["verifier_flagged"] == 1 and len(dis["verifier_only"]) == 1 and dis["guard_only"] is None
+    text = "\n".join(multi_metrics.summary_lines([record]))
+    assert "All three tools called: 1/1" in text and "evidence re-asks: 1 in 1 cases" in text
+    assert "Revisions: 1 in 1 cases (guard 0, verifier 1" in text and "not measured" in text
+
+
+def test_guard_rejected_drafts_and_the_post_hoc_verifier(make_tools):
+    from evals import multi_metrics
+    tools = make_tools()
+    bad = good_report(tools, calibrated_probability=0.5)  # the guard rejects a changed probability
+    pipeline = make_pipeline(writer=[MockLLMClient.final(bad), MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True))])
+    record = multi_record(tools, pipeline)
+    drafts = multi_metrics.guard_rejected_drafts([record])
+    assert len(drafts) == 1 and json.loads(drafts[0]["text"])["calibrated_probability"] == 0.5
+    shadow = [{"run_id": "run-m", "case_id": record["case_id"], "step": drafts[0]["step"], "unsupported": 0},
+              {"run_id": "other-run", "case_id": record["case_id"], "step": 1, "unsupported": 0}]  # same case id
+    dis = multi_metrics.disagreement([record], shadow)
+    assert dis["guard_rejected"] == 1 and len(dis["guard_only"]) == 1  # the other run's draft isn't counted
+
+
+def test_the_audit_verifier_gets_exactly_the_pipeline_request(make_tools):
+    from agent.multi_agent import bundle_from_tool_outputs, verify_once
+    tools = make_tools()
+    pipeline = make_pipeline(writer=[MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True))])
+    record = multi_record(tools, pipeline)
+    in_pipeline = pipeline.clients["verifier"]
+    again = MockLLMClient([MockLLMClient.final(verdict(True))], name="verifier-m")
+    verify_once(again, bundle_from_tool_outputs(record["tool_outputs"]), Report.model_validate(record["report"]))
+    assert again.calls == in_pipeline.calls and again.systems == in_pipeline.systems
+    assert again.schemas == in_pipeline.schemas == ["verdict"]
+
+
+def test_verifier_audit_parts_resume_and_write_the_spot_check_sheet(make_tools, tmp_path):
+    from evals import verifier_audit as audit_mod
+    from evals.judge import MockJudge
+    tools = make_tools()
+    bad = good_report(tools, calibrated_probability=0.5)
+    pipeline = make_pipeline(writer=[MockLLMClient.final(bad), MockLLMClient.final(unsupported_report(tools)),
+                                     MockLLMClient.final(good_report(tools))],
+                             verifier=[MockLLMClient.final(verdict(True, False)), MockLLMClient.final(verdict(True))])
+    record = multi_record(tools, pipeline)
+    audit = audit_mod.load_audit(tmp_path / "missing.audit.json")
+    quiet = {"log": lambda *_: None}
+    verifier = MockLLMClient([MockLLMClient.final(verdict(False))], name="verifier-m")
+    checker = MockLLMClient([MockLLMClient.final({"supported": True, "evidence": "quoted", "reason": "it is there"})],
+                            name="checker-m")
+    judge = MockJudge({"faithfulness": 4, "uncertainty_language": 5, "actionability": 5, "plain_language": 5})
+    audit_mod.shadow_verify(verifier, {"run-m": [record]}, audit, lambda: None, **quiet)
+    audit_mod.check_flags(checker, [record], audit, lambda: None, **quiet)
+    audit_mod.judge_drift(judge, [record], audit, lambda: None, **quiet)
+    assert audit["shadow_verifier"][0]["unsupported"] == 1 and audit["shadow_verifier"][0]["error"] is None
+    assert audit["flag_checks"][0]["checker_supported"] is True and audit["flag_checks"][0]["claim"] == "claim 1"
+    assert audit["judge_drift"][0]["recorded"]["faithfulness"] == 5 and audit["judge_drift"][0]["now"]["faithfulness"] == 4
+    assert checker.systems == [audit_mod.CLAIM_CHECK_SYSTEM] and checker.schemas == ["claim_check"]
+    # A second pass skips what's done: the scripted clients are exhausted, so any call would record an error
+    audit_mod.shadow_verify(verifier, {"run-m": [record]}, audit, lambda: None, **quiet)
+    audit_mod.check_flags(checker, [record], audit, lambda: None, **quiet)
+    assert not any(i.get("error") for part in ("shadow_verifier", "flag_checks") for i in audit[part])
+    sheet = audit_mod.flags_sheet(dict(audit, checker_model="checker-m"), "run-m")
+    assert "found 1 of them supported" in sheet and "| 1 | `" in sheet and sheet.rstrip().endswith("| |")
+
+
+def test_compare_applies_the_decision_rule(make_tools, tmp_path):
+    from evals import compare
+    from evals.dataset import dataset_hash, load_cases
+    from evals.run import _finish_case, append_record, new_record
+    cases = load_cases()
+    single_path, multi_path = tmp_path / "20261026T000000Z.jsonl", tmp_path / "20261027T000000Z.jsonl"
+    for i, case in enumerate(cases[:2]):
+        tools = make_tools(pixel=10 + i)
+        tracer = Tracer()
+        single = run_report(tools, MockLLMClient(evidence_script() + [MockLLMClient.final(good_report(tools))]),
+                            tracer=tracer)
+        s = new_record(case, "s", dataset_hash(cases), "groq", "mock", _finish_case(case, tools, tracer, single))
+        m = multi_record(tools, make_pipeline(writer=[MockLLMClient.final(good_report(tools))],
+                                              verifier=[MockLLMClient.final(verdict(True))]), run_id="m", case_index=i)
+        append_record(single_path, dict(s, judge=JUDGED))
+        append_record(multi_path, m)
+    md = compare.build(single_path, multi_path)
+    assert "**Result: switch to multi**" in md and "| Template fallbacks | 0 | 0 |" in md
+    assert "Latency per report, p90" in md and "## Verifier audit" in md
+    # One multi report becomes the template: more fallbacks than single -> keep single, with the reason
+    records = [json.loads(line) for line in multi_path.read_text(encoding="utf-8").splitlines()]
+    records[-1]["report_source"], records[-1]["fallback_reason"] = "fallback", "The verifier still found ..."
+    multi_path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    md = compare.build(single_path, multi_path)
+    assert "**Result: keep single** — template fallbacks: multi 1 > single 0" in md

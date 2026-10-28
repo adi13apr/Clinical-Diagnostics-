@@ -215,6 +215,24 @@ def verifier_prompt(bundle, report):
     return f"EVIDENCE:\n{bundle.prompt_json()}\n\nDRAFT REPORT:\n{json.dumps(draft, indent=1)}"
 
 
+def bundle_from_tool_outputs(tool_outputs, tool_calls=REQUIRED_TOOLS):
+    """The EvidenceBundle for an eval record's tool_outputs (classifier, gradcam, condition_info): the
+    same evidence the writer and verifier saw, since the tools are deterministic for an image."""
+    info = tool_outputs["condition_info"]
+    caveats = info.get("model_limitations") or []
+    return EvidenceBundle(classifier=ClassifierFacts(**tool_outputs["classifier"]), gradcam=tool_outputs["gradcam"],
+                          condition_info=info, dataset_caveat=caveats[0] if caveats else None,
+                          tool_calls=list(tool_calls))
+
+
+def verify_once(client, bundle, report):
+    """One verifier call outside the orchestrator (evals: post-hoc checks, sensitivity), with the
+    pipeline's exact request. Returns (VerifierVerdict, LLMTurn); raises on an invalid verdict."""
+    turn = client.generate_json(VERIFIER_SYSTEM, [{"role": "user", "text": verifier_prompt(bundle, report)}],
+                                "verdict", VERDICT_JSON_SCHEMA)
+    return VerifierVerdict.model_validate_json(_strip_fence(turn.text)), turn
+
+
 # ---- The pipeline object (what build_report_llm returns in multi mode) ----
 
 class AgentTimeoutError(TimeoutError):
@@ -360,7 +378,7 @@ class _Orchestrator:
                 verdict = yield from self._verify(bundle, report)
                 if verdict.unsupported:
                     revision = self._revise(RevisionRequest(by="verifier", unsupported=verdict.unsupported),
-                                            report, None)
+                                            report, None, verdict.findings)
                     continue
                 self.result.findings = [f.model_dump() for f in verdict.findings]
                 self._transition(State.FINAL_GUARD)
@@ -503,11 +521,15 @@ class _Orchestrator:
                                          "problem": problem})
         return problem
 
-    def _revise(self, request, report, problem):
-        """Send the draft back once; with no revision left, the template is used."""
+    def _revise(self, request, report, problem, findings=()):
+        """Send the draft back once; with no revision left, the template is used.
+
+        findings: the verifier's whole verdict on this draft (supported claims too), kept for the evals.
+        """
         self.result.revisions.append({"step": self.steps, "by": request.by, "text": self._last_draft_text,
                                       "problems": request.problems,
-                                      "unsupported": [f.model_dump() for f in request.unsupported]})
+                                      "unsupported": [f.model_dump() for f in request.unsupported],
+                                      "findings": [f.model_dump() for f in findings]})
         if self.revisions_left == 0:
             if request.by == "guard":
                 raise _Fallback(f"Report rejected after {MAX_REVISIONS} revision: {problem}.", kind="model")
