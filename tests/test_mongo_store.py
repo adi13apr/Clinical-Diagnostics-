@@ -113,6 +113,17 @@ def test_document_keeps_the_record_verbatim_plus_derived():
     assert doc["derived"]["case"]["true_label"] == CASES_BY_ID[record["case_id"]].true_label
 
 
+def test_id_is_the_first_field_of_every_document(tmp_path):
+    """Atlas reports a replacement as modified when _id isn't first, even with identical content, so a
+    re-import said 'updated' for all 180 records. mongomock ignores field order, hence this direct check."""
+    record = real_records(1)[0]
+    assert list(record_document(record))[0] == "_id"
+    path, _ = fixture_run(tmp_path)
+    docs, runs, _ = mongo_import.build_documents(path, CASES_BY_ID, DATA_HASH)
+    labels = label_documents([{"case_id": record["case_id"]}], "r")
+    assert all(list(d)[0] == "_id" for d in docs + list(runs.values()) + labels)
+
+
 def test_case_join_only_for_the_same_dataset():
     record = dict(real_records(1)[0], dataset_hash="other")
     assert record_document(record, CASES_BY_ID, DATA_HASH)["derived"]["case"] is None

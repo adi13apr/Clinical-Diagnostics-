@@ -114,9 +114,12 @@ def record_document(record, cases_by_id=None, data_hash=None, source_file=None, 
     if cases_by_id and record.get("dataset_hash") == data_hash and record.get("case_id") in cases_by_id:
         c = cases_by_id[record["case_id"]]  # only joined when the record was made from this exact dataset
         case = {"true_label": c.true_label, "categories": list(c.categories), "source": c.source}
-    doc = {k: v for k, v in record.items() if k not in ("_id", "derived", "imported")}
-    # No import timestamp: re-importing the same file with the same code leaves the document unchanged
-    doc.update(_id=record_id(record["run_id"], record["case_id"]), derived=normalize(record, case),
+    # _id first: MongoDB stores it first, and a replacement with _id elsewhere counts as modified even
+    # when nothing changed (found on Atlas; mongomock doesn't do this). No import timestamp, for the same
+    # reason: re-importing the same file with the same code must leave the document unchanged.
+    doc = {"_id": record_id(record["run_id"], record["case_id"])}
+    doc.update((k, v) for k, v in record.items() if k not in ("_id", "derived", "imported"))
+    doc.update(derived=normalize(record, case),
                imported={"file": source_file, "line": line, "checks_code": checks_code})
     return doc
 
