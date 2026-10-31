@@ -37,6 +37,9 @@ python -m evals.verifier_audit --run evals/runs/<multi>.jsonl --single-run evals
 python -m evals.compare --single evals/runs/<single>.jsonl --multi evals/runs/<multi>.jsonl  # side by side, offline
 python -m evals.judge_sensitivity --verifier   # the 5 planted bad reports + 3 controls through the verifier (live)
 python -m evals.benchmark --simulated  # old (sync) vs new (async) runner with fake-latency clients
+python -m evals.mongo_import evals/runs/   # copy run files + human labels into MongoDB (MONGODB_URI); idempotent
+python -m evals.queries all        # cross-run tables: rejected/fallback cases, check trend, judge by model, judge vs human
+python -m evals.run --live --mongo # live eval that also upserts each record into MongoDB (JSONL unchanged)
 cd web && npm install && npm run dev   # React UI on :5173 (needs web/.env.local and the API)
 cd web && npm run lint && npm run build
 cd web && npx vercel deploy --prod   # React app to Vercel (project clinical-diagnostics)
@@ -58,6 +61,10 @@ api_key = "..."   # or env GROQ_API_KEY
 
 [gemini]          # only if LLM_PROVIDER=gemini (or "provider" in config/llm.json)
 api_key = "..."   # or env GEMINI_API_KEY
+
+[mongodb]         # only for evals/mongo_import.py, evals/queries.py and --live --mongo; the app never reads it
+uri = "mongodb+srv://..."   # or env MONGODB_URI (the env wins); holds the password, never printed or logged
+# db = "clinical_evals"     # or env MONGODB_DB
 ```
 
 Database setup: run the files in `sql/` in order, in the Supabase SQL Editor, **before** deploying code that depends on them:
@@ -164,6 +171,9 @@ evals/                      Report-agent eval suite (see "Evals")
   compare.py                Single vs multi table from two runs + the default-pipeline decision rule
   verifier_sensitivity.*    judge_sensitivity --verifier output
   human_labels.csv          Blind sheet for a HUMAN to score (never fill it in programmatically)
+  store.py                  MongoEvalStore: record/run/label documents, per-version normalisers, INDEXES, connect()
+  mongo_import.py           Importer CLI + LiveMongoWriter (--live --mongo)
+  queries.py                Aggregation pipelines (*_pipeline builders) + table output CLI
 .github/workflows/ci.yml    pytest + eval replay
 tests/                      pytest; conftest.py stubs the network so tests need no checkpoint or Supabase
   fixtures/                 Verbatim LLM outputs used as regression tests; an "expect" block makes
@@ -345,6 +355,18 @@ The model is loaded once through `@st.cache_resource` on `ModelService._load_mod
   - **Labels belong to one run.** `evals/human_labels.meta.json` records the run the sheet was exported from (`labels_run()`). `load_agreement` returns `{"other_run": …}` for any other run, so summaries never compare human scores with a different run's judge, and `--agreement` defaults to the labels' run. The current labels are for `20261018T161443Z`.
 - **Judge sensitivity** (`python -m evals.judge_sensitivity`, live): 5 deliberately broken reports (wrong class, missing referral, TB "no follow-up needed", overconfident wording, invented symptom), each built on real tool outputs from `20261018T161443Z`. It records whether the judge scores the broken criterion ≤ 2, and whether the guard blocks the report (offline). Writes `evals/judge_sensitivity.{json,md}`. The guard blocks 3 of 5 by construction; overclaiming and invented facts can only be caught by the judge, the multi pipeline's verifier, or a human.
   - `--verifier`: the same 5 plus the 3 untouched base reports (controls) through the verifier (`verify_once`), and the guard as the pipeline runs it (with the caveat). Writes `evals/verifier_sensitivity.{json,md}`. **Result (2026-10-26, gpt-oss-20b): 5/5 caught, each on the planted claim; 0/3 false alarms; guard first, then verifier, stops 5/5.** n is tiny.
+
+### MongoDB eval store (`evals/store.py`, `mongo_import.py`, `queries.py`)
+
+- **What it is for:** querying eval records across runs. The committed `evals/runs/*.jsonl` stay the source of truth (CI replays them; CI never connects to MongoDB). Postgres/Supabase stays the store for user data; eval documents hold only public-dataset case ids, report text and scores. Runs on a free MongoDB Atlas M0 cluster (`cluster0.b2muqxx`, MongoDB 8.0; user `eval-writer` with readWrite on `clinical_evals` only; IP access list = the owner's home IP, so a new IP needs adding in Atlas).
+- **Collections** (db `clinical_evals`): `eval_records` (one per run and case: the file's **last** record per case, as `load_run` reads it), `eval_runs` (`_id` = run_id: date, models, dataset hash, counts, `pass_rates`, `judge_means`, `is_baseline`, run notes), `human_labels` (CSV rows, for the run in `human_labels.meta.json`).
+- **Documents:** the record's fields verbatim, plus `derived` (what queries read) and `imported` (file, line, `git describe` of the code that scored the checks). `_id` = `"<run_id>/<case_id>"`; writes are `replace_one(upsert=True)`, so re-importing reports "unchanged". There is deliberately no import timestamp, because it would make every re-import an update. **`_id` must be the first field:** real MongoDB counts a replacement with `_id` elsewhere as modified even when nothing changed (found on Atlas: a re-import said "updated" for all 180 records; mongomock ignores field order, so `test_id_is_the_first_field_of_every_document` checks it directly). A new commit changes `imported.checks_code`, so the first import after a commit updates every record.
+- **Record versions:** queries read only `derived`. `NORMALIZERS = {1: normalize_v1}` builds it; a new `record_version` needs a new normaliser, not new queries. Unknown versions are refused (listed, exit 1), never stored. Version 1 already has several shapes (the 2026-10-18/20 runs lack `tool_calls`; `20261027T000140Z` adds `pipeline`, `revisions`, `git_commit`, ...), so `normalize_v1` treats every post-v1 field as optional.
+- **Checks are today's:** `derived.checks` and `eval_runs.pass_rates` come from the current `evals/checks.py` (same numbers as `--replay`; a test asserts this for the baseline run). Old runs scored by today's guard can drop on `guard_replay_consistent`, which is what replay would show. Run files imported from another branch's checkout are scored by the importing checkout's checks.
+- **Dataset join:** `derived.case` (true label, categories) is filled only when the record's `dataset_hash` equals the current `cases.jsonl`. Unlike `--replay`, the importer still imports records from another dataset.
+- **Indexes** (`INDEXES`, each with its reason): unique `(run_id, case_id)`; `derived.rejected_count` and `derived.fallback` (one per branch of the `rejected` query's `$or`); `(derived.agent_model, run_id)` for `--agent-model`; `eval_runs.date`. At a few hundred documents they are about correctness and access paths, not speed; unfiltered trend/model queries scan anyway. Checked with `explain` on Atlas (2026-10-31): `rejected` → IXSCAN `fallback` + `rejected_count`; `judge-by-model --agent-model` → `agent_model_run`; `check-trend --since` → `run_case`; `check-trend` unfiltered → COLLSCAN.
+- **`--live --mongo`:** connects (and fails) before the model loads; each record is written to the JSONL first, then upserted. Mongo errors warn once and never stop the run. At the end `finish()` re-imports the whole run file, which repairs failed writes and writes the run document (also after an early stop: `complete: false`).
+- **mongomock limits** (tests run the real pipelines on it): no `$lookup` with `let`/`pipeline`, no `$reduce`, no `bulk_write(ReplaceOne)` with pymongo 4.19, and array literals of expressions in `$project` aren't evaluated (hence the `$map`/`$filter` form in `disagreements_pipeline`). Avoid them, or the tests stop running the pipeline.
 
 ## Supabase
 

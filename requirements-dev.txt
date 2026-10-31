@@ -5,3 +5,5 @@ pypdf
 pytest-asyncio
 fakeredis[lua]          # Lua scripting (lupa) for the Redis rate-limit budget tests
 httpx
+pymongo>=4.9            # evals/store.py: cross-run eval queries in MongoDB (not needed by the app)
+mongomock               # offline MongoDB for tests/test_mongo_store.py
