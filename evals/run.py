@@ -1,6 +1,6 @@
 """Eval runner.
 
-    python -m evals.run --live [--resume [RUN]] [--limit N] [--sync]    # real model + LLM agent/judge, resumable
+    python -m evals.run --live [--resume [RUN]] [--limit N] [--sync] [--mongo]   # real model + LLM, resumable
     python -m evals.run --replay [--run RUN] [--update-baseline]        # re-score saved outputs, no network (CI)
     python -m evals.run --export-human-labels [--run RUN]               # blank sheet for human scoring
     python -m evals.run --agreement [--run RUN]                         # judge vs human agreement
@@ -276,6 +276,16 @@ def live(args):
     mode = "sync" if args.sync else "async"
     print(f"Run {relative(run_path)}: {len(cases)} cases, dataset {data_hash[:12]}, provider {provider}, "
           f"reports {model}, judge {judge.model}, {mode} runner")
+    mongo = None
+    if args.mongo:
+        from evals.mongo_import import LiveMongoWriter
+        mongo = LiveMongoWriter.connect(cases, data_hash, run_path)  # exits here if Mongo is unreachable
+
+    def append(record):
+        append_record(run_path, record)  # the run file first: it is the source of truth
+        if mongo:
+            mongo.write(record)
+
     service = ModelService(str(REPO / "best_student_model_aligned_final.pth"))
     roots = {"pneumonia": find_root(REPO / "data" / "pneumonia", "chest_xray", "train"),
              "tb": find_root(REPO / "data" / "tb", "TB_Chest_Radiography_Database", "Tuberculosis")}
@@ -286,13 +296,15 @@ def live(args):
         stop = run_pipeline_sync(
             todo, records,
             lambda case: new_record(case, run_id, data_hash, provider, model, run_case(case, service, llm, roots)),
-            judge, lambda r: append_record(run_path, r))
+            judge, append)
     else:
         async def amake_record(case):
             return new_record(case, run_id, data_hash, provider, model, await arun_case(case, service, llm, roots))
-        stop = asyncio.run(run_pipeline_async(todo, records, amake_record, judge, lambda r: append_record(run_path, r)))
+        stop = asyncio.run(run_pipeline_async(todo, records, amake_record, judge, append))
     elapsed = time.perf_counter() - started
     print(f"\n{mode} runner wall time: {elapsed:.1f} s for {len(todo)} cases")
+    if mongo:
+        mongo.finish()  # also when the run stopped early: the run document then says complete: false
     if stop:
         remaining = sum(1 for c in todo if not (records.get(c.case_id) or {}).get("judge"))
         print(f"\nStopped: {stop}\n{remaining} cases left. "
@@ -510,9 +522,13 @@ def main(argv=None):
     ap.add_argument("--sync", action="store_true", help="with --live: use the original sequential runner")
     ap.add_argument("--run-file", help="with --live: write this run file instead of evals/runs/<timestamp>.jsonl")
     ap.add_argument("--judge-model", help="judge model (default: the agent's model)")
+    ap.add_argument("--mongo", action="store_true",
+                    help="with --live: also upsert each record and the run summary into MongoDB (MONGODB_URI)")
     ap.add_argument("--update-baseline", action="store_true", help="with --replay: write evals/baseline.json")
     ap.add_argument("--summary-out", help="with --replay: also write the markdown summary to this file")
     args = ap.parse_args(argv)
+    if args.mongo and not args.live:
+        ap.error("--mongo only applies to --live (import saved runs with python -m evals.mongo_import)")
     sys.stdout.reconfigure(encoding="utf-8")
     if args.live:
         return live(args)
