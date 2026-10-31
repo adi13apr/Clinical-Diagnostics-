@@ -17,7 +17,7 @@ from evals.dataset import dataset_hash, load_cases
 from evals.human_labels import HUMAN_LABELS_PATH, labels_run
 from evals.queries import table
 from evals.store import (
-    INDEXES, UnsupportedRecordVersion, code_version, connect, label_documents, read_label_rows, record_document,
+    INDEXES, UnsupportedRecordVersion, code_version, connect_or_exit, label_documents, read_label_rows, record_document,
     run_document,
 )
 
@@ -123,11 +123,11 @@ class LiveMongoWriter:
     @classmethod
     def connect(cls, cases, data_hash, run_path, log=print):
         """Fails before the run starts (no URI, bad credentials, IP not allowed), not halfway through it."""
+        store, where = connect_or_exit("--mongo")
         try:
-            store, where = connect()
             store.ensure_indexes()
-        except Exception as e:
-            raise SystemExit(f"--mongo: could not connect to MongoDB ({type(e).__name__}: {e})")
+        except Exception as e:  # e.g. the user may read but not write
+            raise SystemExit(f"--mongo: could not create indexes ({type(e).__name__}: {e})")
         log(f"MongoDB: {where}")
         return cls(store, cases, data_hash, run_path, log)
 
@@ -166,7 +166,7 @@ def main(argv=None):
 
     store = None
     if not args.dry_run:
-        store, where = connect()
+        store, where = connect_or_exit()
         print(f"MongoDB: {where}")
         print(f"Indexes: {len(INDEXES)} ensured")
     labels_source = labels_run()

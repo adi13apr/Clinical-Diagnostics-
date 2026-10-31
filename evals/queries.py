@@ -217,8 +217,8 @@ def main(argv=None, db=None):
     args = parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8")
     if db is None:
-        from evals.store import connect
-        store, where = connect()
+        from evals.store import connect_or_exit
+        store, where = connect_or_exit()
         db = store.db
         print(f"MongoDB: {where}\n")
     names = list(QUERIES) if args.query == "all" else [args.query]

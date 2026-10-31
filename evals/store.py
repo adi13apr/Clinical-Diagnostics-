@@ -257,3 +257,13 @@ def connect(environ=None, secrets_path=SECRETS_PATH, timeout_ms=10000):
     client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms, appname="clinical-evals")
     client.admin.command("ping")
     return MongoEvalStore(client[db_name]), f"{safe_host(uri)}/{db_name} (from {origin})"
+
+
+def connect_or_exit(prefix="MongoDB"):
+    """connect() for the command-line tools: one readable line instead of a traceback."""
+    try:
+        return connect()
+    except MongoNotConfigured as e:
+        raise SystemExit(f"{prefix}: {e}")
+    except Exception as e:  # bad credentials, IP not on the Atlas access list, DNS, timeout
+        raise SystemExit(f"{prefix}: could not connect ({type(e).__name__}: {e})")

@@ -161,7 +161,7 @@ def test_run_document_matches_replay_pass_rates(store):
 
 def test_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
     path, _ = fixture_run(tmp_path)
-    monkeypatch.setattr(mongo_import, "connect", lambda: pytest.fail("dry run must not connect"))
+    monkeypatch.setattr(mongo_import, "connect_or_exit", lambda: pytest.fail("dry run must not connect"))
     assert mongo_import.main([str(tmp_path), "--dry-run", "--no-labels"]) == 0
     assert "Dry run: nothing written" in capsys.readouterr().out
 
@@ -176,6 +176,21 @@ def test_env_uri_wins_over_secrets(tmp_path):
     assert mongo_settings({}, secrets)[0] == "mongodb://from-secrets"
     with pytest.raises(MongoNotConfigured):
         mongo_settings({}, tmp_path / "missing.toml")
+
+
+@pytest.mark.parametrize("error, expected", [
+    (MongoNotConfigured("No MongoDB URI: set MONGODB_URI"), "MongoDB: No MongoDB URI"),
+    (TimeoutError("cluster0.x.mongodb.net:27017: timed out"), "MongoDB: could not connect (TimeoutError"),
+])
+def test_cli_connection_errors_are_one_line(monkeypatch, error, expected):
+    import evals.store as store_module
+
+    def fail():
+        raise error
+    monkeypatch.setattr(store_module, "connect", fail)
+    with pytest.raises(SystemExit) as exc:
+        queries.main(["rejected"])
+    assert str(exc.value).startswith(expected)
 
 
 def test_safe_host_drops_credentials():
