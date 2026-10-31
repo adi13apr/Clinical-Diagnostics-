@@ -26,7 +26,8 @@ class EvalCase(BaseModel):
     source: Literal["pneumonia", "tb"]
     split: Literal["test"]
     true_label: Literal["Normal", "Pneumonia", "Tuberculosis"]
-    categories: List[Literal["error", "refer", "correct"]]
+    # "regression": added by hand after a failure was found (failure-to-regression skill); kept on rebuild
+    categories: List[Literal["error", "refer", "correct", "regression"]]
     snapshot: ClassifierSnapshot     # classifier output when the dataset was built (drift check)
 
 

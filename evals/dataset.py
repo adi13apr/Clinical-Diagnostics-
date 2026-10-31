@@ -4,7 +4,8 @@
 
 Selection (test split of splits/split_manifest.csv only): every model error, every
 'refer' case, and a stratified sample of confident correct cases (2 per class;
-Normal takes one from each source dataset).
+Normal takes one from each source dataset). Cases with the "regression" category were added
+by hand (.claude/skills/failure-to-regression/add_case.py) and are carried over on a rebuild.
 """
 import argparse
 import hashlib
@@ -51,7 +52,8 @@ def dataset_hash(cases):
     return h.hexdigest()
 
 
-def build_cases():
+def build_cases(keep=()):
+    """Cases selected from the cached logits, then the `keep` cases (hand-added regressions) renumbered after them."""
     import numpy as np
     sys.path.insert(0, str(REPO))
     from services.calibration import apply_temperature, load_temperature, triage
@@ -98,7 +100,17 @@ def build_cases():
     for i, r in enumerate(selected, 1):
         stem = Path(r["relpath"]).stem
         cases.append(EvalCase(schema_version=CASE_SCHEMA_VERSION, case_id=f"c{i:02d}-{stem}", split="test", **r))
+    built = {c.relpath for c in cases}
+    for extra in keep:
+        if extra.relpath not in built:
+            cases.append(extra.model_copy(update={"case_id": next_case_id(cases, extra.relpath)}))
     return cases
+
+
+def next_case_id(cases, relpath):
+    """c<N+1>-<file stem>, after the highest existing number."""
+    n = max((int(c.case_id[1:].split("-", 1)[0]) for c in cases), default=0) + 1
+    return f"c{n:02d}-{Path(relpath).stem}"
 
 
 def write_cases(cases, path=CASES_PATH):
@@ -113,9 +125,10 @@ def main():
     args = ap.parse_args()
     if CASES_PATH.exists() and not args.force:
         sys.exit(f"{CASES_PATH} exists; pass --force to rebuild (this changes the dataset hash).")
-    cases = build_cases()
+    keep = [c for c in load_cases() if "regression" in c.categories] if CASES_PATH.exists() else []
+    cases = build_cases(keep)
     write_cases(cases)
-    counts = {k: sum(k in c.categories for c in cases) for k in ("error", "refer", "correct")}
+    counts = {k: sum(k in c.categories for c in cases) for k in ("error", "refer", "correct", "regression")}
     print(f"Wrote {len(cases)} cases to {CASES_PATH} {counts}, hash {dataset_hash(cases)[:12]}")
 
 

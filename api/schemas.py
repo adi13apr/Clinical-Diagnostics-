@@ -50,6 +50,8 @@ class ReportResponse(BaseModel):
     source_line: str = Field(description="Who wrote the report, for display")
     reason: Optional[str] = Field(description="Why the template was used (user-facing)")
     cached: bool
+    pipeline: Literal["single", "multi"] = Field("single", description="The report pipeline that actually ran "
+                                                                       "(REPORT_PIPELINE)")
 
 
 class ReportJobResponse(BaseModel):

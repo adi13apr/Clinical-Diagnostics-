@@ -442,16 +442,27 @@ def main():
             missing.append(t)
         else:
             spans.extend(found)
-    tokens = [(s["attributes"].get("input_tokens") or 0) + (s["attributes"].get("output_tokens") or 0)
-              + (s["attributes"].get("thinking_tokens") or 0) for s in spans]
+    def span_tokens(s):
+        return ((s["attributes"].get("input_tokens") or 0) + (s["attributes"].get("output_tokens") or 0)
+                + (s["attributes"].get("thinking_tokens") or 0))
+
+    tokens = [span_tokens(s) for s in spans]
+    # The Redis numbers are the report model's budget only; with REPORT_PIPELINE=multi the verifier's
+    # calls (another model, its own budget) are in the traces too, so compare like with like
+    by_model = {}
+    for s in spans:
+        m = by_model.setdefault(s["attributes"].get("model"), {"llm_calls": 0, "tokens": 0})
+        m["llm_calls"] += 1
+        m["tokens"] += span_tokens(s)
+    report_tokens = by_model.get(out["report_model"], {}).get("tokens", 0)
     retries = sum(s["attributes"].get("rate_limit_retries") or 0 for s in spans)
     errors = {}
     for s in spans:
         if s["status"] == "error":
             errors[s["error_type"]] = errors.get(s["error_type"], 0) + 1
     out["budget_traces"] = {"traces_read": len(trace_ids) - len(missing), "traces_missing": len(missing),
-                            "llm_calls": len(spans), "tokens": sum(tokens), "groq_429_retries": retries,
-                            "llm_call_errors": errors, "traces_http_status": statuses}
+                            "llm_calls": len(spans), "tokens": sum(tokens), "by_model": by_model,
+                            "groq_429_retries": retries, "llm_call_errors": errors, "traces_http_status": statuses}
     if missing == trace_ids:
         checks.add("Groq 429s (traces)", None, f"no trace readable through /traces (HTTP status: count {statuses}; "
                    "404 usually means the spans never reached Supabase: is sql/006 applied?)")
@@ -460,9 +471,11 @@ def main():
         partial = f" ({len(missing)} of {len(trace_ids)} traces missing)" if missing else ""
         checks.add("Groq 429s (traces)", rate_limited == 0,
                    f"{len(spans)} llm_call spans, {retries} rate-limit retries, errors {errors or 'none'}{partial}")
-        checks.add("tokens: traces vs Redis", None if missing else sum(tokens) == total_tokens,
-                   f"traces {sum(tokens)}, Redis {total_tokens}"
-                   + (" (a call that failed keeps its reserved estimate in Redis)" if sum(tokens) != total_tokens else ""))
+        others = {m: v["tokens"] for m, v in by_model.items() if m != out["report_model"]}
+        checks.add("tokens: traces vs Redis", None if missing else report_tokens == total_tokens,
+                   f"{out['report_model']}: traces {report_tokens}, Redis {total_tokens}"
+                   + (f"; other models (own budgets, not sampled): {others}" if others else "")
+                   + (" (a call that failed keeps its reserved estimate in Redis)" if report_tokens != total_tokens else ""))
 
     out["checks"] = checks.rows
     RESULTS_DIR.mkdir(exist_ok=True)

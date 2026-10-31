@@ -1,7 +1,7 @@
 {
-  "run": "evals/runs/20261020T075220Z.jsonl",
+  "run": "evals/runs/20261026T040807Z.jsonl",
   "dataset_hash": "c475a686fb48a2abdd03437fdf583260e6c1f7b18436b42f831cfd9c2ece35b8",
-  "created": "2026-10-20T08:30:28+00:00",
+  "created": "2026-10-26T04:52:38+00:00",
   "reports": 36,
   "cases": 36,
   "note": "",
@@ -17,6 +17,6 @@
     "guard_replay_consistent": 1.0,
     "abnormal_result_not_dismissed": 1.0,
     "confident_not_called_uncertain": 1.0,
-    "dataset_caveat_present": 0.9722
+    "dataset_caveat_present": 1.0
   }
 }

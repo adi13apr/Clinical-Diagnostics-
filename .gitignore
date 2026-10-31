@@ -6,3 +6,4 @@ data/
 traces/
 .env
 demo_results/
+.claude/settings.local.json

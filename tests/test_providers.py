@@ -14,6 +14,7 @@ from agent.agent import (
 from agent.llm_config import load_llm_config, provider_settings
 from agent.rate_limit import DailyCapReached, RedisModelBudget
 from agent.tools import TOOL_DECLARATIONS, ReportTools
+from test_agent import CAVEAT
 from evals.judge import JUDGE_JSON_SCHEMA, OpenAICompatibleJudge, build_judge
 from evals.schema import CRITERIA
 
@@ -84,7 +85,7 @@ def tools(make_service, calibration_file, monkeypatch):
 def valid_report(truth):
     return {"predicted_class": truth["predicted_class"], "calibrated_probability": truth["calibrated_probability"],
             "status": truth["status"], "summary": "The model suggests Normal. This is a screening result.",
-            "recommendation": "Share with a clinician.", "limitations": ["Two public datasets only."],
+            "recommendation": "Share with a clinician.", "limitations": [CAVEAT],
             "disclaimer": "x"}
 
 

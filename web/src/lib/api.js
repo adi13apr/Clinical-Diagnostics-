@@ -70,6 +70,7 @@ export const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:8000")
  * @property {string} source_line Who wrote the report, for display.
  * @property {string|null} reason Why the template was used (user-facing).
  * @property {boolean} cached
+ * @property {"single"|"multi"} pipeline The report pipeline that actually ran (REPORT_PIPELINE).
  */
 
 /**

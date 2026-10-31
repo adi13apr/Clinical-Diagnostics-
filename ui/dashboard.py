@@ -111,12 +111,12 @@ def show_single_result(user_email, model_service, image, trace_store=None):
     st.divider()
     st.subheader("📝 AI Report")
     if st.button("Generate report"):
-        from agent.agent import build_llm_client, generate_report_for_image
+        from agent.agent import build_report_llm, generate_report_for_image
         # Same trace as the prediction, so everything about this image is one trace
         tracer = make_tracer(trace_store, trace_id=st.session_state.get('last_trace_id'))
         with st.spinner("Writing report..."):
             st.session_state['last_report'] = generate_report_for_image(
-                model_service, image, prediction=result, llm=build_llm_client(), tracer=tracer)
+                model_service, image, prediction=result, llm=build_report_llm(), tracer=tracer)
         finish_trace(tracer)
         if tracer is not None:
             st.session_state['last_trace_spans'] = st.session_state.get('last_trace_spans', []) + [

@@ -20,7 +20,7 @@ The React app works only while that PC is on: the API isn't on a cloud host yet,
 2. **Calibration and triage:** raw probabilities are rescaled with a single temperature fitted on the validation split. If the top calibrated probability is below **0.9**, the result is marked **refer: uncertain, clinician review recommended**.
 3. **Grad-CAM:** computed on the last convolutional layer, summarised as the most influential zone of the image.
 4. **Report agent:** an LLM (Groq `openai/gpt-oss-120b` by default) gathers facts through three tools: classifier output, Grad-CAM summary, and the project's fixed condition text (a draft that a clinician hasn't reviewed yet; see [Known limits](#known-limits)).
-   - A guard rejects any report whose class, probability or status differs from the classifier, or that claims a confirmed diagnosis.
+   - A guard rejects any report whose class, probability or status differs from the classifier, that claims a confirmed diagnosis, or that leaves out the dataset caveat from the condition-info tool.
    - After one retry, a fixed template report is used instead.
    - The LLM never sees the image or patient details, and can't change the prediction.
 5. **Logging:** predictions, triage status and step-level traces (latency, tokens, guard verdicts) go to Supabase, with per-user row-level security, and to local JSONL.
@@ -42,13 +42,12 @@ The raw model was strongly **under**-confident: its probabilities never reached 
 
 ### Report agent eval
 
-36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-20.md`](evals/results/2026-10-20.md).
+36 test cases, made up of every model error, every refer case, and 6 correct ones. Latest run: [`evals/results/2026-10-26.md`](evals/results/2026-10-26.md).
 
-- **Deterministic checks: 11 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
-  - The 12th check, that the dataset caveat is quoted from the tool, fails on 1 of 36 (`c07`): the model skipped the condition-info tool and invented its own limitations.
-  - CI replays this run on every push and fails if any rate drops.
-- All 36 reports were written by the LLM: no template fallbacks and no guard rejections.
-- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.58–4.97 out of 5 on faithfulness, uncertainty language, actionability and plain language.
+- **Deterministic checks: 12 of 12 at 100%.** These are: class, probability and status match the classifier; refer cases recommend clinician review; confident results are never called uncertain; Pneumonia/TB reports never say no follow-up is needed; no confirmed-diagnosis claim; the dataset caveat is quoted from the tool; limitations present; length limits; schema valid; and the guard still agrees with the decisions recorded in the run.
+  - CI replays this run, and the multi-agent run below, on every push and fails if any rate drops in either.
+- All 36 reports were written by the LLM, with no template fallbacks. The guard rejected 2 drafts (`c35`, `c36`: confident TB results whose recommendation opened with "Refer:"), and both were fixed on the one retry.
+- An LLM judge (`qwen/qwen3.8-27b`, a different model family from the report writer) scored 4.64–5.0 out of 5 on faithfulness, uncertainty language, actionability and plain language.
 - **Judge vs human:** I scored 15 reports blind (from the 18 Oct run) with the same rubric. They agree on 82% of scores exactly and 97% within one point, but both of us rated almost everything 5, so that number is flattering.
   - The one report I marked down (`c32`: "No immediate referral is required" for a 99.99% Pneumonia result) got 5/5 from the judge on faithfulness and actionability.
 - **Judge sensitivity:** given 5 deliberately bad reports (wrong class, missing referral, TB "no follow-up needed", overconfident wording, invented symptom), the judge scored the broken part 1/5 in **all 5** ([`evals/judge_sensitivity.md`](evals/judge_sensitivity.md)). The guard blocks 3 of them.
@@ -68,14 +67,45 @@ This pneumonia X-ray is called Normal at 50.15%, so it is correctly **referred**
 - **Ungrounded caveat.** In the pilot, the judge marked down a report for saying the model was evaluated on "two public datasets". The fact was true, but it came from the agent's instructions rather than any tool output. It was moved into a tool, so it's now grounded.
 - **Dismissed follow-up (found by human review, missed by the judge).** `c32` said "No immediate referral is required" for a 99.99% Pneumonia result. The guard now rejects any Pneumonia/TB report that says no referral, action or follow-up is needed, and the template always recommends clinician follow-up. In the latest run, `c32` reads "Clinician follow-up is advised…".
 - **My own regression (found by the judge, missed by the guard).** The first prompt wording for that rule made 5 of 8 confident Pneumonia/TB reports open with "Refer: uncertain…", calling 99.99% results uncertain. The judge scored them 1–2. The prompt was fixed and the guard now rejects it; that run is kept as evidence (`evals/runs/20261020T071107Z`).
+- **Missing dataset caveat (found by an eval check, missed by the guard and the judge).** `c07` skipped the condition-info tool and invented its own limitations ("may be affected by image quality, positioning…"), dropping the dataset/source-confound caveat; the judge gave it faithfulness 5. The guard now reads the caveat from the tool itself and rejects any report that doesn't quote it, whichever tools the model called, and its rejection message quotes the text to copy on the retry. That exact report is a fixture, and in the next run (`20261026T040807Z`) all 36 reports carry the caveat.
 
 ### Known limits
 
 - **Source confound:** each disease comes from a different dataset (pneumonia: pediatric JPEGs; TB: adult PNGs; Normal: both). The model may partly learn the source. Normal recall is 100% on images from the TB dataset but 95.1% on images from the pneumonia dataset, and every metric above is in-distribution.
 - **Slow reports:** about 58 s each on Groq's free tier, mostly waiting to stay under the 8k tokens/min limit (4 sequential LLM calls per report).
 - **Grad-CAM** is coarse (a 3×2 grid, not a lung segmentation) and usually diffuse.
-- **The model can skip a tool.** Nothing forces the report model to call all three tools (`c07` skipped one). The eval flags it, but the guard doesn't block it yet.
+- **The model can skip a tool.** In the default single-agent pipeline, nothing forces the report model to call all three tools (`c07` skipped one in the 20 Oct run). The guard now blocks the missing dataset caveat that caused, but it doesn't check that region text came from `get_gradcam`. The experimental multi-agent pipeline (below) re-asks once for a skipped tool and otherwise uses the template.
 - **Unreviewed medical text:** the condition text in `agent/condition_info.json` is a draft that hasn't been reviewed by a clinician. The judge model is a Groq *Preview* model.
+
+### Multi-agent report pipeline (experimental, off by default)
+
+`REPORT_PIPELINE=multi` swaps the single report agent for three agents run by an orchestrator ([`agent/multi_agent.py`](agent/multi_agent.py)). The single agent stays the default: in a full comparison it had fewer template fallbacks (below).
+
+1. **Evidence agent** (`gpt-oss-120b`, tool calls): must call all three tools. If it stops early, it is asked once more, naming the missing tool; otherwise the template report is used.
+2. **Writer** (`gpt-oss-120b`, no tools): writes the report as strict JSON from the tool outputs only, including the dataset caveat.
+3. **Guard:** the same deterministic checks as before, on every draft.
+4. **Verifier** (`gpt-oss-20b`, a separate Groq budget): checks each claim against the tool outputs. An unsupported claim sends the draft back once.
+5. **Guard again** on the final report: it has the last word, even after the verifier approves.
+
+Every step is a trace span (agent, tokens, latency, verdict), and each agent has its own time limit.
+
+**Single vs multi on the same 36 cases** ([`evals/results/2026-10-27_single_vs_multi.md`](evals/results/2026-10-27_single_vs_multi.md); single run `20261026T040807Z`, multi run `20261027T000140Z`, same judge):
+
+| | Single | Multi |
+| --- | --- | --- |
+| Deterministic checks at 100% | 12 of 12 | 12 of 12 |
+| Template fallbacks | **0** | **3** |
+| Judge means (faithfulness / uncertainty / actionability / plain language) | 5.00 / 4.81 / 5.00 / 4.64 | 4.86 / 4.81 / 4.81 / 4.61 |
+| Guard rejections; verifier revisions | 2; — | 0; 2 |
+| gpt-oss-120b tokens per report; gpt-oss-20b | 5,249; — | 3,614; 1,795 |
+| Latency per report, median / p90 | 58.8 s / 60.0 s | 54.7 s / 59.8 s |
+| Nominal cost, 36 reports (billed $0 on the free tier) | $0.034 | $0.038 |
+
+- **Why single stays the default:** the rule was to switch only if multi ties or beats single on every deterministic check *and* has no more fallbacks. All 3 multi fallbacks came from the verifier's JSON: gpt-oss-20b failed Groq's strict schema on 12 of 47 calls (an out-of-list `source` value), and the one retry didn't fix 3 of them.
+- **Also worse in multi:** 9 of 33 reports list the dataset caveat twice (a writer-prompt artifact), and `c19` got actionability 1 from the judge.
+- **What the verifier adds:** on the 5 planted bad reports it flagged all 5, each on the planted claim, with no false alarms on the 3 originals ([`evals/verifier_sensitivity.md`](evals/verifier_sensitivity.md)); the guard alone stops 3. Live, it sent back 2 Normal reports that said no follow-up was needed, which the guard allows. A second model agreed with both flags. The guard still matters too: the verifier would have passed both drafts the guard rejected in the single run.
+- **Judge noise:** re-scoring 5 single-run reports a day later left 12 of 20 scores unchanged (mean change 0), so most per-criterion differences above are within ±1 noise.
+- **In the Compose stack** (`REPORT_PIPELINE=multi`, 2 API replicas, 3 workers, `demo_results/20261027T183834Z.json`): 3 concurrent multi-agent report jobs took 62 s, 65 s and 114 s, against a derived job timeout of 480 s. All 3 were written by the LLM, with no Groq 429s. The peak was 7,070 gpt-oss-120b tokens in any 60 s (limit 8,000). A lone job took 5.5 s.
 
 ## Why the eval runner is async (and why that isn't threads)
 
@@ -316,6 +346,28 @@ It opens a web UI where you can list and call the tools and read the resources. 
 The first tool call loads the model (a few seconds, about 440 MB of memory). Listing tools doesn't need it. `tests/test_mcp_server.py` checks every tool through the SDK's in-memory client with fake models and LLMs, plus one real stdio run with the real checkpoint. It's part of `pytest` and CI.
 
 > **TODO:** a streamable HTTP transport (for remote clients). It's left out on purpose for now: it would need authentication, because anything that can reach the port could read the allowed folders through the tools.
+
+## Agent Skills (`.claude/skills/`)
+
+Two [Claude Code skills](https://docs.claude.com/en/docs/claude-code/skills) package the workflows behind [Things the evals caught](#things-the-evals-caught). Claude Code loads them automatically in this repo. Run one with `/failure-to-regression c07` or `/release-check`, or just describe the task. Each `SKILL.md` is short; Python scripts next to it do the mechanical work. Every script has `--help` and runs offline except the live eval and the smoke test.
+
+**`failure-to-regression`** turns one bad report into a permanent check:
+
+| Step | Script |
+| --- | --- |
+| Reproduce it from an eval case, a trace id or a saved MCP `generate_report` output: failing checks, today's guard verdict, the exact report | `reproduce.py` |
+| Add the image to `evals/cases.jsonl` as a `regression` case (test split only; no change if it's already a case) | `add_case.py` |
+| Save the exact output as a fixture with an `expect` block (`tests/test_regression_fixtures.py` enforces every one), then write the check or guard rule | `reproduce.py --write-fixture` |
+| Run pytest and the replay, and tell an expected replay failure (the new guard rejects the recorded report) from a real one | `verify.py` |
+| Run the live eval in the background, then compare fallbacks, guard rejections, checks and judge scores on all 36 cases against the baseline run; it stops before `--update-baseline` if fallbacks or rejections went up | `live_eval.py`, `compare_runs.py` |
+| Draft the README entry and open a PR | `SKILL.md` instructions |
+
+**`release-check`** runs pytest, the eval replay and the API smoke test before a merge and prints a PASS / FAIL / SKIP table (`release_check.py`). The smoke test needs a running API (`API_URL`, or a local one on 7860/7861) and a token (`SUPABASE_ACCESS_TOKEN`, or the demo account in `.env`). Without them it is SKIP, never PASS.
+
+```powershell
+venv\Scripts\python.exe .claude\skills\failure-to-regression\reproduce.py --case c07
+venv\Scripts\python.exe .claude\skills\release-check\release_check.py
+```
 
 ## Deployment
 

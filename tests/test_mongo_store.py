@@ -28,7 +28,7 @@ from evals.store import (
 )
 
 REPO = Path(__file__).resolve().parent.parent
-BASELINE_RUN = REPO / "evals" / "runs" / "20261020T075220Z.jsonl"
+BASELINE_RUN = REPO / "evals" / "runs" / "20261020T075220Z.jsonl"  # fixture source; was the baseline until c07
 CASES = load_cases()
 DATA_HASH = dataset_hash(CASES)
 CASES_BY_ID = {c.case_id: c for c in CASES}
@@ -161,13 +161,15 @@ def test_indexes_exist_and_run_case_is_unique(store):
 
 def test_run_document_matches_replay_pass_rates(store):
     """eval_runs.pass_rates are the numbers --replay prints for the committed baseline run."""
-    import_runs(store, [BASELINE_RUN])
-    run = store.runs.find_one({"_id": "20261020T075220Z"})
-    expected = pass_rates([r for r in eval_run.load_run(BASELINE_RUN).values() if r.get("report")])
+    baseline = REPO / eval_run.load_baseline()["run"]
+    import_runs(store, [baseline, BASELINE_RUN])
+    run = store.runs.find_one({"_id": baseline.stem})
+    expected = pass_rates([r for r in eval_run.load_run(baseline).values() if r.get("report")])
     assert run["pass_rates"] == expected
     assert run["is_baseline"] and run["complete"] and run["dataset_matches_cases"]
+    assert store.runs.count_documents({"is_baseline": True}) == 1
     assert run["agent_model"] == "openai/gpt-oss-120b" and run["judge_model"] == "qwen/qwen3.8-27b"
-    assert run["date"].year == 2026 and run["notes"].startswith("**What changed")
+    assert run["date"].year == 2026 and run["notes"]
 
 
 def test_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):

@@ -14,6 +14,7 @@ from agent.agent import (
     LLMTurn, MockLLMClient, OpenAICompatibleClient, ToolCall, agenerate_report, generate_report,
 )
 from agent.tools import ReportTools
+from test_agent import CAVEAT
 from evals import run as eval_run
 from evals.dataset import load_cases
 from evals.judge import MockJudge, OpenAICompatibleJudge
@@ -84,7 +85,7 @@ def make_tools(make_service, calibration_file, monkeypatch):
 def valid_report(truth, **overrides):
     data = {"predicted_class": truth["predicted_class"], "calibrated_probability": truth["calibrated_probability"],
             "status": truth["status"], "summary": "The model suggests Normal. This is a screening result.",
-            "recommendation": "Share this result with a clinician.", "limitations": ["Two public datasets only."],
+            "recommendation": "Share this result with a clinician.", "limitations": [CAVEAT],
             "disclaimer": "x"}
     data.update(overrides)
     return data

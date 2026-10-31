@@ -22,6 +22,7 @@ from PIL import Image
 
 from agent.agent import REPORT_CACHE, MockLLMClient, RedisReportCache, ReportCache
 from agent.rate_limit import BUDGETS, ModelBudget, RedisModelBudget
+from test_agent import CAVEAT
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier
 from api.main import check_redis, create_app, daily_volume, shared_state
 from api.settings import Settings
@@ -535,11 +536,39 @@ def report_script(truth):
         "summary": f"The model's most likely category is {truth['predicted_class']}. "
                    "This is a screening result, not a diagnosis.",
         "recommendation": "Share this result with a clinician at the next visit.",
-        "limitations": ["Evaluated on two public datasets only."],
+        "limitations": [CAVEAT],
         "disclaimer": "Not medical advice.",
     }
     return [MockLLMClient.tool("run_classifier"), MockLLMClient.tool("get_gradcam"),
             MockLLMClient.tool("get_condition_info"), MockLLMClient.final(report)]
+
+
+def multi_report_llm(script):
+    """A single-agent mock script as a MultiAgentPipeline: its tool turns go to the evidence agent, its
+    final drafts to the writer (named "mock", like the single agent), and the verifier supports every draft."""
+    from agent.agent import LLMTurn
+    from agent.multi_agent import MultiAgentPipeline
+    n = next((i for i, t in enumerate(script) if not (isinstance(t, LLMTurn) and t.tool_calls)), len(script))
+    if n == 0:
+        return MultiAgentPipeline(MockLLMClient(script), MockLLMClient([]), MockLLMClient([], name="mock-verifier"))
+    drafts = script[n:]
+    verdict = {"findings": [{"claim": "c", "supported": True, "source": "classifier", "reason": "r"}]}
+    return MultiAgentPipeline(MockLLMClient(script[:n], name="mock-evidence"), MockLLMClient(drafts),
+                              MockLLMClient([MockLLMClient.final(verdict)] * len(drafts), name="mock-verifier"))
+
+
+def test_inline_report_with_the_multi_pipeline(make_client, store):
+    client = make_client(llm=lambda: multi_report_llm(report_script(truth)))
+    truth = predict(client)
+    res = client.post(f"/report/{truth['trace_id']}", headers=auth())
+    assert res.status_code == 200
+    first = res.json()["result"]
+    assert first["source"] == "llm" and first["pipeline"] == "multi" and first["model"] == "mock"
+    assert "multi-agent pipeline" in first["source_line"]
+    names = {r["name"] for r in store.tables["traces"] if r["trace_id"] == truth["trace_id"]}
+    assert {"evidence_agent", "writer_agent", "verifier_agent", "final_guard"} <= names
+    second = client.post(f"/report/{truth['trace_id']}", headers=auth()).json()["result"]
+    assert second["cached"] and second["pipeline"] == "multi"
 
 
 def test_report_without_llm_key_uses_the_template(client):
@@ -780,6 +809,20 @@ def test_llm_budgets_are_shared_through_redis_only_with_redis_url(model_service,
     assert isinstance(shared.budget, RedisModelBudget) and shared.model == local.model
     assert (shared.budget.rpm, shared.budget.tpm, shared.budget.rpd) == (local.budget.rpm, local.budget.tpm,
                                                                          local.budget.rpd)
+
+
+def test_multi_pipeline_agents_share_the_redis_budgets_too(model_service, monkeypatch):
+    from agent.multi_agent import MultiAgentPipeline
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    monkeypatch.setenv("REPORT_PIPELINE", "multi")
+    app = create_app(Settings(supabase_url=SUPABASE_URL, redis_url="redis://redis.internal:6380/0"),
+                     model_service=model_service, verifier=object(), db_factory=lambda token: None)
+    llm = app.state.llm_factory()
+    assert isinstance(llm, MultiAgentPipeline)
+    budgets = {agent: client.budget for agent, client in llm.clients.items()}
+    assert all(isinstance(b, RedisModelBudget) for b in budgets.values())
+    assert budgets["evidence"] is budgets["writer"] and budgets["verifier"].model == "openai/gpt-oss-20b"
 
 
 def test_redis_url_from_env_or_secrets(tmp_path):

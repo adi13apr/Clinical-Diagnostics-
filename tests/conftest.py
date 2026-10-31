@@ -24,6 +24,12 @@ class FixedLogitsModel(nn.Module):
         return self.logits.expand(x.shape[0], -1), None
 
 
+@pytest.fixture(autouse=True)
+def default_report_pipeline(monkeypatch):
+    """Tests start on the configured default pipeline (single) whatever the shell has; multi tests set it."""
+    monkeypatch.delenv("REPORT_PIPELINE", raising=False)
+
+
 @pytest.fixture
 def calibration_file(tmp_path):
     """Writes a calibration.json with the given temperature and returns its path."""

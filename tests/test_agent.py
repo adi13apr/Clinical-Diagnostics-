@@ -15,7 +15,7 @@ from agent.agent import (
     generate_report_for_image, parse_report, retry_delay_seconds,
 )
 from agent.schema import DISCLAIMER, Report
-from agent.tools import CLASS_NAMES, TOOL_DECLARATIONS, ReportTools
+from agent.tools import CLASS_NAMES, CONDITION_INFO_PATH, TOOL_DECLARATIONS, ReportTools
 from services.calibration import REFER_MESSAGE
 from services.heatmap_handler import summarize_cam_regions
 from services.model_handler import ModelService, StudentEfficientNet
@@ -24,6 +24,8 @@ from services.pdf_handler import PDFReportGenerator
 CONFIDENT = ([2.0, 0.0, 0.0], 0.1318)  # Normal, calibrated ~1.0
 REFER = ([0.0, 0.2, 0.6], 1.0)         # Tuberculosis, calibrated ~0.44
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# The dataset/source-confound caveat every report must quote (get_condition_info's first model_limitations item)
+CAVEAT = json.loads(CONDITION_INFO_PATH.read_text(encoding="utf-8"))["_model_limitations"][0]
 
 GRADCAM = {"explained_class": None, "peak_region": "right upper zone", "focus": "diffuse",
            "region_shares": {"right upper zone": 0.22}, "border_share": 0.3, "border_attention": False}
@@ -50,7 +52,7 @@ def report_json(truth, **overrides):
                    "This is a screening result, not a diagnosis.",
         "recommendation": (f"{REFER_MESSAGE.capitalize()}. A clinician review is needed before any decision."
                            if refer else "Share this result with a clinician at the next visit."),
-        "limitations": ["Evaluated on two public datasets only."],
+        "limitations": [CAVEAT],
         "disclaimer": "Not medical advice.",
     }
     data.update(overrides)
@@ -196,7 +198,7 @@ def test_fallback_report_is_valid_and_grounded(make_tools, case):
     tools = make_tools(case)
     report = fallback_report(tools)
     Report.model_validate(report.model_dump())
-    assert check_grounding(report, tools.run_classifier()) == []
+    assert check_grounding(report, tools.run_classifier(), CAVEAT) == []
 
 
 def test_fallback_survives_gradcam_failure(make_service, calibration_file):
@@ -605,3 +607,54 @@ def test_refer_report_still_uses_refer_sentence(make_tools):
     truth = tools.run_classifier()
     ok = report_json(truth)  # report_json writes the refer sentence for refer cases
     assert generate_report(tools, MockLLMClient(full_script(truth, ok))).source == "llm"
+
+
+# Guard: the dataset/source-confound caveat must be in the limitations (c07, 20261020T075220Z)
+
+# What gpt-oss wrote for c07 after skipping get_condition_info
+INVENTED_LIMITATIONS = ["Model limitations: The model may be affected by image quality, positioning, and may "
+                        "misinterpret non-pulmonary structures as pathology."]
+
+
+def test_regression_c07_missing_caveat_is_rejected():
+    """The exact gpt-oss report the guard accepted and the LLM judge scored faithfulness 5."""
+    fixture = json.loads((FIXTURES / "gptoss_c07_missing_dataset_caveat.json").read_text(encoding="utf-8"))
+    assert fixture["tool_outputs"]["condition_info"]["model_limitations"][0] == CAVEAT
+    report, problem = parse_report(json.dumps(fixture["report"]), fixture["truth"], CAVEAT)
+    assert report is None and "the limitations must include this caveat" in problem
+    assert CAVEAT in problem  # the retry message quotes the text to copy
+    assert parse_report(json.dumps(fixture["report"]), fixture["truth"])[0] is not None  # no caveat given: old rule
+
+
+def test_caveat_match_ignores_case_whitespace_and_hyphen_variants(make_tools):
+    tools = make_tools(PNEUMONIA_REFER)
+    truth = tools.run_classifier()
+    variant = "Limitation: " + CAVEAT.upper().replace(" ", "  ").replace("-", "‑")
+    report = Report.model_validate(report_json(truth, limitations=[variant]))
+    assert check_grounding(report, truth, CAVEAT) == []
+    shortened = Report.model_validate(report_json(truth, limitations=[CAVEAT[:120]]))
+    assert check_grounding(shortened, truth, CAVEAT)
+
+
+def test_missing_caveat_retry_can_recover(make_tools):
+    tools = make_tools(PNEUMONIA_REFER)
+    truth = tools.run_classifier()
+    bad = report_json(truth, limitations=INVENTED_LIMITATIONS)
+    llm = MockLLMClient(full_script(truth, bad, report_json(truth)))
+    result = generate_report(tools, llm)
+    assert result.source == "llm" and len(result.rejected) == 1
+    assert CAVEAT in llm.calls[-1][-1]["text"]  # the retry quotes the caveat to copy
+
+
+def test_missing_caveat_is_rejected_even_without_get_condition_info(make_tools):
+    # c07: the model never called get_condition_info, yet the guard still knows the caveat
+    tools = make_tools(PNEUMONIA_REFER)
+    truth = tools.run_classifier()
+    bad = report_json(truth, limitations=INVENTED_LIMITATIONS)
+    script = [MockLLMClient.tool("run_classifier"), MockLLMClient.tool("get_gradcam"),
+              MockLLMClient.final(bad), MockLLMClient.final(bad)]
+    result = generate_report(tools, MockLLMClient(script))  # rejected, retried, rejected
+    assert "get_condition_info" not in result.tool_calls
+    assert result.source == "fallback" and len(result.rejected) == 2
+    assert "caveat" in result.reason
+    assert CAVEAT in result.report.limitations  # the template quotes it

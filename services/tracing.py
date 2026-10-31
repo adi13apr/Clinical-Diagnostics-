@@ -22,7 +22,9 @@ TRACE_DIR = REPO / "traces"
 PRICING_PATH = REPO / "config" / "pricing.json"
 
 # Spans that mark a moment rather than time a step (excluded from latency averages)
-EVENT_SPANS = {"guard", "fallback_used", "report_cache_hit"}
+EVENT_SPANS = {"guard", "fallback_used", "report_cache_hit",
+               # multi-agent pipeline (agent/multi_agent.py)
+               "final_guard", "handoff", "orchestrator_state", "evidence_reask", "revision_requested"}
 
 
 @dataclass
@@ -287,12 +289,25 @@ def summarize_spans(rows):
     steps = {name: {"count": s["count"], "avg_latency_ms": round(s["total_ms"] / s["count"], 1),
                     "error_rate": round(s["errors"] / s["count"], 3)} for name, s in by_step.items()}
 
-    # Tokens per report: sum the llm_call spans under each report span that made LLM calls
+    # Tokens per report: sum the llm_call spans under each report span that made LLM calls. In the
+    # multi-agent pipeline they sit one level deeper (report -> writer_agent -> llm_call), so walk up
+    # to the enclosing report span; its parent is the call's own parent when there is none.
+    by_id = {r.get("span_id"): r for r in rows}
+
+    def report_of(row):
+        parent, seen = row.get("parent_span_id"), set()
+        while parent in by_id and parent not in seen:
+            seen.add(parent)
+            if by_id[parent]["name"] == "report":
+                return parent
+            parent = by_id[parent].get("parent_span_id")
+        return row.get("parent_span_id")
+
     per_report = {}
     for r in rows:
         if r["name"] == "llm_call":
             a = r.get("attributes") or {}
-            t = per_report.setdefault(r.get("parent_span_id"), {"input": 0, "output": 0, "cost": 0.0})
+            t = per_report.setdefault(report_of(r), {"input": 0, "output": 0, "cost": 0.0})
             t["input"] += a.get("input_tokens") or 0
             t["output"] += (a.get("output_tokens") or 0) + (a.get("thinking_tokens") or 0)
             t["cost"] += a.get("nominal_cost_usd") or 0.0

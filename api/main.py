@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agent.agent import REPORT_CACHE, RedisReportCache, build_llm_client
+from agent.agent import REPORT_CACHE, RedisReportCache, build_report_llm
 from agent.rate_limit import BUDGETS, BudgetRegistry
 from api.auth import AuthError, AuthUnavailable, SupabaseJWTVerifier, user_db_factory
 from api.jobs import ReportJobs, write_report
@@ -119,7 +119,7 @@ def create_app(settings=None, model_service=None, verifier=None, db_factory=None
         if settings.supabase_url else None)
     app.state.db_factory = db_factory or (
         user_db_factory(settings.supabase_url, settings.supabase_key) if settings.supabase_url else None)
-    app.state.llm_factory = llm_factory or partial(build_llm_client, budgets=budgets)
+    app.state.llm_factory = llm_factory or partial(build_report_llm, budgets=budgets)
     app.state.report_cache = report_cache
     app.state.uploads = uploads
     app.state.report_jobs = report_jobs
@@ -427,7 +427,8 @@ def compute_cam_map(model, upload, tracer):
 
 def report_response(trace_id, result):
     return ReportResponse(trace_id=trace_id, report=result.report, source=result.source, model=result.model,
-                          source_line=result.source_line(), reason=result.reason, cached=result.cached)
+                          source_line=result.source_line(), reason=result.reason, cached=result.cached,
+                          pipeline=result.pipeline)
 
 
 def trace_warnings(tracer):
